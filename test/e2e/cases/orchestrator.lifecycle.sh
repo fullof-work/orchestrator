@@ -7,6 +7,97 @@ wait_mmds_listener
 "$BIN/node-ctl" manifest-key add --socket "$WORK/node-ctl.socket" "$MK" >/dev/null
 . "$SCRIPT_DIR/execute_template.sh"
 build_ready_template
+
+# #426 real process-owner acceptance, retained after the unified-case migration.
+runner_lifecycle_check() {
+    python3 "$E2E_LIB/orchestrator/runner_lifecycle.py" "$1" "$WORK" "$2" "$RUNNER_PREFIX" "$3" "${@:4}"
+}
+run_runner_exit_case() { # $1=static|controller, $2=ch|runtime|parent, $3=template
+    local mode="$1" role="$2" template="$3" body code sid token before started ready_ms killed cleanup_ms runtime_pid
+    body=$(python3 - "$template" <<'PY'
+import json,sys
+print(json.dumps({"templateID":sys.argv[1],"timeout":180}))
+PY
+    )
+    started=$(date +%s%3N)
+    code=$(req POST /sandboxes "$AK" "$body")
+    [ "$code" = 201 ] || fail "runner-exit $mode/$role Create=$code"
+    sid=$(json_field "$WORK/resp.body" sandboxID)
+    token=$(json_field "$WORK/resp.body" envdAccessToken)
+    code=$(DP_MAX_TIME=120 dp "49983-$sid" /health "$token" || true)
+    { [ "$code" = 200 ] || [ "$code" = 204 ]; } || fail "runner-exit $mode/$role guest health=$code"
+    wait_sandbox_state "$sid" running 60 || fail "runner-exit did not reach running"
+    ready_ms=$(( $(date +%s%3N) - started ))
+    before="$WORK/runner-lifecycle-$mode-$role.json"
+    runner_lifecycle_check snapshot "$sid" "$before" || fail "runner-exit process identities"
+    if [ "$mode" = controller ]; then
+        wait_resource_stats "$sid" || fail "runner-exit reservation unavailable"
+        runner_lifecycle_check lease "$sid" "$before" || fail "runner-exit runtime-owned lease"
+    fi
+    if [ "$mode/$role" = controller/parent ]; then
+        # Controller and conductor share this process. Restart with a live
+        # guest and require StateSync/session recovery without re-execution.
+        stop_orchestrator
+        start_orchestrator "$WORK/orch-runner-lifecycle-restart.log"
+        wait_mmds_listener
+        wait_resource_stats "$sid" || fail "live StateSync did not restore reservation"
+        runner_lifecycle_check same-run "$sid" "$before" || fail "conductor restart replaced a live run"
+        runner_lifecycle_check lease "$sid" "$before" || fail "StateSync did not preserve runtime PID"
+        runtime_pid=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["processes"]["runtime"]["pid"])' "$before")
+        for _ in $(seq 1 100); do
+            grep -Fq "state sync sid=$sid pid=$runtime_pid " "$WORK/orch-runner-lifecycle-restart.log" && break
+            sleep 0.1
+        done
+        grep -Fq "state sync sid=$sid pid=$runtime_pid " "$WORK/orch-runner-lifecycle-restart.log" || fail "no successful runtime StateSync after restart"
+        code=$(DP_MAX_TIME=30 dp "49983-$sid" /health "$token" || true)
+        { [ "$code" = 200 ] || [ "$code" = 204 ]; } || fail "guest lost connectivity across conductor restart"
+        echo "==> PASS: live conductor/controller restart preserved parent/runtime/CH and StateSync identity"
+    fi
+    killed=$(date +%s%3N)
+    runner_lifecycle_check signal "$sid" "$before" --role "$role" || fail "runner-exit guarded signal"
+    # No DELETE, explicit StopUnit or restart can help this cleanup path.
+    wait_sandbox_state "$sid" dead 600 || fail "runner-exit $mode/$role did not automatically reach dead"
+    assert_dead_no_ownership "$sid" || fail "runner-exit retained durable ownership"
+    for _ in $(seq 1 100); do
+        runner_lifecycle_check dead "$sid" "$before" 2>/dev/null && break
+        sleep 0.1
+    done
+    runner_lifecycle_check dead "$sid" "$before" || fail "runner-exit retained processes/paths or lost result"
+    cleanup_ms=$(( $(date +%s%3N) - killed ))
+    for _ in $(seq 1 50); do
+        code=$(DP_MAX_TIME=2 dp "49983-$sid" /health "$token" || true)
+        [ "$code" = 404 ] && break
+        sleep 0.1
+    done
+    [ "$code" = 404 ] || fail "dead runner route still reachable: $code"
+    python3 - "$before" "$mode" "$role" "$ready_ms" "$cleanup_ms" <<'PY'
+import json,sys
+path,mode,role,ready,cleanup=sys.argv[1:]
+record=json.load(open(path))
+record.update(resource_mode=mode,killed_role=role,ready_ms=int(ready),cleanup_ms=int(cleanup))
+with open(path,"w") as stream: json.dump(record,stream,indent=2)
+print("runner-lifecycle measurement",json.dumps({k:record[k] for k in ("resource_mode","killed_role","ready_ms","cleanup_ms","parent_measurement")}))
+PY
+    echo "==> PASS: $mode $role SIGKILL auto-cleaned without DELETE or conductor restart"
+}
+
+
+# Exercise both static and controller-backed ownership using the already-built template.
+stop_orchestrator
+write_orchestrator_config unset static
+start_orchestrator "$WORK/orch-runner-lifecycle-static.log"
+wait_mmds_listener
+run_runner_exit_case static ch "$TEMPLATE"
+run_runner_exit_case static runtime "$TEMPLATE"
+run_runner_exit_case static parent "$TEMPLATE"
+stop_orchestrator
+write_orchestrator_config unset controller
+start_orchestrator "$WORK/orch-runner-lifecycle-controller.log"
+wait_mmds_listener
+run_runner_exit_case controller ch "$TEMPLATE"
+run_runner_exit_case controller runtime "$TEMPLATE"
+run_runner_exit_case controller parent "$TEMPLATE"
+
 # ---- async launch failure/kill gates --------------------------------------
 # These deterministic injections surround the release-candidate binaries; they
 # exercise the real conductor, sqlite store, run pool, systemd units, network,

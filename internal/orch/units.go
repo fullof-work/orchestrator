@@ -17,9 +17,9 @@ import (
 // units.install=false, the operator manages unit files out of band and this
 // method performs no file or systemd operations.
 //
-//   - <runner>  (sandbox-runner@.service): one run-id unit that waits for a sandbox
-//     assignment, then exec-replaces into sandbox-ctl run with config pulled over
-//     the config-socket.
+//   - <runner>  (sandbox-runner@.service): one run-id unit whose parent waits
+//     for a sandbox assignment, starts sandbox-ctl run as its direct child with
+//     config pulled over the config-socket, reports the child result, then exits.
 //   - <builder> (sandbox-builder@.service): one run-id unit that waits for a build
 //     assignment, authenticates an exact-run bootstrap, prepares an artifact root
 //     task-locally when required, then drives the target-selected pipeline and posts
@@ -75,20 +75,20 @@ Description=kuasar sandbox runner %%i
 CollectMode=inactive-or-failed
 # %%i is a run-id, not a sandbox id. node-ctl run-sandbox waits on the config
 # socket until this run-id is assigned a sandbox id, then fetches the sandbox's
-# LaunchSpec and exec-replaces into sandbox-ctl.
+# LaunchSpec, starts sandbox-ctl as a direct child and reports its result.
 
 [Service]
 Type=exec
 WorkingDirectory=%s
 ExecStart=%s run-sandbox --pidfile=%s --config-socket=%s --run-id=%%i
 ExecStopPost=/bin/rm -f %s
-# One process per sandbox, stateful: a crash means the sandbox is gone, not retryable.
+# One resident node-ctl parent owns one direct sandbox-ctl child per assignment; runtime child exit is terminal for that exact run.
 Restart=no
 KillMode=control-group
 TimeoutStopSec=20
 Slice=sandbox-runner.slice
 # node-ctl moves itself into ctl/ before enabling cgroup-v2 domain controllers;
-# after exec, sandbox-ctl stays there while node-ctl creates vmm/ for CH.
+# node-ctl remains the resident ctl/ parent; its direct sandbox-ctl child uses the handed-off vmm/ descriptor for Cloud Hypervisor.
 Delegate=yes
 # KillMode=control-group recursively covers both delegated subgroups.
 `, o.cfg.Paths.RunRoot, o.executables.OrchestratorCtl(), nodepath.RunnerPID(o.cfg.Paths.RunRoot, "%i"), o.cfg.Paths.ConfigSocket, nodepath.RunnerPID(o.cfg.Paths.RunRoot, "%i"))
