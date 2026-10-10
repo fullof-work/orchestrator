@@ -421,7 +421,16 @@ for i in "${!PIDS[@]}"; do [ "${PIDS[$i]}" != "$PRESSURE_EXEC_PID" ] || PIDS[$i]
 wait_sandbox_state "$FIRST" running 600 || fail "adopted Snapshot did not resume"
 restored=""
 for _ in $(seq 1 100); do
-    pressure_guest_state "$FIRST" > "$WORK/pressure-after.json"
+    if pressure_guest_state "$FIRST" > "$WORK/pressure-after.json"; then
+        :
+    else
+        probe_status=$?
+        # A bounded read can time out while the restored guest faults pages.
+        # Retry that observation; preserve every other exec failure.
+        [ "$probe_status" -eq 124 ] || exit "$probe_status"
+        sleep .2
+        continue
+    fi
     if python3 - "$WORK/pressure-before.json" "$WORK/pressure-after.json" <<'PY_MEMORY'
 import json, sys
 before,after=[json.load(open(p)) for p in sys.argv[1:]]
@@ -522,7 +531,16 @@ wait_sandbox_state "$SECOND" missing 600 || fail "second pressure delete finaliz
 wait_sandbox_state "$FIRST" running 600 || fail "saved primary did not recover after real relief"
 recovered=""
 for _ in $(seq 1 100); do
-    pressure_guest_state "$FIRST" > "$WORK/pressure-final-primary.json"
+    if pressure_guest_state "$FIRST" > "$WORK/pressure-final-primary.json"; then
+        :
+    else
+        probe_status=$?
+        # A bounded read can time out while the restored guest faults pages.
+        # Retry that observation; preserve every other exec failure.
+        [ "$probe_status" -eq 124 ] || exit "$probe_status"
+        sleep .2
+        continue
+    fi
     pressure_status
     if python3 - "$WORK/pressure-before.json" "$WORK/pressure-final-primary.json" "$WORK/pressure-status.json" <<'PY_RELIEF'
 import json,sys
