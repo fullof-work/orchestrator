@@ -56,6 +56,12 @@ python3 - "$WORK/config.yaml" <<'PY_CONFIG'
 from pathlib import Path
 import sys
 path = Path(sys.argv[1]); text = path.read_text()
+# Proxy Wake supplies no requested lifetime, so resume uses this node default.
+# Match the pressure guests' explicit 600s create/Connect lifetime; the normal
+# 120s default could expire during the critical hold and trigger an unrelated
+# automatic Pause before the background-recovery assertion.
+assert text.count("  timeout_sec: 120\n") == 1
+text = text.replace("  timeout_sec: 120\n", "  timeout_sec: 600\n", 1)
 # P=1GiB fits either full-capacity Snapshot, while both held workloads plus
 # their real headroom cannot run together. No workload size enters node policy.
 text = text.replace("physical_memory: auto", "physical_memory: 1792MiB", 1)
