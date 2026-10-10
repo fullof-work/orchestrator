@@ -48,6 +48,9 @@ wait_sandbox_state "$SID" missing 120 || fail "delete finalization"
 # these two primary guest workloads; it never changes host services/resources.
 build_image_template bare
 stop_orchestrator
+# Preserve the original 100s client / 120s parking allowance after the full
+# 60s critical hold. These are deadlines, not additional sleeps or retries.
+PROXY_PARK_TIMEOUT=180s
 write_orchestrator_config unset controller
 python3 - "$WORK/config.yaml" <<'PY_CONFIG'
 from pathlib import Path
@@ -64,7 +67,7 @@ text = text.replace(needle, """  watermarks: { low_factor: 0.70, high_factor: 0.
   # independent normal-grow rate limiter's one-second bucket.
   rate_limits: { memory_grant_per_sec_factor: 1.0 }
   # Keep critical refusal observable through the bounded 40s allocation
-  # barrier below. The single parked request has a 100s end-to-end deadline.
+  # barrier below. The single parked request has a 160s end-to-end deadline.
   pressure: { interval: 2s, failure_interval: 500ms, critical_after_rounds: 3, pause_after_rounds: 3, critical_exit_hold: 60s, red_to_yellow_hold: 5s, yellow_to_green_hold: 5s, minimum_run_time: 2s }
 """ + needle, 1)
 path.write_text(text)
@@ -401,7 +404,7 @@ code=$(req POST "/sandboxes/$FIRST/pause" "$AK")
 [ "$code" = 409 ] || fail "ordinary repeated Pause=$code"
 # A real request remains parked across the critical policy refusal. It is sent
 # once; there is no replay of a delivered operation or a killed exec session.
-exec_through_proxy_connect "$FIRST" "$FIRST_KAT" "PRESSURE_RESTORED_$RANDOM" 1 100 &
+exec_through_proxy_connect "$FIRST" "$FIRST_KAT" "PRESSURE_RESTORED_$RANDOM" 1 160 &
 PRESSURE_EXEC_PID=$!
 PIDS+=("$PRESSURE_EXEC_PID")
 pressure_wait_parking || fail "ordinary critical request did not park"
