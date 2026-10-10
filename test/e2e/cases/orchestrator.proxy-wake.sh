@@ -63,7 +63,9 @@ text = text.replace(needle, """  watermarks: { low_factor: 0.70, high_factor: 0.
   # This deliberately small pool must exercise memory shortage, not the
   # independent normal-grow rate limiter's one-second bucket.
   rate_limits: { memory_grant_per_sec_factor: 1.0 }
-  pressure: { interval: 2s, failure_interval: 500ms, critical_after_rounds: 3, pause_after_rounds: 3, critical_exit_hold: 5s, red_to_yellow_hold: 5s, yellow_to_green_hold: 5s, minimum_run_time: 2s }
+  # Keep critical refusal observable through the bounded 40s allocation
+  # barrier below. The single parked request has a 100s end-to-end deadline.
+  pressure: { interval: 2s, failure_interval: 500ms, critical_after_rounds: 3, pause_after_rounds: 3, critical_exit_hold: 60s, red_to_yellow_hold: 5s, yellow_to_green_hold: 5s, minimum_run_time: 2s }
 """ + needle, 1)
 path.write_text(text)
 PY_CONFIG
@@ -284,7 +286,7 @@ PY_CREATE
     wait_sandbox_state "$PRESSURE_SID" running 600 || fail "pressure primary did not start"
 }
 pressure_guest_state() {
-    "$BIN/sandbox-ctl" exec --run-root "$EXECUTE_RUN_ROOT/sandboxes" --sandbox-id "$1" -- /bin/cat /tmp/pressure-state.json
+    timeout 3 "$BIN/sandbox-ctl" exec --run-root "$EXECUTE_RUN_ROOT/sandboxes" --sandbox-id "$1" -- /bin/cat /tmp/pressure-state.json
 }
 pressure_create 384
 FIRST=$PRESSURE_SID
@@ -367,19 +369,14 @@ PY_ADOPT
 wait_paused_cleanup "$FIRST" 600 || fail "resource Pause cleanup incomplete"
 pressure_memory_observation after || fail "resource Pause did not release the old physical consumer"
 [ "$(checkpoint_pair "$FIRST" snapshot "$WORK/lib/sandboxes/$FIRST/checkpoint/$FIRST.snapshot")" = "$SNAPSHOT_PAIR" ] || fail "adoption changed Snapshot source"
-"$BIN/node-ctl" resource drain --disable --socket "$WORK/sandbox-resource.sock" >/dev/null
-code=$(req POST "/sandboxes/$FIRST/pause" "$AK")
-[ "$code" = 409 ] || fail "ordinary repeated Pause=$code"
-# A real request remains parked across the critical policy refusal. It is sent
-# once; there is no replay of a delivered operation or a killed exec session.
-exec_through_proxy_connect "$FIRST" "$FIRST_KAT" "PRESSURE_RESTORED_$RANDOM" 1 100 &
-PRESSURE_EXEC_PID=$!
-PIDS+=("$PRESSURE_EXEC_PID")
-pressure_wait_parking || fail "ordinary critical request did not park"
+# Explicit Wake has priority over normal grow. Establish the second held
+# workload before submitting Wake, while admission is still drained to fence
+# background recovery. Drain does not block this existing consumer's growth.
 # Record the second primary before its explicit Snapshot as well; later
 # recovery must preserve its identity, payload and increasing work counter.
 second_ready=""
-for _ in $(seq 1 200); do
+second_deadline=$((SECONDS + 40))
+while [ "$SECONDS" -lt "$second_deadline" ]; do
     if pressure_guest_state "$SECOND" > "$WORK/pressure-second-before.json" 2>/dev/null &&
        python3 - "$WORK/pressure-second-before.json" <<'PY_SECOND'
 import json, sys
@@ -390,6 +387,24 @@ PY_SECOND
     sleep .2
 done
 [ -n "$second_ready" ] || fail "second held primary did not finish allocation"
+pressure_status
+cp "$WORK/pressure-status.json" "$WORK/pressure-before-wake.json"
+python3 - "$WORK/pressure-before-wake.json" "$FIRST" "$SECOND" <<'PY_WAKE_BARRIER' || fail "critical Wake precondition expired before request"
+import json, sys
+p = json.load(open(sys.argv[1])); rows = {r["sandbox_id"]: r for r in p["sandboxes"]}
+assert p["zone"] == "critical" and p["pool_memory"] == 1<<30, p
+assert rows[sys.argv[2]]["state"] == "paused" and rows[sys.argv[2]]["pause_reason"] == "explicit", rows
+assert rows[sys.argv[3]]["state"] == "running", rows
+PY_WAKE_BARRIER
+"$BIN/node-ctl" resource drain --disable --socket "$WORK/sandbox-resource.sock" >/dev/null
+code=$(req POST "/sandboxes/$FIRST/pause" "$AK")
+[ "$code" = 409 ] || fail "ordinary repeated Pause=$code"
+# A real request remains parked across the critical policy refusal. It is sent
+# once; there is no replay of a delivered operation or a killed exec session.
+exec_through_proxy_connect "$FIRST" "$FIRST_KAT" "PRESSURE_RESTORED_$RANDOM" 1 100 &
+PRESSURE_EXEC_PID=$!
+PIDS+=("$PRESSURE_EXEC_PID")
+pressure_wait_parking || fail "ordinary critical request did not park"
 code=$(req POST "/sandboxes/$SECOND/pause" "$AK")
 [ "$code" = 204 ] || fail "second explicit Pause=$code"
 wait "$PRESSURE_EXEC_PID" || fail "parked Proxy Wake did not recover adopted Snapshot"
