@@ -444,7 +444,11 @@ PY_BUDGET
 # while the other Snapshot remains intact; real Delete then permits recovery.
 # Read-only native exec probes below cannot launch a paused sandbox.
 allowed=""
-for _ in $(seq 1 100); do
+# A Wake accepted before the second Pause releases its reservation can renew
+# the critical hold. Allow the full 60s hold plus pressure sampling margin;
+# return immediately when actual relief makes recovery eligible.
+allowed_deadline=$((SECONDS + 75))
+while [ "$SECONDS" -lt "$allowed_deadline" ]; do
     pressure_status
     if python3 - "$WORK/pressure-status.json" <<'PY_ORDINARY'
 import json, sys
