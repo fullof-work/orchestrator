@@ -436,6 +436,8 @@ run-builder 对每阶段调用
   --output - /` 导出新镜像工件流回——挂载点自身与 `/opt/sandbox-runtime` 投影都是
   挂载,被 `--skip-mounts` 排除,导出不自吞、工具链不进镜像。即使没有 steps，E source
   也必须走 B 并导出完整顶层 image，所以成品不引用 source E/root layers。
+  RUN 步骤须在返回前完成对导出选集内 rootfs 的写入。构建约定要求源树在导出结束前保持稳定；选集与内容检查用于检测变化，不提供原子快照，也不强制终止后台进程。
+
 - **C memory snapshot**(只在 resolved `target={kind:sandbox,memory:true}`):使用与普通
   Sandbox Create/顶层 E 相同的 cold-config projection，以 final image 完整替换 boot。
   image source 普通 cold run；有 source E defaults 时调用
