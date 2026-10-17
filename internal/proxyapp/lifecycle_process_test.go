@@ -324,6 +324,10 @@ func serveFixtureRoutes(t *testing.T, socket string, metadata bool, options ...r
 	}
 	server := &http.Server{Handler: h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == routesync.ProxyRetirePath {
+			if len(options) != 0 && options[0].legacy {
+				http.NotFound(w, r)
+				return
+			}
 			var identity routesync.ProxyInstance
 			if json.NewDecoder(r.Body).Decode(&identity) != nil {
 				w.WriteHeader(http.StatusBadRequest)

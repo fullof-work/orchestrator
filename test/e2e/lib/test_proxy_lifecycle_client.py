@@ -22,7 +22,10 @@ class LifecycleManagementTest(unittest.TestCase):
                         connection.settimeout(3)
                         request = b''
                         while b'\r\n\r\n' not in request:
-                            request += connection.recv(4096)
+                            chunk = connection.recv(4096)
+                            if not chunk:
+                                return
+                            request += chunk
                         received.append(request)
                         connection.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}')
 

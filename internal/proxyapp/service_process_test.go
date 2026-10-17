@@ -30,11 +30,88 @@ var fixtureBuild = "initial"
 
 type serviceFixtureExtension struct{ s *Service }
 
+// Cancel only after the target really has an open process-local descriptor.
+// This context is part of the test executable, not a production fault hook.
+type fixtureCancelOnTargetOpen struct {
+	context.Context
+	target   os.FileInfo
+	cancel   context.CancelFunc
+	observed bool
+}
+
+func fixtureTargetOpen(target os.FileInfo) bool {
+	entries, _ := os.ReadDir("/proc/self/fd")
+	for _, entry := range entries {
+		if info, err := os.Stat("/proc/self/fd/" + entry.Name()); err == nil && os.SameFile(info, target) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *fixtureCancelOnTargetOpen) Err() error {
+	if !c.observed && fixtureTargetOpen(c.target) {
+		c.observed = true
+		c.cancel()
+	}
+	return c.Context.Err()
+}
+
 func (*serviceFixtureExtension) Start(context.Context, proxyextension.MasterHost) error { return nil }
 func (*serviceFixtureExtension) Shutdown(context.Context) error                         { return nil }
 func (e *serviceFixtureExtension) WrapManagement(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
+		case "/fixture/cancel-opening-restart":
+			e.s.mu.Lock()
+			path := e.s.input.Executable
+			e.s.mu.Unlock()
+			info, err := os.Stat(path)
+			if err != nil || fixtureTargetOpen(info) {
+				http.Error(w, "target unavailable or already open", 500)
+				return
+			}
+			ctx, cancel := context.WithCancel(r.Context())
+			defer cancel()
+			opening := &fixtureCancelOnTargetOpen{Context: ctx, target: info, cancel: cancel}
+			id, err := e.s.InplaceRestart(opening)
+			if !opening.observed || id != "" || !errors.Is(err, context.Canceled) || fixtureTargetOpen(info) {
+				http.Error(w, fmt.Sprintf("target cancellation: observed=%v id=%s err=%v", opening.observed, id, err), 500)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		case "/fixture/concurrent-restart":
+			type result struct {
+				id  RestartID
+				err error
+			}
+			results := make(chan result, 8)
+			start := make(chan struct{})
+			for range 8 {
+				go func() {
+					ctx, cancel := context.WithCancel(r.Context())
+					<-start
+					id, err := e.s.InplaceRestart(ctx)
+					cancel() // An accepted operation outlives this caller.
+					results <- result{id, err}
+				}()
+			}
+			close(start)
+			var accepted RestartID
+			var failure error
+			for range 8 {
+				result := <-results
+				if result.err == nil && result.id != "" && accepted == "" {
+					accepted = result.id
+				} else if result.id != "" || !errors.Is(result.err, ErrRestartInProgress) {
+					failure = errors.Join(failure, fmt.Errorf("unexpected concurrent result: %s %v", result.id, result.err))
+				}
+			}
+			if failure != nil || accepted == "" {
+				http.Error(w, fmt.Sprintf("concurrent acceptance: id=%s err=%v", accepted, failure), 500)
+				return
+			}
+			fmt.Fprint(w, accepted)
 		case "/fixture/cancelled-restart":
 			ctx, cancel := context.WithCancel(r.Context())
 			cancel()
@@ -207,7 +284,7 @@ func fixtureStopBeforeRun(service *Service, input ServiceInput, mode string) err
 }
 
 func TestServiceRealImageReplacement(t *testing.T) {
-	testServiceRealImageReplacement(t, serviceScenario{})
+	testServiceRealImageReplacement(t, serviceScenario{concurrent: true})
 }
 
 func TestServiceRealSignalReplacement(t *testing.T) {
@@ -253,6 +330,7 @@ func TestServiceRealSuccessorFailureDuringCandidateDrain(t *testing.T) {
 }
 
 type serviceScenario struct {
+	concurrent                                                                                                  bool
 	signals, recovery, stopRecovery, execFailure, candidateFailure, stopDrain, forceStopDrain, successorFailure bool
 	legacy                                                                                                      bool
 	metrics                                                                                                     string
@@ -354,15 +432,25 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 	}
 	initialBoot, initialMetrics := status.BootID, status.MetricsAddress
 	if scenario.metrics != "" {
+		if scenario.metrics != "dynamic" && initialMetrics != cfg.MetricsListen {
+			t.Fatalf("A changed configured metrics address: %s want=%s", initialMetrics, cfg.MetricsListen)
+		}
 		checkFixtureMetrics(t, initialMetrics)
 	}
-	response, err := management.Post("http://proxy/fixture/cancelled-restart", "", nil)
-	if err != nil {
-		t.Fatal(err)
+	cancelPaths := []string{"/fixture/cancelled-restart"}
+	if scenario.concurrent {
+		cancelPaths = append(cancelPaths, "/fixture/cancel-opening-restart")
 	}
-	response.Body.Close()
-	if response.StatusCode != http.StatusNoContent {
-		t.Fatalf("pre-acceptance cancellation: %d", response.StatusCode)
+	for _, path := range cancelPaths {
+		response, err := management.Post("http://proxy"+path, "", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(response.Body)
+		response.Body.Close()
+		if err != nil || response.StatusCode != http.StatusNoContent {
+			t.Fatalf("pre-acceptance cancellation: %s %d %s %v", path, response.StatusCode, body, err)
+		}
 	}
 	status = waitServiceStatus(t, management, func(status Status) bool { return status.Ready })
 	if status.InplaceRestart != nil || len(status.Instances) != 1 || status.BootID != initialBoot {
@@ -415,7 +503,7 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 	rejectRestart := scenario.legacy || scenario.metrics == "boundary"
 	for iteration := 0; iteration < 2; iteration++ {
 		var releaseHeld func()
-		if (scenario.execFailure || scenario.candidateFailure || scenario.stopDrain || scenario.successorFailure) && iteration == 0 || scenario.metrics != "" && !rejectRestart && !(scenario.metrics == "occupied" && iteration == 0) {
+		if (scenario.execFailure || scenario.candidateFailure || scenario.stopDrain || scenario.successorFailure) && iteration == 0 || scenario.concurrent || scenario.metrics != "" && !rejectRestart && !(scenario.metrics == "occupied" && iteration == 0) {
 			release := make(chan struct{})
 			var once sync.Once
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -429,11 +517,17 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 			defer once.Do(func() { close(release) })
 			request, _ := http.NewRequest("GET", "http://"+cfg.DataListen+"/fixture/hold", nil)
 			request.Header.Set("X-Fixture-Target", upstream.URL)
-			response, err := client.Do(request)
+			// The original request predates B preparation. Its client deadline
+			// must include that separate 30s budget, not just the drain budget.
+			// The server's shutdown_timeout and full-body assertion stay fixed.
+			heldClient := &http.Client{Transport: client.Transport, Timeout: candidatePrepareTimeout + cfg.ShutdownTimeoutDur() + time.Second}
+			heldAt := time.Now()
+			response, err := heldClient.Do(request)
 			if err != nil {
 				t.Fatal(err)
 			}
 			releaseHeld = func() {
+				t.Logf("release finite response: iteration=%d held_for=%s", iteration, time.Since(heldAt))
 				if !scenario.forceStopDrain {
 					once.Do(func() { close(release) })
 				}
@@ -465,7 +559,11 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 			status = waitServiceStatus(t, management, func(status Status) bool { return status.InplaceRestart != nil && status.InplaceRestart.ID != previous })
 			id = status.InplaceRestart.ID
 		} else {
-			response, err := management.Post("http://proxy/fixture/restart", "", nil)
+			path := "/fixture/restart"
+			if scenario.concurrent {
+				path = "/fixture/concurrent-restart"
+			}
+			response, err := management.Post("http://proxy"+path, "", nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -491,6 +589,14 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 			t.Fatalf("operation ID %q", id)
 		}
 		previous = id
+		if scenario.concurrent {
+			draining := waitServiceStatus(t, management, func(status Status) bool {
+				return status.InplaceRestart != nil && status.InplaceRestart.Phase == "draining_a" && len(status.Instances) == 2
+			})
+			checkFixtureRestartRejected(t, fixtureManagement(draining.Instances[1].StatsSocket), "nested")
+			checkFixtureRestartRejected(t, management, ErrRestartInProgress.Error())
+			releaseHeld()
+		}
 		if scenario.metrics == "occupied" && iteration == 0 {
 			status = waitServiceStatus(t, management, func(status Status) bool {
 				return status.InplaceRestart != nil && status.InplaceRestart.Result != ""
