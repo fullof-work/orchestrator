@@ -11,10 +11,12 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	proxyextension "github.com/kuasar-sandbox/orchestrator/app/proxy/extension"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxycompletion"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
@@ -292,7 +294,7 @@ func TestMasterRealWorkersReadyAndOrderedDrain(t *testing.T) {
 	}
 }
 
-func serveFixtureRoutes(t *testing.T, socket string, metadata bool) {
+func serveFixtureRoutes(t *testing.T, socket string, metadata bool) func() {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(socket), 0700); err != nil {
 		t.Fatal(err)
@@ -301,9 +303,43 @@ func serveFixtureRoutes(t *testing.T, socket string, metadata bool) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var registrationsMu sync.Mutex
+	registrations := map[string]routesync.ProxyInstance{}
+	consume := func() {
+		registrationsMu.Lock()
+		defer registrationsMu.Unlock()
+		for _, identity := range registrations {
+			if complete, err := proxycompletion.Verify(identity); err == nil && complete {
+				if err := proxycompletion.Remove(identity); err != nil {
+					t.Error(err)
+				}
+			}
+		}
+	}
 	server := &http.Server{Handler: h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if _, err := routesync.ReadRegister(r.Body); err != nil {
+		if r.URL.Path == routesync.ProxyRetirePath {
+			var identity routesync.ProxyInstance
+			if json.NewDecoder(r.Body).Decode(&identity) != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if complete, err := proxycompletion.Verify(identity); err == nil && complete {
+				if err := proxycompletion.Remove(identity); err != nil {
+					w.WriteHeader(http.StatusConflict)
+					return
+				}
+			}
+			w.WriteHeader(http.StatusNoContent)
 			return
+		}
+		registration, err := routesync.ReadRegister(r.Body)
+		if err != nil {
+			return
+		}
+		if registration.Proxy != nil && registration.Proxy.Instance != nil {
+			registrationsMu.Lock()
+			registrations[registration.Proxy.Instance.ServiceID] = *registration.Proxy.Instance
+			registrationsMu.Unlock()
 		}
 		policy := routesync.Policy{AuthMode: "enforce", ParkTimeoutMS: 30000, MMDS: &routesync.MMDSProxyPolicy{Enabled: metadata, Listen: "fd=mmds"}}
 		if err := routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{Version: routesync.Version, Policy: policy, ProxyCapabilities: []string{routesync.InplaceRestartV1}}}); err != nil {
@@ -317,6 +353,7 @@ func serveFixtureRoutes(t *testing.T, socket string, metadata bool) {
 	}), &http2.Server{})}
 	go server.Serve(listener)
 	t.Cleanup(func() { server.Close(); listener.Close() })
+	return consume
 }
 
 func TestMasterReportsWorkerCompletionFailure(t *testing.T) {

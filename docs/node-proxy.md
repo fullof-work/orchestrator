@@ -622,6 +622,20 @@ keeps existing admission limits and single-generation concurrency slack. Reserve
 capacity for two instances, two quota sets, FD/memory peaks and the adjacent
 metrics port; there is no cross-generation quota transfer.
 
+Conductor persists the two instance ownership slots across registration loss and
+its own restart. Retirement follows actual worker/process completion; losing a
+connection does not imply zero traffic. Stats queries bind both the registration
+epoch and instance BootID. A private 0600 `.proxy-service-completion-<service-id>`
+file in the configured stats directory is retained across image replacement.
+Only the coordinator signs it, after the entire service has ended. If conductor
+is unavailable at shutdown, the signed file preserves completion without
+extending the service's stop deadline. Conductor consumes it on recovery or a
+stats query; a later admitted coordinator also retries delivery of completed
+files in that directory. Durable retirement precedes removal of the file and
+ownership records. Do not remove incomplete files to make statistics appear
+idle: missing, corrupt or unverifiable evidence remains unavailable. Keep the
+stats directory accessible to conductor and writable by the Proxy service.
+
 ### 9.5 Named listeners and systemd deployment
 
 `data_listen: "fd=proxy-data"` and conductor `mmds.listen: "fd=proxy-mmds"`

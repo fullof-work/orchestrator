@@ -13,25 +13,25 @@ const candidatePrepareTimeout = 30 * time.Second
 
 func (s *Service) drainLocal(deadline time.Time) error {
 	s.mu.Lock()
-	instance, done := s.local, s.localDone
+	instance, done, ended, err := s.local, s.localDone, s.localEnded, s.localResult
 	s.mu.Unlock()
 	if instance == nil || done == nil {
 		return nil
 	}
-	instance.requestStop(deadline)
-	err := <-done
-	s.mu.Lock()
-	if s.localDone == done {
-		s.localDone = nil
+	if !ended {
+		instance.requestStop(deadline)
+		err = <-done
 	}
+	s.mu.Lock()
+	s.localEnded, s.localResult = true, err
 	if s.stopping() {
 		s.stopErr = errors.Join(s.stopErr, err)
 	}
 	s.mu.Unlock()
-	if errors.Is(err, ErrForcedClose) {
+	if !ended && errors.Is(err, ErrForcedClose) {
 		s.recordForced()
 	}
-	return err
+	return errors.Join(err, s.finishLocalRegistration())
 }
 
 func (s *Service) recordForced() {

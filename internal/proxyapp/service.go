@@ -13,6 +13,7 @@ import (
 	"time"
 
 	proxyextension "github.com/kuasar-sandbox/orchestrator/app/proxy/extension"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxycompletion"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
@@ -33,45 +34,54 @@ type Service struct {
 	mu sync.Mutex
 	// actionMu orders stop acceptance against process creation and exec. No
 	// application callback or drain runs while it is held.
-	actionMu       sync.Mutex
-	input          ServiceInput
-	baseline       *EffectiveConfig
-	prepare        PrepareService
-	prepareCancel  context.CancelFunc
-	runner         MasterRunner
-	local          *Instance
-	localDone      chan error
-	localExtension any
-	resources      *retainedResources
-	child          *serviceChild
-	operation      *RestartStatus
-	target         *restartTarget
-	stopRecord     *stopRecord
-	stop           chan struct{}
-	stopOnce       sync.Once
-	stopMMDS       chan struct{}
-	stopReleased   sync.Once
-	done           chan struct{}
-	changed        chan struct{}
-	requests       chan struct{}
-	preparing      bool
-	running        bool
-	started        bool
-	closing        bool
-	finished       sync.Once
-	knownService   *Status
-	candidate      bool
-	parent         *serviceWire
-	err            error
-	stopErr        error
-	timeout        time.Duration
-	logger         *slog.Logger
-	coordinatorPID int
+	actionMu          sync.Mutex
+	input             ServiceInput
+	baseline          *EffectiveConfig
+	prepare           PrepareService
+	prepareCancel     context.CancelFunc
+	runner            MasterRunner
+	local             *Instance
+	localDone         chan error
+	localEnded        bool
+	localResult       error
+	localIdentity     *routesync.ProxyInstance
+	completion        routesync.ProxyCompletion
+	completionKey     []byte
+	ownershipRestored bool
+	serviceID         string
+	localGeneration   uint64
+	childGeneration   uint64
+	localExtension    any
+	resources         *retainedResources
+	child             *serviceChild
+	operation         *RestartStatus
+	target            *restartTarget
+	stopRecord        *stopRecord
+	stop              chan struct{}
+	stopOnce          sync.Once
+	stopMMDS          chan struct{}
+	stopReleased      sync.Once
+	done              chan struct{}
+	changed           chan struct{}
+	requests          chan struct{}
+	preparing         bool
+	running           bool
+	started           bool
+	closing           bool
+	finished          sync.Once
+	knownService      *Status
+	candidate         bool
+	parent            *serviceWire
+	err               error
+	stopErr           error
+	timeout           time.Duration
+	logger            *slog.Logger
+	coordinatorPID    int
 }
 
 // NewService performs no I/O. Runtime resources are acquired by Run.
 func NewService() *Service {
-	return &Service{stop: make(chan struct{}), done: make(chan struct{}), changed: make(chan struct{}), requests: make(chan struct{}, 1), timeout: 30 * time.Second, coordinatorPID: os.Getpid()}
+	return &Service{stop: make(chan struct{}), done: make(chan struct{}), changed: make(chan struct{}), requests: make(chan struct{}, 1), timeout: 30 * time.Second, coordinatorPID: os.Getpid(), serviceID: newBootID()}
 }
 
 func (s *Service) notifyLocked() { close(s.changed); s.changed = make(chan struct{}) }
@@ -242,6 +252,9 @@ func (s *Service) beginShutdown(deadline time.Time) chan struct{} {
 		instance.requestStop(deadline)
 	}
 	if child != nil {
+		child.mu.Lock()
+		child.draining = true
+		child.mu.Unlock()
 		_ = child.wire.send(serviceMessage{Kind: "drain", Deadline: deadline, HoldMMDS: true})
 	}
 	go s.releaseShutdownMMDS(deadline, instance, done, child, gate)
@@ -369,6 +382,7 @@ func (s *Service) Run(ctx context.Context, input ServiceInput, continuation *Con
 		s.mu.Unlock()
 	}()
 	defer s.releaseService()
+	defer func() { returnErr = errors.Join(returnErr, s.finishServiceRegistration()) }()
 	if continuation != nil {
 		defer continuation.Close()
 		if err := s.restore(continuation); err != nil {
@@ -389,6 +403,7 @@ func (s *Service) Run(ctx context.Context, input ServiceInput, continuation *Con
 	if s.candidate {
 		return s.runCandidate(ctx)
 	}
+	s.ownershipRestored = true
 	deadline, err := s.stopRecord.read()
 	if err != nil {
 		return err
@@ -434,7 +449,10 @@ func (s *Service) Run(ctx context.Context, input ServiceInput, continuation *Con
 				return err
 			}
 		case err := <-localDone:
-			return err
+			s.mu.Lock()
+			s.localEnded, s.localResult = true, err
+			s.mu.Unlock()
+			return errors.Join(err, s.finishLocalRegistration())
 		}
 	}
 }
@@ -444,6 +462,10 @@ func (s *Service) startLocal(ctx context.Context, boot, id string, resources *re
 	if s.stopping() {
 		s.mu.Unlock()
 		return ErrStopped
+	}
+	if s.localDone != nil {
+		s.mu.Unlock()
+		return fmt.Errorf("previous local instance has not completed retirement")
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	s.prepareCancel = cancel
@@ -513,6 +535,24 @@ func (s *Service) startLocal(ctx context.Context, boot, id string, resources *re
 		operation = s.operation.ID
 	}
 	instance := NewInstance(id, boot, operation, config.Workers)
+	identity := routesync.ProxyInstance{ServiceID: s.serviceID, BootID: instance.identity.BootID, Slot: "coordinator", CoordinatorPID: s.coordinatorPID}
+	if s.candidate {
+		identity.Slot, identity.Generation = "candidate", s.childGeneration
+	} else {
+		s.localGeneration++
+		identity.Generation = s.localGeneration
+	}
+	if !s.candidate && s.completion.Path == "" {
+		s.completion, s.completionKey, err = proxycompletion.Create(config.StatsSocket, identity)
+		if err != nil {
+			s.mu.Unlock()
+			return err
+		}
+	}
+	identity.Completion = s.completion
+	s.localIdentity = &identity
+	s.localEnded, s.localResult = false, nil
+	startup.Runtime.statsIdentity = &identity
 	instance.statusProvider = s.Status
 	startup.Runtime.Instance = instance
 	startup.Runtime.inherited = resources

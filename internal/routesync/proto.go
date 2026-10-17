@@ -300,7 +300,8 @@ type Subscribe struct {
 // Proxy marks the trusted independent proxy registration and optionally exposes
 // its master-only traffic stats socket.
 type Proxy struct {
-	StatsSocket *Socket `json:"stats_socket,omitempty"`
+	StatsSocket *Socket        `json:"stats_socket,omitempty"`
+	Instance    *ProxyInstance `json:"instance,omitempty"`
 }
 
 // Telemetry advertises an optional local HTTP API. Queries never use route frames.

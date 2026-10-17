@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/listenresource"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"golang.org/x/sys/unix"
 )
 
@@ -20,6 +21,7 @@ type serviceChild struct {
 	mu             sync.Mutex
 	pid            int
 	boot           string
+	generation     uint64
 	wire           *serviceWire
 	resources      *retainedResources
 	status         InstanceStatus
@@ -31,6 +33,13 @@ type serviceChild struct {
 	changed        chan struct{}
 	detached       chan struct{}
 	readerDone     chan struct{}
+	exited         bool
+}
+
+func (c *serviceChild) readerCompletion() <-chan struct{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.readerDone
 }
 
 func (c *serviceChild) snapshot() InstanceStatus {
@@ -44,6 +53,7 @@ func (c *serviceChild) notifyLocked() { close(c.changed); c.changed = make(chan 
 func (c *serviceChild) failed() error { c.mu.Lock(); defer c.mu.Unlock(); return c.err }
 
 func (s *Service) watchChild(c *serviceChild) {
+	s.readChild(c)
 	go func() {
 		var status unix.WaitStatus
 		var err error
@@ -76,6 +86,14 @@ func (s *Service) watchChild(c *serviceChild) {
 				break
 			}
 		}
+		// The whole process group has exited. Apply its queued final snapshots
+		// and errors before reporting completion; closing the local connection
+		// first could discard an extension failure sent just before exit.
+		c.mu.Lock()
+		c.exited = true
+		readerDone := c.readerDone
+		c.mu.Unlock()
+		<-readerDone
 		c.mu.Lock()
 		c.err = errors.Join(c.err, err)
 		c.status.Ready = false
@@ -87,13 +105,19 @@ func (s *Service) watchChild(c *serviceChild) {
 		c.mu.Unlock()
 		_ = c.wire.conn.Close()
 	}()
-	s.readChild(c)
 }
 
 func (s *Service) readChild(c *serviceChild) {
-	c.readerDone = make(chan struct{})
+	c.mu.Lock()
+	if c.exited {
+		c.mu.Unlock()
+		return
+	}
+	readerDone := make(chan struct{})
+	c.readerDone = readerDone
+	c.mu.Unlock()
 	go func() {
-		defer close(c.readerDone)
+		defer close(readerDone)
 		for {
 			message, err := c.wire.read()
 			if err != nil {
@@ -258,7 +282,11 @@ func cleanContinuationEnvironment() []string {
 func (s *Service) envelope(mode, boot, id string, r *retainedResources) continuationEnvelope {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return continuationEnvelope{Mode: mode, Input: s.input, Baseline: append([]byte(nil), s.baseline.raw...), BootID: boot, InstanceID: id, Operation: *s.operation, TargetIdentity: s.target.identity, TargetDigest: s.target.digest, DataExpression: r.DataExpression, MMDSExpression: r.MMDSExpression, StatsPath: r.StatsPath, ShmPath: r.ShmPath, StatsIdentity: r.StatsIdentity, ShmIdentity: r.ShmIdentity, MetricsExpression: r.MetricsExpression}
+	e := continuationEnvelope{ServiceID: s.serviceID, Completion: s.completion, LocalGeneration: s.localGeneration, ChildGeneration: s.childGeneration, Mode: mode, Input: s.input, Baseline: append([]byte(nil), s.baseline.raw...), BootID: boot, InstanceID: id, Operation: *s.operation, TargetIdentity: s.target.identity, TargetDigest: s.target.digest, DataExpression: r.DataExpression, MMDSExpression: r.MMDSExpression, StatsPath: r.StatsPath, ShmPath: r.ShmPath, StatsIdentity: r.StatsIdentity, ShmIdentity: r.ShmIdentity, MetricsExpression: r.MetricsExpression}
+	if mode == "resume" {
+		e.CompletionKey = append([]byte(nil), s.completionKey...)
+	}
+	return e
 }
 
 func (s *Service) startChild() (child *serviceChild, returnErr error) {
@@ -287,6 +315,7 @@ func (s *Service) startChild() (child *serviceChild, returnErr error) {
 	defer remote.Close()
 	s.mu.Lock()
 	target, record := s.target, s.stopRecord
+	s.childGeneration++
 	s.operation.Attempts++
 	s.operation.Phase = "preparing_b"
 	s.operation.NextAttempt = nil
@@ -336,6 +365,7 @@ func (s *Service) startChild() (child *serviceChild, returnErr error) {
 		return nil, err
 	}
 	child = &serviceChild{pid: process.Pid, boot: boot, wire: wire, resources: r, status: InstanceStatus{InstanceID: envelope.InstanceID, BootID: boot, PID: process.Pid, Phase: "starting"}, done: make(chan struct{}), changed: make(chan struct{}), detached: make(chan struct{})}
+	child.generation = envelope.ChildGeneration
 	_ = process.Release()
 	s.mu.Lock()
 	s.child = child
@@ -373,7 +403,7 @@ func (s *Service) reapChild(c *serviceChild, deadline time.Time, hold bool) (ret
 		<-c.done
 	}
 	_ = c.wire.conn.Close()
-	<-c.readerDone
+	<-c.readerCompletion()
 	err := c.failed()
 	if forced {
 		err = errors.Join(err, ErrForcedClose)
@@ -393,6 +423,13 @@ func (s *Service) reapChild(c *serviceChild, deadline time.Time, hold bool) (ret
 		if cleanup := c.resources.removePaths(); cleanup != nil {
 			return errors.Join(err, cleanup)
 		}
+	}
+	s.mu.Lock()
+	identity := routesync.ProxyInstance{ServiceID: s.serviceID, BootID: c.boot, Slot: "candidate", Generation: c.generation, CoordinatorPID: s.coordinatorPID, Completion: s.completion}
+	configSocket := s.baseline.config.ConfigSocket
+	s.mu.Unlock()
+	if retirement := s.retireInstance(configSocket, identity, true); retirement != nil {
+		return errors.Join(err, retirement)
 	}
 	s.mu.Lock()
 	if s.child == c {

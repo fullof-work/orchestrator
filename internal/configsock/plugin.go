@@ -35,10 +35,13 @@ type Plugin struct {
 // register and Removes on disconnect. It also coordinates the trusted Proxy
 // route barrier and exposes that registration's traffic-stats socket.
 type Registry struct {
-	mu        sync.Mutex
-	m         map[string]*Plugin
-	nextEpoch uint64
-	barriers  map[string]*proxyRouteBarrier
+	mu          sync.Mutex
+	m           map[string]*Plugin
+	nextEpoch   uint64
+	barriers    map[string]*proxyRouteBarrier
+	obligations map[string]routesync.ProxyStatsRecord
+	storage     ProxyStatsStore
+	kernelBoot  string
 }
 
 var (
@@ -48,14 +51,18 @@ var (
 )
 
 func NewRegistry() *Registry {
-	return &Registry{m: map[string]*Plugin{}, barriers: map[string]*proxyRouteBarrier{}}
+	return &Registry{m: map[string]*Plugin{}, barriers: map[string]*proxyRouteBarrier{}, obligations: map[string]routesync.ProxyStatsRecord{}}
 }
 
 // Add registers p, evicting (and closing the stream of) any existing registration
 // with the same id — a re-register deregisters the prior. The lock serializes this
 // against the evicted plugin's Remove, so the successor is never dropped.
-func (r *Registry) Add(p *Plugin) {
+func (r *Registry) Add(p *Plugin) error {
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.admitObligationLocked(p); err != nil {
+		return err
+	}
 	if old := r.m[p.ID]; old != nil && old != p {
 		r.failBarriersLocked(old, ErrProxyRouteLeaseChanged)
 		if old.revoke != nil {
@@ -73,7 +80,7 @@ func (r *Registry) Add(p *Plugin) {
 	}
 	p.lease, p.revoke = context.WithCancel(p.lease)
 	r.m[p.ID] = p
-	r.mu.Unlock()
+	return nil
 }
 
 // Remove deregisters p only if it is still the current registration for its id, so
@@ -293,23 +300,43 @@ type ProxyStatsRegistration struct {
 	InstanceID string
 	Epoch      uint64
 	Socket     string
+	BootID     string
 }
 
 func (r *Registry) ProxyStatsTargets() ([]ProxyStatsRegistration, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.consumeCompletionsLocked()
 	var targets []ProxyStatsRegistration
 	seen := map[string]bool{}
+	// A lost registration or conductor restart does not prove that its workers
+	// stopped. Every durable obligation must have the exact live incarnation.
+	for _, record := range r.obligations {
+		if record.Retired {
+			continue
+		}
+		current := r.m[record.InstanceID]
+		if current == nil || current.Caps.Proxy == nil || current.Caps.Proxy.Instance == nil || *current.Caps.Proxy.Instance != record.Identity || current.peerPID != record.PeerPID {
+			return nil, false
+		}
+	}
 	for _, p := range r.m {
 		if p.Caps.Proxy == nil {
 			continue
+		}
+		boot := ""
+		if identity := p.Caps.Proxy.Instance; identity != nil {
+			if r.obligations[identity.Key()].Retired {
+				continue
+			}
+			boot = identity.BootID
 		}
 		endpoint := p.Caps.Proxy.StatsSocket
 		if endpoint == nil || endpoint.Path == "" || seen[endpoint.Path] {
 			return nil, false
 		}
 		seen[endpoint.Path] = true
-		targets = append(targets, ProxyStatsRegistration{p.ID, p.epoch, endpoint.Path})
+		targets = append(targets, ProxyStatsRegistration{InstanceID: p.ID, Epoch: p.epoch, Socket: endpoint.Path, BootID: boot})
 	}
 	slices.SortFunc(targets, func(a, b ProxyStatsRegistration) int {
 		if a.InstanceID < b.InstanceID {
@@ -356,7 +383,10 @@ func (s *Server) handlePluginRegister(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	p := &Plugin{ID: id, Caps: reg, peerPID: peer, cancel: cancel, lease: ctx}
-	s.deps.Plugins.Add(p)
+	if err := s.deps.Plugins.Add(p); err != nil {
+		http.Error(w, "proxy registration identity unavailable", http.StatusConflict)
+		return
+	}
 	defer s.deps.Plugins.Remove(p)
 	s.log.Info("plugin registered", "id", id, "subscribe", reg.SubscribeKind(), "proxy", reg.Proxy != nil, "mmds", reg.Mmds)
 	hooks := &routesync.StreamHooks{

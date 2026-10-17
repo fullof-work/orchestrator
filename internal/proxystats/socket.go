@@ -53,6 +53,8 @@ type RouteIdentity struct {
 }
 
 type StatsServer struct {
+	// BootID is fixed before Serve for the lifetime of this instance.
+	BootID string
 	master *MasterStats
 	synced func() bool
 	lookup func(string) (RouteIdentity, bool)
@@ -94,6 +96,11 @@ func (s *StatsServer) Handler() http.Handler {
 
 func (s *StatsServer) batchGet(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Kuasar-Proxy-Boot-ID", s.BootID)
+	if expected := r.Header.Get("X-Kuasar-Proxy-Boot-ID"); expected != "" && expected != s.BootID {
+		writeSocketError(w, http.StatusServiceUnavailable, "proxy instance identity unavailable")
+		return
+	}
 	if s.master == nil || s.synced == nil || !s.synced() || s.lookup == nil || !s.master.Available() {
 		writeSocketError(w, http.StatusServiceUnavailable, "traffic stats unavailable")
 		return
@@ -151,6 +158,12 @@ func writeSocketError(w http.ResponseWriter, status int, message string) {
 }
 
 func QuerySocket(ctx context.Context, socketPath string, queries []TrafficQuery) ([]BatchResult, error) {
+	return QueryInstanceSocket(ctx, socketPath, "", queries)
+}
+
+// QueryInstanceSocket additionally binds the response to a registered BootID.
+// Empty identity preserves the existing single-instance peer contract.
+func QueryInstanceSocket(ctx context.Context, socketPath, bootID string, queries []TrafficQuery) ([]BatchResult, error) {
 	if socketPath == "" || len(queries) == 0 || len(queries) > maxBatchQueries {
 		return nil, api.ErrStatsUnavailable
 	}
@@ -170,11 +183,17 @@ func QuerySocket(ctx context.Context, socketPath string, queries []TrafficQuery)
 		return nil, err
 	}
 	request.Header.Set("Content-Type", "application/json")
+	if bootID != "" {
+		request.Header.Set("X-Kuasar-Proxy-Boot-ID", bootID)
+	}
 	response, err := client.Do(request)
 	if err != nil {
 		return nil, fmt.Errorf("%w: query proxy stats: %v", api.ErrStatsUnavailable, err)
 	}
 	defer response.Body.Close()
+	if bootID != "" && response.Header.Get("X-Kuasar-Proxy-Boot-ID") != bootID {
+		return nil, api.ErrStatsUnavailable
+	}
 	if response.StatusCode != http.StatusOK {
 		if response.StatusCode == http.StatusConflict {
 			return nil, api.ErrStatsConflict

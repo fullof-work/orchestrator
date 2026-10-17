@@ -24,6 +24,8 @@ func (s *Service) restore(c *Continuation) error {
 	e := c.envelope
 	s.input = e.Input
 	s.operation = &e.Operation
+	s.serviceID, s.localGeneration, s.childGeneration = e.ServiceID, e.LocalGeneration, e.ChildGeneration
+	s.completion, s.completionKey = e.Completion, e.CompletionKey
 	baseline, err := effectiveConfigFromRaw(e.Baseline, sha256.Sum256(e.Baseline))
 	if err != nil {
 		return err
@@ -55,6 +57,7 @@ func (s *Service) restore(c *Continuation) error {
 			return fmt.Errorf("proxy continuation child identity invalid")
 		}
 		child := &serviceChild{pid: e.CandidatePID, boot: boot, wire: wire, resources: &retainedResources{StatsPath: e.CandidateStatsPath, ShmPath: e.CandidateShmPath, StatsIdentity: e.CandidateStatsIdentity, ShmIdentity: e.CandidateShmIdentity, Metrics: c.take(e.Files.CandidateMetrics), MetricsExpression: e.CandidateMetricsExpression}, status: InstanceStatus{PID: e.CandidatePID, BootID: boot, Phase: "starting"}, done: make(chan struct{}), changed: make(chan struct{}), detached: make(chan struct{})}
+		child.generation = e.ChildGeneration
 		s.child = child
 		// Restore supervision before validating or preparing business resources.
 		s.watchChild(child)
@@ -222,6 +225,9 @@ func (s *Service) runCandidate(ctx context.Context) error {
 }
 
 func (s *Service) execTarget() error {
+	if err := s.finishLocalRegistration(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	child, r, target, record := s.child, s.resources, s.target, s.stopRecord
 	s.mu.Unlock()
@@ -239,7 +245,7 @@ func (s *Service) execTarget() error {
 	defer timer.Stop()
 	select {
 	case <-child.detached:
-		<-child.readerDone
+		<-child.readerCompletion()
 	case <-child.done:
 		return errors.Join(ErrNotReady, child.failed())
 	case <-s.stop:

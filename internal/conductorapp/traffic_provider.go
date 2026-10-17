@@ -37,7 +37,7 @@ func (p *ExternalTrafficProvider) SandboxTrafficStatsBatch(ctx context.Context, 
 	batches := make([][]proxystats.BatchResult, len(targets))
 	for index, target := range targets {
 		var err error
-		batches[index], err = proxystats.QuerySocket(ctx, target.Socket, queries)
+		batches[index], err = proxystats.QueryInstanceSocket(ctx, target.Socket, target.BootID, queries)
 		if err != nil {
 			return nil, err
 		}

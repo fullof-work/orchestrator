@@ -80,20 +80,21 @@ type workerState struct {
 // Instance owns one generation's control state. The service coordinator owns
 // cross-generation actions; stopping this instance never stops its replacement.
 type Instance struct {
-	mu             sync.Mutex
-	identity       controlIdentity
-	status         InstanceStatus
-	workers        []workerState
-	changed        chan struct{}
-	stop           chan struct{}
-	done           chan struct{}
-	stopping       bool
-	deadline       time.Time
-	err            error
-	initialized    bool
-	everSynced     bool
-	capabilities   []string
-	statusProvider func() Status
+	mu                sync.Mutex
+	identity          controlIdentity
+	status            InstanceStatus
+	workers           []workerState
+	changed           chan struct{}
+	stop              chan struct{}
+	done              chan struct{}
+	stopping          bool
+	deadline          time.Time
+	err               error
+	initialized       bool
+	everSynced        bool
+	capabilities      []string
+	capabilitiesKnown bool
+	statusProvider    func() Status
 	// A full-service stop may hold MMDS until every instance has drained data.
 	mmdsGate <-chan struct{}
 }
@@ -290,5 +291,6 @@ func (s *readinessSink) SetProxyCapabilities(capabilities []string) {
 	s.instance.mu.Lock()
 	defer s.instance.mu.Unlock()
 	s.instance.capabilities = append([]string(nil), capabilities...)
+	s.instance.capabilitiesKnown = true
 	s.instance.notifyLocked()
 }

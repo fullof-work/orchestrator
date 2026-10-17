@@ -1,9 +1,12 @@
 package proxyapp
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxycompletion"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -16,6 +19,45 @@ import (
 type statusLogHandler struct {
 	slog.Handler
 	service *Service
+}
+
+func TestCompletionBeforeSuccessorInitialization(t *testing.T) {
+	s := NewService()
+	cfg := testProxyConfig(t)
+	cfg.StatsSocket = filepath.Join(t.TempDir(), "stats.sock")
+	cfg.ConfigSocket = filepath.Join(t.TempDir(), "offline.sock")
+	var err error
+	s.baseline, err = FreezeConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.ownershipRestored = true
+	identity := routesync.ProxyInstance{ServiceID: s.serviceID, BootID: s.serviceID, Slot: "coordinator", Generation: 1, CoordinatorPID: os.Getpid()}
+	s.completion, s.completionKey, err = proxycompletion.Create(cfg.StatsSocket, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity.Completion = s.completion
+	s.child = &serviceChild{done: make(chan struct{})}
+	if err := s.finishServiceRegistration(); err == nil {
+		t.Fatal("signed completion before candidate reaping")
+	}
+	if done, _ := proxycompletion.Verify(identity); done {
+		t.Fatal("live candidate was signed complete")
+	}
+	close(s.child.done)
+	if err := s.finishServiceRegistration(); err != nil {
+		t.Fatal(err)
+	}
+	if done, err := proxycompletion.Verify(identity); err != nil || !done {
+		t.Fatalf("uninitialized A-prime lost completed B responsibility: %v %v", done, err)
+	}
+	s.operation, s.target = &RestartStatus{ID: "test"}, &restartTarget{}
+	candidate := s.envelope("candidate", newBootID(), "proxy-b", &retainedResources{})
+	successor := s.envelope("resume", newBootID(), "proxy", &retainedResources{})
+	if len(candidate.CompletionKey) != 0 || !bytes.Equal(successor.CompletionKey, s.completionKey) {
+		t.Fatal("completion signing authority crossed the wrong process boundary")
+	}
 }
 
 func (h statusLogHandler) Enabled(context.Context, slog.Level) bool { return true }
@@ -122,6 +164,10 @@ func TestShutdownRetainsPreviouslyConsumedDrainResult(t *testing.T) {
 	if err := service.requestShutdown(); err != nil {
 		t.Fatal(err)
 	}
+	service.local.mu.Lock()
+	service.local.status.Data = "stopped"
+	service.local.notifyLocked()
+	service.local.mu.Unlock()
 	if err := service.drainLocal(time.Now()); !errors.Is(err, ErrForcedClose) {
 		t.Fatal(err)
 	}

@@ -112,6 +112,7 @@ func TestQuerySocketRoundTrip(t *testing.T) {
 		return RouteIdentity{RunID: "run-1", Profile: types.ProfileE2B, State: types.StateRunning}, sandboxID == "s1"
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	done := make(chan error, 1)
+	server.BootID = "actual-instance"
 	go func() { done <- server.Serve(ctx, listener) }()
 
 	results, err := QuerySocket(context.Background(), socket, []TrafficQuery{{
@@ -122,6 +123,13 @@ func TestQuerySocketRoundTrip(t *testing.T) {
 	}
 	if len(results) != 1 || results[0].Stats == nil || len(results[0].Stats.Services) != 4 {
 		t.Fatalf("query results = %+v", results)
+	}
+	query := []TrafficQuery{{SandboxID: "s1", RunID: "run-1", Profile: types.ProfileE2B, State: types.StateRunning}}
+	if _, err := QueryInstanceSocket(ctx, socket, "actual-instance", query); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := QueryInstanceSocket(ctx, socket, "different-instance", query); !errors.Is(err, api.ErrStatsUnavailable) {
+		t.Fatalf("accepted another BootID: %v", err)
 	}
 	cancel()
 	select {

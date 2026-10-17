@@ -858,6 +858,16 @@ metrics 为空则均关闭；固定 `host:p` 的 A/A′ 用 p、B 用 p+1；端�
 各代保留既有额度和单代并发余量，部署预留双实例 CPU、内存、FD、两份额度和相邻 metrics
 端口，不进行跨代额度转移。
 
+conductor 持久保存两个实例的归属槽位，注册断连或 conductor 自身重启不会遗忘仍可能
+持有业务的实例。只有实际回收 worker/进程后才确认退役；统计查询同时核对注册 epoch
+与实例 BootID。服务在配置的 stats 目录保留一个 0600 私有文件
+`.proxy-service-completion-<service-id>`，跨程序映像替换沿用；只有协调者在整个服务
+结束后才签署完成凭据。停机时 conductor 不可达，签名文件保存完成证据，不延长服务
+停机期限。conductor 恢复或查询统计时消费凭据；后续已准入协调者也会重试转交同目录
+的完成文件。先持久确认退役，再删除文件和归属记录。不要通过删除未完成文件让统计
+看似空闲：证据缺失、损坏或无法验证仍返回不可用。stats 目录需允许 conductor 访问，
+并保持 Proxy 服务可写。
+
 ### 9.5 命名监听与 systemd 部署
 
 `data_listen: "fd=proxy-data"` 与 conductor `mmds.listen: "fd=proxy-mmds"`

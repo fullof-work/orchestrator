@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"sync"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/netns"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyadmission"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxycompletion"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyext"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyshm"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxystats"
@@ -213,6 +215,7 @@ func RunMaster(ctx context.Context, effective *EffectiveConfig, runtime *Runtime
 			TrafficPolicyInvalid: route.TrafficPolicyInvalid,
 		}, true
 	}, logger)
+	statsServer.BootID = instance.identity.BootID
 	managementHandler := statsServer.Handler()
 	if managementWrapper != nil {
 		managementHandler = managementWrapper.WrapManagement(managementHandler)
@@ -237,6 +240,7 @@ func RunMaster(ctx context.Context, effective *EffectiveConfig, runtime *Runtime
 		Subscribe: &routesync.Subscribe{Kind: routesync.KindRouteWake},
 		Proxy: &routesync.Proxy{
 			StatsSocket: &routesync.Socket{Path: cfg.StatsSocket},
+			Instance:    runtime.statsIdentity,
 		},
 		Mmds: true,
 	}
@@ -246,6 +250,31 @@ func RunMaster(ctx context.Context, effective *EffectiveConfig, runtime *Runtime
 	startMasterTask(func() {
 		routesync.NewSubscriber(dial, instance.status.InstanceID, registration, routeSink, view, logger).Run(masterCtx)
 	})
+	if runtime.statsIdentity != nil && runtime.statsIdentity.Slot == "coordinator" {
+		startMasterTask(func() {
+			retry := time.NewTicker(10 * time.Second)
+			defer retry.Stop()
+			for {
+				instance.mu.Lock()
+				changed := instance.changed
+				supported := slices.Contains(instance.capabilities, routesync.InplaceRestartV1)
+				instance.mu.Unlock()
+				if supported {
+					for _, receipt := range proxycompletion.Pending(cfg.StatsSocket) {
+						if err := retireProxyInstanceContext(masterCtx, cfg.ConfigSocket, receipt, true); err != nil && masterCtx.Err() == nil {
+							logger.Warn("proxy completion delivery", "err", err)
+						}
+					}
+				}
+				select {
+				case <-changed:
+				case <-retry.C:
+				case <-masterCtx.Done():
+					return
+				}
+			}
+		})
+	}
 
 	var mmdsListener net.Listener
 	mmdsPolicy, ready := view.WaitPolicy(startupCtx)

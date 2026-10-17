@@ -176,7 +176,7 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 	}
 	cfg.DataListen = listener.Addr().String()
 	listener.Close()
-	serveFixtureRoutes(t, cfg.ConfigSocket, false)
+	consumeCompletions := serveFixtureRoutes(t, cfg.ConfigSocket, false)
 	dir := filepath.Dir(cfg.StatsSocket)
 	initial, err := os.Executable()
 	if err != nil {
@@ -549,6 +549,9 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 			t.Fatalf("resource remains: %s: %v", path, err)
 		}
 	}
+	// A forced stop can exhaust the service's one deadline before an RPC ACK.
+	// The authority consumes its admitted, signed completion on its next read.
+	consumeCompletions()
 	paths, _ := filepath.Glob(filepath.Join(dir, ".proxy-*"))
 	if len(paths) != 0 {
 		t.Fatalf("candidate resources remain: %v", paths)
