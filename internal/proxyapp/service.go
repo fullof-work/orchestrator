@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"slices"
 	"sync"
 	"time"
@@ -63,11 +64,12 @@ type Service struct {
 	err            error
 	timeout        time.Duration
 	logger         *slog.Logger
+	coordinatorPID int
 }
 
 // NewService performs no I/O. Runtime resources are acquired by Run.
 func NewService() *Service {
-	return &Service{stop: make(chan struct{}), done: make(chan struct{}), changed: make(chan struct{}), requests: make(chan struct{}, 1), timeout: 30 * time.Second}
+	return &Service{stop: make(chan struct{}), done: make(chan struct{}), changed: make(chan struct{}), requests: make(chan struct{}, 1), timeout: 30 * time.Second, coordinatorPID: os.Getpid()}
 }
 
 func (s *Service) notifyLocked() { close(s.changed); s.changed = make(chan struct{}) }
@@ -75,7 +77,7 @@ func (s *Service) notifyLocked() { close(s.changed); s.changed = make(chan struc
 func (s *Service) Status() Status {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	result := Status{InstanceStatus: InstanceStatus{Phase: "starting", Reasons: []string{"not_started"}}, Instances: []InstanceStatus{}}
+	result := Status{InstanceStatus: InstanceStatus{Phase: "starting", Reasons: []string{"not_started"}}, CoordinatorPID: s.coordinatorPID, Instances: []InstanceStatus{}}
 	if s.local != nil {
 		result.InstanceStatus = s.local.Snapshot()
 		result.Instances = append(result.Instances, result.InstanceStatus)
@@ -299,7 +301,13 @@ func (s *Service) InplaceRestart(ctx context.Context) (RestartID, error) {
 	s.mu.Unlock()
 	target, err := openRestartTarget(ctx, input.Executable)
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	var logOperation func()
+	defer func() {
+		s.mu.Unlock()
+		if logOperation != nil {
+			logOperation()
+		}
+	}()
 	s.preparing = false
 	if err != nil {
 		return "", err
@@ -319,7 +327,7 @@ func (s *Service) InplaceRestart(ctx context.Context) (RestartID, error) {
 	id := RestartID(newBootID())
 	s.target = target
 	s.operation = &RestartStatus{ID: id, Phase: "preparing_b", Target: target.description()}
-	s.logOperationLocked()
+	logOperation = s.operationLogLocked()
 	s.notifyLocked()
 	s.requests <- struct{}{}
 	return id, nil
@@ -520,25 +528,27 @@ func (s *Service) startLocal(ctx context.Context, boot, id string, resources *re
 
 func (s *Service) phase(phase string, err error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.operation.Phase = phase
 	s.operation.NextAttempt = nil
 	if err != nil {
 		s.operation.LastError = err.Error()
 	}
-	s.logOperationLocked()
+	logOperation := s.operationLogLocked()
 	s.notifyLocked()
+	s.mu.Unlock()
+	logOperation()
 }
 
 func (s *Service) operationComplete(result string, err error) {
 	s.phase("completed", err)
 	s.mu.Lock()
 	s.operation.Result = result
-	s.logOperationLocked()
+	logOperation := s.operationLogLocked()
 	target := s.target
 	s.target = nil
 	s.notifyLocked()
 	s.mu.Unlock()
+	logOperation()
 	if target != nil {
 		target.file.Close()
 	}
@@ -583,9 +593,10 @@ func (s *Service) backoff(attempt int, err error) bool {
 	s.operation.Phase = "recovering"
 	s.operation.LastError = err.Error()
 	s.operation.NextAttempt = &next
-	s.logOperationLocked()
+	logOperation := s.operationLogLocked()
 	s.notifyLocked()
 	s.mu.Unlock()
+	logOperation()
 	timer := time.NewTimer(time.Until(next))
 	defer timer.Stop()
 	select {
@@ -596,14 +607,18 @@ func (s *Service) backoff(attempt int, err error) bool {
 	}
 }
 
-func (s *Service) logOperationLocked() {
+// Copy under the state lock, then invoke the application-supplied logger after
+// unlocking. A logger may itself inspect the public status snapshot.
+func (s *Service) operationLogLocked() func() {
 	logger := s.logger
 	if logger == nil {
 		logger = slog.Default()
 	}
-	op := s.operation
-	logger.Info("proxy InplaceRestart", "id", op.ID, "phase", op.Phase,
-		"target", op.Target, "attempts", op.Attempts, "last_error", op.LastError,
-		"next_attempt", op.NextAttempt, "result", op.Result,
-		"forced_close_count", op.ForcedCloseCount)
+	op := *s.operation
+	return func() {
+		logger.Info("proxy InplaceRestart", "id", op.ID, "phase", op.Phase,
+			"target", op.Target, "attempts", op.Attempts, "last_error", op.LastError,
+			"next_attempt", op.NextAttempt, "result", op.Result,
+			"forced_close_count", op.ForcedCloseCount)
+	}
 }

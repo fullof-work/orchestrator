@@ -14,6 +14,8 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -219,7 +221,7 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", cfg.StatsSocket)
 	}}, Timeout: time.Second}
 	status := waitServiceStatus(t, management, func(status Status) bool { return status.Ready })
-	if status.PID != pid || !status.ServiceReady {
+	if status.PID != pid || status.CoordinatorPID != pid || !status.ServiceReady {
 		t.Fatalf("initial identity: %+v", status)
 	}
 	if err := os.Rename(target, deployment); err != nil {
@@ -325,11 +327,11 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 		}
 		previous = id
 		if scenario.successorFailure && iteration == 0 {
-			waitServiceStatus(t, management, func(status Status) bool {
-				return status.InplaceRestart != nil && status.InplaceRestart.Phase == "draining_a"
+			originalDraining := waitServiceStatus(t, management, func(status Status) bool {
+				return status.InplaceRestart != nil && status.InplaceRestart.Phase == "draining_a" && status.Workers.Ready == 0
 			})
 			// A no longer accepts, so this finite request belongs to B.
-			releaseCandidate := holdServiceRequest(t, client, cfg.DataListen)
+			releaseCandidate := holdServiceRequest(t, client, cfg.DataListen, originalDraining.Instances[1].PID)
 			releaseHeld()
 			draining := waitServiceStatus(t, management, func(status Status) bool {
 				return status.InplaceRestart != nil && status.InplaceRestart.Phase == "draining_b" && status.Ready
@@ -425,7 +427,7 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 			recovering := waitServiceStatus(t, candidateClient, func(status Status) bool {
 				return status.InplaceRestart != nil && status.InplaceRestart.Attempts >= 4 && status.InplaceRestart.NextAttempt != nil
 			})
-			if !recovering.Ready || !recovering.ServiceReady || recovering.InplaceRestart.ID != id || recovering.InplaceRestart.LastError == "" {
+			if !recovering.Ready || !recovering.ServiceReady || recovering.CoordinatorPID != pid || recovering.InplaceRestart.ID != id || recovering.InplaceRestart.LastError == "" {
 				t.Fatalf("missing supervised recovery: %+v", recovering)
 			}
 			t.Logf("recovery: main_pid=%d candidate_pid=%d operation=%s target=%s attempts=%d last_error=%q next_attempt=%v", pid, recovering.PID, id, recovering.InplaceRestart.Target, recovering.InplaceRestart.Attempts, recovering.InplaceRestart.LastError, recovering.InplaceRestart.NextAttempt)
@@ -525,7 +527,7 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 	}
 }
 
-func holdServiceRequest(t *testing.T, client *http.Client, address string) func() {
+func holdServiceRequest(t *testing.T, client *http.Client, address string, parent int) func() {
 	t.Helper()
 	release := make(chan struct{})
 	var once sync.Once
@@ -548,6 +550,18 @@ func holdServiceRequest(t *testing.T, client *http.Client, address string) func(
 		response.Body.Close()
 		upstream.Close()
 	})
+	worker, err := strconv.Atoi(response.Header.Get("X-Fixture-PID"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", worker))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields := strings.Fields(string(stat[strings.LastIndexByte(string(stat), ')')+1:]))
+	if len(fields) < 2 || fields[1] != strconv.Itoa(parent) {
+		t.Fatalf("held request belongs to worker %d with stat %q, expected B parent %d", worker, stat, parent)
+	}
 	return func() {
 		once.Do(func() { close(release) })
 		body, err := io.ReadAll(response.Body)

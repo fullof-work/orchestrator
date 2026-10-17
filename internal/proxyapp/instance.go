@@ -68,12 +68,12 @@ func (i *Instance) workerEvent(index int, epoch uint64, message controlMessage) 
 		if !i.stopping {
 			w.ready = true
 		}
-	case "data_drained":
+	case "data_draining", "data_drained":
 		if !i.stopping {
 			i.mu.Unlock()
 			return fmt.Errorf("proxy worker drained without a stop request")
 		}
-		w.dataDone = true
+		w.dataDone = w.dataDone || message.Kind == "data_drained"
 		w.ready = false
 	case "mmds_drained":
 		if !w.dataDone {

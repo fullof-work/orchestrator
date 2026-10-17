@@ -31,6 +31,9 @@ func (s *Service) restore(c *Continuation) error {
 	s.baseline = baseline
 	s.timeout = baseline.config.ShutdownTimeoutDur()
 	s.candidate = e.Mode == "candidate"
+	if s.candidate {
+		s.coordinatorPID = os.Getppid()
+	}
 	control := c.take(e.Files.Control)
 	if control == nil {
 		return fmt.Errorf("proxy continuation control missing")

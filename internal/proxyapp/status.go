@@ -61,6 +61,10 @@ type RestartStatus struct {
 // Status separates the queried instance from the entire supervised service.
 type Status struct {
 	InstanceStatus
+	// CoordinatorPID remains the original master PID across exec. A custom
+	// entry can use it to keep signal triggers out of B without interpreting
+	// registration IDs as process roles.
+	CoordinatorPID int              `json:"coordinator_pid"`
 	ServiceReady   bool             `json:"service_ready"`
 	Instances      []InstanceStatus `json:"instances"`
 	InplaceRestart *RestartStatus   `json:"inplace_restart"`

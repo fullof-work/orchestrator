@@ -393,7 +393,11 @@ func (worker *PreparedWorker) serveControlled(ctx context.Context, endExtension 
 			}
 		}
 	}()
-	errorsFromServe := make(chan error, 2)
+	type serveResult struct {
+		endpoint string
+		err      error
+	}
+	errorsFromServe := make(chan serveResult, 2)
 	drained := make(chan event, 2)
 	_, canShutdown := runtime.WorkerExtension.(proxyextension.Shutdown)
 	if err := worker.control.send(controlMessage{Kind: "prepared", CanShutdown: runtime.WorkerExtension == nil || canShutdown}); err != nil {
@@ -421,12 +425,20 @@ func (worker *PreparedWorker) serveControlled(ctx context.Context, endExtension 
 			return ctx.Err()
 		case err := <-senderDone:
 			return fmt.Errorf("proxy worker stats stream ended: %v", err)
-		case err := <-errorsFromServe:
-			if err != nil {
-				return err
+		case result := <-errorsFromServe:
+			if result.err != nil {
+				return result.err
 			}
 			if !dataDraining {
 				return fmt.Errorf("proxy ingress exited before drain")
+			}
+			if result.endpoint == "data" {
+				// Serve has finished publishing its accepted connections. The
+				// drain guard is installed and this worker cannot accept again,
+				// while already admitted handlers and tunnels may still run.
+				if err := worker.control.send(controlMessage{Kind: "data_draining"}); err != nil {
+					return err
+				}
 			}
 		case endpoint := <-ready:
 			if endpoint == "data" {
@@ -463,9 +475,9 @@ func (worker *PreparedWorker) serveControlled(ctx context.Context, endExtension 
 					continue
 				}
 				started = true
-				go func() { errorsFromServe <- data.Serve(worker.data) }()
+				go func() { errorsFromServe <- serveResult{"data", data.Serve(worker.data)} }()
 				if metadata != nil {
-					go func() { errorsFromServe <- metadata.Serve(worker.mmds) }()
+					go func() { errorsFromServe <- serveResult{"mmds", metadata.Serve(worker.mmds)} }()
 				}
 			case "drain_data":
 				if dataDraining {

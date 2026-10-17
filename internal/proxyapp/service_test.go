@@ -3,6 +3,7 @@ package proxyapp
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -10,6 +11,34 @@ import (
 
 	"golang.org/x/sys/unix"
 )
+
+type statusLogHandler struct {
+	slog.Handler
+	service *Service
+}
+
+func (h statusLogHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h statusLogHandler) Handle(context.Context, slog.Record) error {
+	_ = h.service.Status()
+	return nil
+}
+
+func TestOperationLoggerMayInspectStatus(t *testing.T) {
+	service := NewService()
+	service.operation = &RestartStatus{ID: "reentrant-status"}
+	service.logger = slog.New(statusLogHandler{service: service})
+	done := make(chan struct{})
+	go func() {
+		service.phase("preparing_b", nil)
+		service.operationComplete("failed", errors.New("candidate failed"))
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("logger deadlocked while inspecting public status")
+	}
+}
 
 func TestShutdownBeforeRunPreventsInitialization(t *testing.T) {
 	service := NewService()
