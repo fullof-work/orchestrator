@@ -95,6 +95,7 @@ After=$sockets
 [Service]
 Type=simple
 ExecStart=$launcher proxy serve --config $WORK/proxy.yaml
+ExecStopPost=/usr/bin/python3 $SCRIPT_DIR/proxy_lifecycle_client.py record-stop $WORK/service-exit-$label.log
 Sockets=$sockets
 KillMode=mixed
 SendSIGKILL=no
@@ -104,9 +105,9 @@ EOF
     systemctl daemon-reload
     systemctl start "$service"
     (umask 077; python3 - "$WORK/client-$label.json" "$WORK/proxy-stats.sock" "$service" "$WORK/client-$label.log" \
-        "$PROXY_PORT" "$SID" "$DOMAIN" "$FORWARD_TOKEN" "$entry" "$source" "$deployment" "$initial" "$target" "$WORK/proxy.yaml" "$PORT" "$AK" "$PROXY_NETNS" "$MMDS_PORT" "$sockets" <<'PY'
+        "$PROXY_PORT" "$SID" "$DOMAIN" "$FORWARD_TOKEN" "$entry" "$source" "$deployment" "$initial" "$target" "$WORK/proxy.yaml" "$PORT" "$AK" "$PROXY_NETNS" "$MMDS_PORT" "$sockets" "$WORK/service-exit-$label.log" <<'PY'
 import json, sys
-names = ('stats', 'unit', 'output', 'port', 'sid', 'domain', 'token', 'entry', 'source', 'deployment', 'initial', 'target', 'proxy_config', 'api_port', 'api_key', 'proxy_netns', 'mmds_port', 'socket_units')
+names = ('stats', 'unit', 'output', 'port', 'sid', 'domain', 'token', 'entry', 'source', 'deployment', 'initial', 'target', 'proxy_config', 'api_port', 'api_key', 'proxy_netns', 'mmds_port', 'socket_units', 'exit_record')
 config = dict(zip(names, sys.argv[2:], strict=True))
 config['port'] = int(config['port'])
 with open(sys.argv[1], 'x') as stream:
@@ -129,6 +130,13 @@ PY
     for journal in "$WORK"/kuasar-proxy-*.journal; do
         [ ! -f "$journal" ] || mv "$journal" "$journal.$label.log"
     done
+    if [ "$entry" = app ]; then
+        # Release the real Guest's slot while its owning conductor is alive.
+        # Stopping the runner alone does not finalize the vSwitch allocation.
+        code=$(req DELETE "/sandboxes/$SID" "$AK")
+        [ "$code" = 204 ] || fail "delete lifecycle Guest=$code"
+        wait_sandbox_state "$SID" missing 120 || fail "lifecycle Guest deletion did not finalize"
+    fi
     stop_orchestrator
 done
 echo "PASS orchestrator.proxy-lifecycle.sh"

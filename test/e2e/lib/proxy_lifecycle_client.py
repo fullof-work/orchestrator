@@ -22,6 +22,17 @@ def digest(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
+def record_service_exit(path):
+    # ExecStopPost runs before systemd can garbage-collect the inactive unit's
+    # execution status. Record manager-supplied values, never inferred success.
+    result = {key: os.environ.get(key) for key in
+              ('SERVICE_RESULT', 'EXIT_CODE', 'EXIT_STATUS', 'INVOCATION_ID')}
+    destination = Path(path)
+    temporary = destination.with_suffix('.next')
+    temporary.write_text(json.dumps(result) + '\n')
+    temporary.replace(destination)
+
+
 class UnixHTTP(http.client.HTTPConnection):
     def __init__(self, socket_path, **kwargs):
         super().__init__('localhost', **kwargs)
@@ -433,23 +444,34 @@ class Probe:
         self.stop_traffic.set()
         self.load.join()
         owned = (self.cgroup / 'cgroup.procs').read_text().split()
+        invocation = subprocess.check_output(['systemctl', 'show', '--value',
+            '-p', 'InvocationID', self.config['unit']], text=True).strip()
+        assert invocation, 'missing service invocation identity'
+        exit_record = Path(self.config['exit_record'])
+        exit_record.unlink(missing_ok=True)
         started = time.monotonic()
         units = [self.config['unit']] + self.config['socket_units'].split()
         subprocess.run(['systemctl', 'stop', '--no-block', *units], check=True)
         self.wait_status(lambda s: not s['ready'] and s['workers']['ready'] == 0 and s['data'] == 'draining', timeout=5)
         for complete in reversed(completions):
             complete()
-        while self.main_pid() and time.monotonic() - started < 15:
+        while (self.main_pid() or not exit_record.exists()) and time.monotonic() - started < 15:
             time.sleep(.02)
         assert self.main_pid() == 0, 'application did not finish its own bounded shutdown'
+        result = json.loads(exit_record.read_text())
+        assert result == dict(SERVICE_RESULT='success', EXIT_CODE='exited',
+                              EXIT_STATUS='0', INVOCATION_ID=invocation), result
+        # ExecStopPost must also have ended before checking the complete cgroup.
+        while self.cgroup.exists() and (self.cgroup / 'cgroup.procs').read_text().split() and time.monotonic() - started < 15:
+            time.sleep(.02)
         remaining = (self.cgroup / 'cgroup.procs').read_text().split() if self.cgroup.exists() else []
         assert not remaining and all(not Path('/proc', pid).exists() for pid in owned), remaining
         properties = subprocess.check_output(['systemctl', 'show', self.config['unit'],
-            '-p', 'Result', '-p', 'ExecMainCode', '-p', 'ExecMainStatus', '-p', 'SendSIGKILL'], text=True)
+            '-p', 'Result', '-p', 'SendSIGKILL'], text=True)
         values = dict(line.split('=', 1) for line in properties.splitlines())
-        assert values == dict(Result='success', ExecMainCode='1', ExecMainStatus='0', SendSIGKILL='no'), values
+        assert values == dict(Result='success', SendSIGKILL='no'), values
         self.log(kind='full_shutdown', elapsed=time.monotonic() - started, owned_pids=owned,
-                 result=values, finite_completed=True, worker_cleanup='application')
+                 result=result, systemd=values, finite_completed=True, worker_cleanup='application')
 
     def run(self):
         self.wait_status(lambda s: s['ready'])
@@ -484,4 +506,7 @@ class Probe:
 
 
 if __name__ == '__main__':
-    Probe(json.loads(Path(sys.argv[1]).read_text())).run()
+    if len(sys.argv) == 3 and sys.argv[1] == 'record-stop':
+        record_service_exit(sys.argv[2])
+    else:
+        Probe(json.loads(Path(sys.argv[1]).read_text())).run()
