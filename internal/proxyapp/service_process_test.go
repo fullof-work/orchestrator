@@ -210,6 +210,26 @@ func runFixtureService() error {
 		}
 		// This fault hook exists only in the test executable, after restored
 		// supervision and before application preparation can fail.
+		if continuation != nil && continuation.envelope.Mode == "candidate" {
+			fault, err := os.ReadFile(filepath.Join(filepath.Dir(cfg.StatsSocket), "candidate-fault"))
+			if err == nil {
+				if err := os.WriteFile(filepath.Join(filepath.Dir(cfg.StatsSocket), "candidate-fault-pid"), []byte(strconv.Itoa(os.Getpid())), 0600); err != nil {
+					return nil, err
+				}
+				switch string(fault) {
+				case "initialization":
+					return nil, fmt.Errorf("fixture candidate initialization failed")
+				case "configuration":
+					cfg.Workers++ // A compatible ELF with an incompatible Configure result.
+				case "control":
+					service.mu.Lock()
+					parent := service.parent
+					service.mu.Unlock()
+					parent.conn.Close()
+					return nil, fmt.Errorf("fixture candidate control closed")
+				}
+			}
+		}
 		if continuation != nil && continuation.envelope.Mode == "resume" {
 			if _, err := os.Stat(filepath.Join(filepath.Dir(cfg.StatsSocket), "fail-resume")); err == nil {
 				return nil, fmt.Errorf("fixture A-prime initialization failure")
@@ -338,6 +358,14 @@ func TestServiceRealRetirementFailureRecovery(t *testing.T) {
 	testServiceRealImageReplacement(t, serviceScenario{retirementFailure: true})
 }
 
+func TestServiceRealCandidatePreparationRollback(t *testing.T) {
+	for _, fault := range []string{"initialization", "configuration", "control"} {
+		t.Run(fault, func(t *testing.T) {
+			testServiceRealImageReplacement(t, serviceScenario{preparationFault: fault})
+		})
+	}
+}
+
 func TestServiceRealCandidateFailureDuringDrain(t *testing.T) {
 	testServiceRealImageReplacement(t, serviceScenario{candidateFailure: true})
 }
@@ -355,6 +383,7 @@ func TestServiceRealSuccessorFailureDuringCandidateDrain(t *testing.T) {
 }
 
 type serviceScenario struct {
+	preparationFault                                                                                            string
 	retirementFailure                                                                                           bool
 	concurrent                                                                                                  bool
 	signals, recovery, stopRecovery, execFailure, candidateFailure, stopDrain, forceStopDrain, successorFailure bool
@@ -532,7 +561,11 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 	var stoppedCandidate int
 	var cancelledAttempt time.Time
 	rejectRestart := scenario.legacy || scenario.metrics == "boundary"
-	for iteration := 0; iteration < 2; iteration++ {
+	iterations := 2
+	if scenario.preparationFault != "" {
+		iterations++ // One rejected candidate, then two complete operations.
+	}
+	for iteration := 0; iteration < iterations; iteration++ {
 		var finalRetirementRetry time.Time
 		var releaseHeld func()
 		if (scenario.execFailure || scenario.candidateFailure || scenario.stopDrain || scenario.successorFailure) && iteration == 0 || scenario.concurrent || scenario.metrics != "" && !rejectRestart && !(scenario.metrics == "occupied" && iteration == 0) {
@@ -581,6 +614,11 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 				t.Fatal(err)
 			}
 		}
+		if scenario.preparationFault != "" && iteration == 0 {
+			if err := os.WriteFile(filepath.Join(dir, "candidate-fault"), []byte(scenario.preparationFault), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
 		var id RestartID
 		if signals {
 			for repeat := 0; repeat < 4; repeat++ {
@@ -595,10 +633,17 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 			if scenario.concurrent {
 				path = "/fixture/concurrent-restart"
 			}
-			response, err := management.Post("http://proxy"+path, "", nil)
+			// Acceptance includes reading and hashing the target executable. It
+			// has no one-second status-probe SLA; keep this separate from the
+			// unchanged business, preparation and drain deadlines below.
+			actionClient := *management
+			actionClient.Timeout = 10 * time.Second
+			acceptedAt := time.Now()
+			response, err := actionClient.Post("http://proxy"+path, "", nil)
 			if err != nil {
 				t.Fatal(err)
 			}
+			t.Logf("restart acceptance: iteration=%d elapsed=%s status=%d", iteration, time.Since(acceptedAt), response.StatusCode)
 			body, _ := io.ReadAll(response.Body)
 			response.Body.Close()
 			if rejectRestart {
@@ -621,6 +666,46 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 			t.Fatalf("operation ID %q", id)
 		}
 		previous = id
+		if scenario.preparationFault != "" && iteration == 0 {
+			rolledBack := waitServiceStatus(t, management, func(status Status) bool {
+				return status.InplaceRestart != nil && status.InplaceRestart.ID == id && status.InplaceRestart.Result != ""
+			})
+			if rolledBack.InplaceRestart.Result != "failed" || rolledBack.InplaceRestart.LastError == "" || !rolledBack.Ready || !rolledBack.ServiceReady || rolledBack.BootID != initialBoot || len(rolledBack.Instances) != 1 || rolledBack.Data != "serving" {
+				t.Fatalf("preparation failure did not preserve A: %+v", rolledBack)
+			}
+			expectedError := map[string]string{
+				"initialization": "fixture candidate initialization failed",
+				"configuration":  "Configure changed the accepted declarative configuration",
+				"control":        "EOF",
+			}[scenario.preparationFault]
+			errorMatches := strings.Contains(rolledBack.InplaceRestart.LastError, expectedError)
+			if scenario.preparationFault == "control" {
+				errorMatches = strings.Contains(rolledBack.InplaceRestart.LastError, "read unixpacket") &&
+					(errorMatches || strings.Contains(rolledBack.InplaceRestart.LastError, "connection reset by peer"))
+			}
+			if !errorMatches {
+				t.Fatalf("candidate fault %s took a different failure path: %s", scenario.preparationFault, rolledBack.InplaceRestart.LastError)
+			}
+			body, err := os.ReadFile(filepath.Join(dir, "candidate-fault-pid"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			failedPID, err := strconv.Atoi(string(body))
+			if err != nil || failedPID <= 0 || unix.Kill(failedPID, 0) != unix.ESRCH {
+				t.Fatalf("failed candidate was not reaped: %s %v", body, err)
+			}
+			for _, suffix := range []string{".sock", ".shm"} {
+				paths, err := filepath.Glob(filepath.Join(dir, ".proxy-*"+suffix))
+				if err != nil || len(paths) != 0 {
+					t.Fatalf("failed preparation retained candidate resources: %v %v", paths, err)
+				}
+			}
+			t.Logf("candidate rollback: fault=%s main_pid=%d failed_pid=%d boot=%s operation=%s error=%s", scenario.preparationFault, pid, failedPID, initialBoot, id, rolledBack.InplaceRestart.LastError)
+			if err := os.Remove(filepath.Join(dir, "candidate-fault")); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
 		if scenario.concurrent {
 			draining := waitServiceStatus(t, management, func(status Status) bool {
 				return status.InplaceRestart != nil && status.InplaceRestart.Phase == "draining_a" && len(status.Instances) == 2
