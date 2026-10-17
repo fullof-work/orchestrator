@@ -556,6 +556,15 @@ cannot begin new business after drain starts; established tunnels can finish.
 Listener Serve returning, HTTP Shutdown finishing and hijacked tunnels ending
 are separate events. No new transport protocol is implied.
 
+For HTTP/1, draining half-closes the response direction and consumes pending
+input until the peer closes its write direction or the shared deadline expires.
+This preserves a completed response when another request was already pipelined.
+A keep-alive client that reads the complete response but leaves its write
+direction open can therefore consume the remaining drain budget. Closing that
+connection at the deadline is reported as forced even when the response body
+was delivered in full. That result describes connection cleanup and does not
+mean that an already completed response failed.
+
 One instance shares one positive `shutdown_timeout` across data and MMDS. The
 two InplaceRestart drains each get a budget; full `App.Shutdown` shares one
 deadline across A/A′ and B. Repeated calls never extend it. Caller cancellation

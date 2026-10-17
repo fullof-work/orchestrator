@@ -139,4 +139,4 @@ PY
     fi
     stop_orchestrator
 done
-echo "PASS orchestrator.proxy-lifecycle.sh"
+echo "PASS orchestrator.proxy-inplace-restart.sh"
