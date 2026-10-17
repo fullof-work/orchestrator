@@ -39,9 +39,7 @@ type fixtureRetirementFailure struct {
 func (f *fixtureRetirementFailure) reject() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.blocked {
-		f.requests = append(f.requests, time.Now())
-	}
+	f.requests = append(f.requests, time.Now())
 	return f.blocked
 }
 
@@ -535,6 +533,7 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 	var cancelledAttempt time.Time
 	rejectRestart := scenario.legacy || scenario.metrics == "boundary"
 	for iteration := 0; iteration < 2; iteration++ {
+		var finalRetirementRetry time.Time
 		var releaseHeld func()
 		if (scenario.execFailure || scenario.candidateFailure || scenario.stopDrain || scenario.successorFailure) && iteration == 0 || scenario.concurrent || scenario.metrics != "" && !rejectRestart && !(scenario.metrics == "occupied" && iteration == 0) {
 			release := make(chan struct{})
@@ -838,6 +837,7 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 				previousNext = next
 			}
 			retirement.release()
+			finalRetirementRetry = previousNext
 		}
 		status = waitServiceStatus(t, management, func(status Status) bool {
 			return status.InplaceRestart != nil && status.InplaceRestart.ID == id && status.InplaceRestart.Result != ""
@@ -848,6 +848,15 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 		}
 		if status.InplaceRestart.Result != wantResult || !status.Ready || len(status.Instances) != 1 || status.PID != pid {
 			t.Fatalf("completion: %+v", status)
+		}
+		if !finalRetirementRetry.IsZero() {
+			retirement.mu.Lock()
+			requests := append([]time.Time(nil), retirement.requests...)
+			retirement.mu.Unlock()
+			if len(requests) != 7 || requests[6].Before(finalRetirementRetry) {
+				t.Fatalf("successful retirement did not respect final capped backoff: requests=%v next=%v", requests, finalRetirementRetry)
+			}
+			t.Logf("retirement recovery completed: request=%s previous_next=%s", requests[6].Format(time.RFC3339Nano), finalRetirementRetry.Format(time.RFC3339Nano))
 		}
 		t.Logf("complete: iteration=%d main_pid=%d operation=%s target=%s attempts=%d result=%s forced=%d", iteration, pid, id, status.InplaceRestart.Target, status.InplaceRestart.Attempts, status.InplaceRestart.Result, status.InplaceRestart.ForcedCloseCount)
 		if scenario.metrics != "" {

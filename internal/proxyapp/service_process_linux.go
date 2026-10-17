@@ -406,11 +406,18 @@ func (s *Service) reapChild(c *serviceChild, deadline time.Time, hold bool) (ret
 	select {
 	case <-c.done:
 	case <-timer.C:
-		forced = true
-		if err := unix.Kill(-c.pid, syscall.SIGKILL); err != nil && err != unix.ESRCH {
-			return errors.Join(ErrForcedClose, err)
+		// Both channels may be ready when retrying retirement after the
+		// process group has already been joined. Never signal its old PID or
+		// count a forced business close solely because this deadline expired.
+		select {
+		case <-c.done:
+		default:
+			forced = true
+			if err := unix.Kill(-c.pid, syscall.SIGKILL); err != nil && err != unix.ESRCH {
+				return errors.Join(ErrForcedClose, err)
+			}
+			<-c.done
 		}
-		<-c.done
 	}
 	_ = c.wire.conn.Close()
 	<-c.readerCompletion()

@@ -21,6 +21,37 @@ type statusLogHandler struct {
 	service *Service
 }
 
+func TestReapedCandidateWithExpiredDeadlineIsNotForced(t *testing.T) {
+	service := NewService()
+	service.baseline, _ = testMasterEffective(t)
+	service.operation = &RestartStatus{ID: "expired-retirement"}
+	parent, peer, err := newServicePair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	defer peer.Close()
+	wire, err := serviceConnection(parent, "ended", service.operation.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire.conn.Close()
+	ended := make(chan struct{})
+	close(ended)
+	// Model an already joined process with an unavailable retirement ACK.
+	// This impossible Linux PID cannot name any real process group if the
+	// regression incorrectly takes its force-close branch.
+	child := &serviceChild{pid: 1 << 30, boot: "ended", generation: 1,
+		wire: wire, done: ended, readerDone: ended}
+	service.child = child
+	for retry := 0; retry < 100; retry++ {
+		err := service.reapChild(child, time.Now().Add(-time.Second), false)
+		if err == nil || errors.Is(err, ErrForcedClose) || service.operation.ForcedCloseCount != 0 {
+			t.Fatalf("completed candidate falsely forced at retry %d: %v, forced=%d", retry, err, service.operation.ForcedCloseCount)
+		}
+	}
+}
+
 func TestCompletionBeforeSuccessorInitialization(t *testing.T) {
 	s := NewService()
 	cfg := testProxyConfig(t)

@@ -33,6 +33,13 @@ def record_service_exit(path):
     temporary.replace(destination)
 
 
+def cgroup_processes(cgroup):
+    try:
+        return (cgroup / 'cgroup.procs').read_text().split()
+    except FileNotFoundError:
+        return []  # systemd may remove the empty cgroup between observations.
+
+
 class UnixHTTP(http.client.HTTPConnection):
     def __init__(self, socket_path, **kwargs):
         super().__init__('localhost', **kwargs)
@@ -462,9 +469,9 @@ class Probe:
         assert result == dict(SERVICE_RESULT='success', EXIT_CODE='exited',
                               EXIT_STATUS='0', INVOCATION_ID=invocation), result
         # ExecStopPost must also have ended before checking the complete cgroup.
-        while self.cgroup.exists() and (self.cgroup / 'cgroup.procs').read_text().split() and time.monotonic() - started < 15:
+        while cgroup_processes(self.cgroup) and time.monotonic() - started < 15:
             time.sleep(.02)
-        remaining = (self.cgroup / 'cgroup.procs').read_text().split() if self.cgroup.exists() else []
+        remaining = cgroup_processes(self.cgroup)
         assert not remaining and all(not Path('/proc', pid).exists() for pid in owned), remaining
         properties = subprocess.check_output(['systemctl', 'show', self.config['unit'],
             '-p', 'Result', '-p', 'SendSIGKILL'], text=True)
