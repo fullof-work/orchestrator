@@ -27,6 +27,7 @@ start_orchestrator "$WORK/orch.log"
 . "$SCRIPT_DIR/execute_template.sh"
 build_image_template
 create_guest "{\"templateID\":\"$TEMPLATE\",\"timeout\":1800}"
+wait_sandbox_state "$SID" running 1200 || fail "lifecycle Guest did not reach running"
 # These fixture programs execute in the real Guest. A finite data request reads
 # MMDS after its original Proxy instance has stopped accepting data.
 for fixture in proxy_lifecycle_guest websocket_probe; do
