@@ -95,7 +95,7 @@ After=$sockets
 [Service]
 Type=simple
 ExecStart=$launcher proxy serve --config $WORK/proxy.yaml
-ExecStopPost=/usr/bin/python3 $SCRIPT_DIR/proxy_lifecycle_client.py record-stop $WORK/service-exit-$label.log
+ExecStopPost=/usr/bin/python3 -B $SCRIPT_DIR/proxy_lifecycle_client.py record-stop $WORK/service-exit-$label.log
 Sockets=$sockets
 KillMode=mixed
 SendSIGKILL=no
