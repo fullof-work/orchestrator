@@ -705,8 +705,10 @@ signal example, plus `data_listen: fd=proxy-data`. Conductor owns
 references when MMDS is disabled. Keep runtime directory permissions, binary
 ownership, namespace access and control-socket admission consistent with the
 service identity. Add ordering for the deployment's actual conductor and network
-setup units. Socket creation must use the intended namespace; putting only the
-service in a namespace does not move existing sockets. See
+setup units. Put `NetworkNamespacePath` in the MMDS unit's `[Socket]` section,
+create that namespace first, and verify its listener with
+`ip netns exec sw0_mgmt ss -ltn`. Putting only the service in a namespace does
+not move existing sockets. See
 [systemd namespace semantics](https://github.com/systemd/systemd/blob/v255/man/systemd.exec.xml).
 
 `KillMode=mixed` lets the main process coordinate graceful stop before systemd's

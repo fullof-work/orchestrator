@@ -929,8 +929,10 @@ Restart=on-failure
 `data_listen: fd=proxy-data`；conductor 配置
 `mmds: {enabled: true, listen: fd=proxy-mmds}`。MMDS disabled 时移除对应 socket unit
 及 service 中的引用。运行目录、程序所有权、netns 权限和控制连接准入须匹配服务身份。
-依部署实际 conductor 与网络准备 unit 补充启动顺序。socket 必须在正确 netns 创建；
-仅改变 service 的 netns 不会移动已经存在的 socket，见
+依部署实际 conductor 与网络准备 unit 补充启动顺序。在 MMDS unit 的 `[Socket]` 中
+设置 `NetworkNamespacePath`，先创建该 netns，再用
+`ip netns exec sw0_mgmt ss -ltn` 检查实际监听位置。仅改变 service 的 netns 不会移动
+已经存在的 socket，见
 [systemd 命名空间语义](https://github.com/systemd/systemd/blob/v255/man/systemd.exec.xml)。
 
 `KillMode=mixed` 先让主进程协调停机，再由 systemd 执行最终 cgroup 清理。

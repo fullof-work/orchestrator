@@ -30,7 +30,7 @@ create_guest "{\"templateID\":\"$TEMPLATE\",\"timeout\":1800}"
 # These fixture programs execute in the real Guest. A finite data request reads
 # MMDS after its original Proxy instance has stopped accepting data.
 for fixture in proxy_lifecycle_guest websocket_probe; do
-    options=()
+    options=(--sid "$SID")
     [ "$fixture" != websocket_probe ] || options=(--idle-timeout 45)
     command=$(python3 "$SCRIPT_DIR/$fixture.py" guest-command "${options[@]}")
     python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "$command" >"$WORK/$fixture.log" 2>&1 || true
@@ -96,15 +96,16 @@ Type=simple
 ExecStart=$launcher proxy serve --config $WORK/proxy.yaml
 Sockets=$sockets
 KillMode=mixed
+SendSIGKILL=no
 TimeoutStopSec=20s
 Restart=no
 EOF
     systemctl daemon-reload
     systemctl start "$service"
     (umask 077; python3 - "$WORK/client-$label.json" "$WORK/proxy-stats.sock" "$service" "$WORK/client-$label.log" \
-        "$PROXY_PORT" "$SID" "$DOMAIN" "$FORWARD_TOKEN" "$entry" "$source" "$deployment" "$initial" "$target" "$WORK/proxy.yaml" "$PORT" "$AK" <<'PY'
+        "$PROXY_PORT" "$SID" "$DOMAIN" "$FORWARD_TOKEN" "$entry" "$source" "$deployment" "$initial" "$target" "$WORK/proxy.yaml" "$PORT" "$AK" "$PROXY_NETNS" "$MMDS_PORT" "$sockets" <<'PY'
 import json, sys
-names = ('stats', 'unit', 'output', 'port', 'sid', 'domain', 'token', 'entry', 'source', 'deployment', 'initial', 'target', 'proxy_config', 'api_port', 'api_key')
+names = ('stats', 'unit', 'output', 'port', 'sid', 'domain', 'token', 'entry', 'source', 'deployment', 'initial', 'target', 'proxy_config', 'api_port', 'api_key', 'proxy_netns', 'mmds_port', 'socket_units')
 config = dict(zip(names, sys.argv[2:], strict=True))
 config['port'] = int(config['port'])
 with open(sys.argv[1], 'x') as stream:

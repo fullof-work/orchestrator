@@ -33,6 +33,7 @@ systemctl() {
     printf '%s\n' "$*" >>"$COMMAND_LOG"
     case "$1" in
         show)
+            if [ "$2" = --property=ControlGroup ]; then echo "${MOCK_CGROUP:-}"; return; fi
             if [ -f "$KUASAR_EXECUTE_UNIT_DIR/${!#}" ]; then echo loaded; else echo not-found; fi;;
         stop) [ "${FAIL_STOP:-0}" != 1 ];;
         reset-failed|daemon-reload) :;;

@@ -18,7 +18,7 @@ proxy_lifecycle_reserve_units() {
 }
 
 proxy_lifecycle_cleanup_units() {
-    local work="$1" key="$2" record="$1/proxy-lifecycle.units" unit state path
+    local work="$1" key="$2" record="$1/proxy-lifecycle.units" unit state path group remaining
     execute_state_path_absent "$record" && return 0
     [[ "$key" =~ ^e-[A-Za-z0-9]{6}$ ]] || return 1
     [ -f "$record" ] && [ ! -L "$record" ] \
@@ -39,6 +39,22 @@ proxy_lifecycle_cleanup_units() {
     done < <(proxy_lifecycle_units "$key")
     if [ "${#loaded[@]}" -gt 0 ]; then
         systemctl stop "${loaded[@]}" || return 1
+        for unit in "${loaded[@]}"; do
+            group="$(systemctl show --property=ControlGroup --value "$unit")" || return 1
+            case "$group" in
+                '') continue;;
+                /*) ;;
+                *) return 1;;
+            esac
+            path="/sys/fs/cgroup$group/cgroup.procs"
+            if [ -e "$path" ]; then
+                remaining="$(cat "$path")" || return 1
+                if [ -n "$remaining" ]; then
+                    echo "owned unit $unit still has processes: $remaining" >&2
+                    return 1
+                fi
+            fi
+        done
         systemctl reset-failed "${loaded[@]}" >/dev/null 2>&1 || true
     fi
     while IFS= read -r unit; do

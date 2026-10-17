@@ -36,9 +36,11 @@ class Probe:
         self.pid = self.main_pid()
         self.initial_pid = self.pid
         self.stop = threading.Event()
+        self.stop_traffic = threading.Event()
         self.errors = []
         self.requests = 0
         self.peaks = dict(processes=0, rss_kib=0, fds=0)
+        self.stable_fds = []
         self.out = open(config['output'], 'x', buffering=1)
         self.output_lock = threading.Lock()
         self.cgroup = Path('/sys/fs/cgroup' + subprocess.check_output(
@@ -107,7 +109,7 @@ class Probe:
             connection.close()
 
     def traffic(self):
-        while not self.stop.is_set():
+        while not self.stop_traffic.is_set():
             started = time.time()
             try:
                 code, body = self.get('/health')
@@ -117,7 +119,7 @@ class Probe:
             except Exception as error:
                 self.errors.append(str(error))
                 self.log(kind='business', start=started, error=str(error))
-            self.stop.wait(.005)
+            self.stop_traffic.wait(.005)
 
     def resources(self):
         while not self.stop.is_set():
@@ -137,22 +139,117 @@ class Probe:
             self.log(kind='resources', pids=pids, rss_kib=rss, fds=fds)
             self.stop.wait(.02)
 
-    def finite(self, key):
+    def connection_inodes(self, local_port, remote_port=None, namespace=None):
+        command = ['cat', '/proc/net/tcp', '/proc/net/tcp6']
+        if namespace:
+            command = ['ip', 'netns', 'exec', namespace] + command
+        inodes = set()
+        for row in subprocess.check_output(command, text=True).splitlines():
+            fields = row.split()
+            if len(fields) > 9 and fields[0].rstrip(':').isdigit() and \
+                    (fields[3] == '01' if remote_port is not None else fields[3] != '0A') and \
+                    int(fields[1].rsplit(':', 1)[1], 16) == int(local_port) and \
+                    (remote_port is None or int(fields[2].rsplit(':', 1)[1], 16) == int(remote_port)):
+                inodes.add('socket:[' + fields[9] + ']')
+        return inodes
+
+    def socket_worker(self, local_port, remote_port, namespace=None):
+        """Resolve this established TCP connection, never the shared listener."""
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            inodes = self.connection_inodes(local_port, remote_port, namespace)
+            owners = set()
+            for pid in (self.cgroup / 'cgroup.procs').read_text().split():
+                for fd in Path('/proc', pid, 'fd').glob('*'):
+                    try:
+                        if os.readlink(fd) in inodes:
+                            owners.add(int(pid))
+                    except FileNotFoundError:
+                        pass
+            if len(owners) == 1:
+                return owners.pop()
+            time.sleep(.01)
+        raise AssertionError(f'cannot resolve connection owner: {local_port=} {remote_port=} {namespace=} {owners=}')
+
+    def wait_no_data(self, worker):
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            assert Path('/proc', str(worker)).exists(), 'MMDS worker ended before the data barrier'
+            inodes = self.connection_inodes(self.config['port'])
+            active = []
+            for fd in Path('/proc', str(worker), 'fd').glob('*'):
+                try:
+                    if os.readlink(fd) in inodes:
+                        active.append(str(fd))
+                except FileNotFoundError:
+                    pass
+            if not active:
+                # Socket ownership is observable here; do not label it as an
+                # internal worker data_drained control acknowledgment.
+                self.log(kind='worker_no_open_data_socket_before_mmds', worker=worker)
+                return
+            time.sleep(.01)
+        raise AssertionError(f'MMDS worker still owns data connections: {active}')
+
+    def finite_once(self, key):
         # One Guest serves every entry/source combination. Never reuse a released
         # request key from a previous mode or accepted operation.
         key = f'{self.initial_pid}-{time.monotonic_ns()}-{key}'
         connection, headers = self.connection()
         connection.request('GET', '/finite?id=' + key, headers=headers)
+        data_port = connection.sock.getsockname()[1]
         response = connection.getresponse()
         assert response.status == 200 and response.read(6) == b'begin\n'
+        data_worker = self.socket_worker(self.config['port'], data_port)
+        mmds_worker = self.socket_worker(self.config['mmds_port'], response.getheader('X-MMDS-Source-Port'), self.config['proxy_netns'])
+        def parent(pid):
+            return int(next(line.split()[1] for line in Path('/proc', str(pid), 'status').read_text().splitlines()
+                            if line.startswith('PPid:')))
+        data_parent, mmds_parent = parent(data_worker), parent(mmds_worker)
+        # An existing CONNECT remains usable after complete service shutdown
+        # has stopped new data admission. It releases the Guest barrier without
+        # depending on a new request through a replacement instance.
+        control = http.client.HTTPConnection('guest', timeout=10)
+        for attempt in range(32):
+            control.sock = self.open_tunnel()
+            control_worker = self.socket_worker(self.config['port'], control.sock.getsockname()[1])
+            self.log(kind='release_tunnel_setup', attempt=attempt, worker=control_worker)
+            if control_worker == data_worker:
+                break
+            control.close()
+        else:
+            raise AssertionError('could not place release tunnel on the data worker')
+        self.log(kind='finite_workers', request=key, data_worker=data_worker, mmds_worker=mmds_worker,
+                 data_parent=data_parent, mmds_parent=mmds_parent)
 
-        def complete():
-            assert self.get('/release?id=' + key)[0] == 204
-            body = response.read()
-            connection.close()
+        def complete(verify_drained=False):
+            try:
+                if verify_drained:
+                    self.wait_no_data(mmds_worker)
+                control.request('GET', '/release?id=' + key, headers={'Connection': 'close'})
+                released = control.getresponse()
+                assert released.status == 204
+                released.read()
+                body = response.read()
+            finally:
+                control.close()
+                connection.close()
             assert body == b'mmds-ok\ncomplete\n', body
-            self.log(kind='finite_complete', request=key, mmds=True)
-        return complete
+            self.log(kind='finite_complete', request=key, mmds=True, sid=self.config['sid'],
+                     data_worker=data_worker, mmds_worker=mmds_worker)
+        # An idle MMDS connection in A may legitimately close once all A data
+        # has ended. Select two workers of the same instance for this barrier.
+        return complete, data_worker != mmds_worker and data_parent == mmds_parent
+
+    def finite(self, key):
+        # This is setup distribution across shared listeners, not a request
+        # retry: every setup request must complete successfully and is logged.
+        for attempt in range(32):
+            complete, cross_worker = self.finite_once(f'{key}-{attempt}')
+            if cross_worker:
+                return lambda: complete(verify_drained=True)
+            complete()
+        raise AssertionError('could not establish a cross-worker data-to-MMDS request')
 
     def websocket(self):
         connection = socket.create_connection(('127.0.0.1', self.config['port']), timeout=15)
@@ -178,7 +275,7 @@ class Probe:
             self.log(kind='websocket_complete', half_close=True)
         return complete
 
-    def tunnel(self):
+    def open_tunnel(self):
         connection = socket.create_connection(('127.0.0.1', self.config['port']), timeout=15)
         request = (f"CONNECT guest HTTP/1.1\r\nHost: guest\r\nE2b-Sandbox-Id: {self.config['sid']}\r\n"
                    f"E2b-Sandbox-Port: 8002\r\nX-Access-Token: {self.config['token']}\r\n\r\n")
@@ -187,6 +284,10 @@ class Probe:
         response.begin()
         assert response.status == 200
         response.close()
+        return connection
+
+    def tunnel(self):
+        connection = self.open_tunnel()
 
         def complete():
             connection.sendall(b'GET /health HTTP/1.1\r\nHost: guest\r\nConnection: close\r\n\r\n')
@@ -222,6 +323,39 @@ class Probe:
                 connection.close()
             time.sleep(.02)
         raise AssertionError('conductor did not count both instances with three held requests each')
+
+    def stable_resources(self):
+        # Stop only between completed operations. Each takeover retains the
+        # continuous no-retry request stream, and every started request joins.
+        self.stop_traffic.set()
+        self.load.join()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            connection = http.client.HTTPConnection('127.0.0.1', int(self.config['api_port']), timeout=2)
+            try:
+                connection.request('GET', f"/sandboxes/{self.config['sid']}/stats/traffic",
+                                   headers={'Host': 'api.' + self.config['domain'], 'X-API-KEY': self.config['api_key']})
+                response = connection.getresponse()
+                body = json.loads(response.read())
+                assert response.status == 200, body
+                if body['inflight']['connected'] == 0:
+                    break
+            finally:
+                connection.close()
+            time.sleep(.02)
+        else:
+            raise AssertionError('business did not become idle between operations')
+        samples = []
+        for _ in range(25):
+            pids = (self.cgroup / 'cgroup.procs').read_text().split()
+            assert len(pids) == 3, pids
+            samples.append(sum(len(list(Path('/proc', pid, 'fd').iterdir())) for pid in pids))
+            time.sleep(.02)
+        assert len(set(samples[-5:])) == 1, samples
+        self.stable_fds.append(samples[-1])
+        self.stop_traffic.clear()
+        self.load = threading.Thread(target=self.traffic)
+        self.load.start()
 
     def deploy(self, source):
         destination = Path(self.config['deployment'])
@@ -280,12 +414,38 @@ class Probe:
         assert result['inplace_restart']['result'] == 'completed', result
         assert result['inplace_restart']['forced_close_count'] == 0 and len(result['instances']) == 1
         assert not Path(f"/proc/{candidate['pid']}").exists(), 'B not reaped'
-        assert not list(Path(self.stats).parent.glob('.proxy-*')), 'B resources remain'
+        assert not Path(candidate['stats_socket']).exists(), 'B stats socket remains'
+        candidate_shm = Path(self.stats).parent / ('.proxy-' + candidate['boot_id'] + '.shm')
+        assert not candidate_shm.exists(), 'B route SHM remains'
         config_path.write_bytes(original_config)
         self.deploy(self.config['target'])
         self.check_ready()
+        self.stable_resources()
         self.log(kind='operation_complete', id=operation, target_sha256=target_digest,
-                 main_pid=self.pid, result=result['inplace_restart'])
+                 main_pid=self.pid, result=result['inplace_restart'], stable_fds=self.stable_fds[-1])
+
+    def full_shutdown(self):
+        completions = [self.finite('full-stop'), self.websocket(), self.tunnel()]
+        self.stop_traffic.set()
+        self.load.join()
+        owned = (self.cgroup / 'cgroup.procs').read_text().split()
+        started = time.monotonic()
+        units = [self.config['unit']] + self.config['socket_units'].split()
+        subprocess.run(['systemctl', 'stop', '--no-block', *units], check=True)
+        self.wait_status(lambda s: not s['ready'] and s['workers']['ready'] == 0 and s['data'] == 'draining', timeout=5)
+        for complete in reversed(completions):
+            complete()
+        while self.main_pid() and time.monotonic() - started < 15:
+            time.sleep(.02)
+        assert self.main_pid() == 0, 'application did not finish its own bounded shutdown'
+        remaining = (self.cgroup / 'cgroup.procs').read_text().split() if self.cgroup.exists() else []
+        assert not remaining and all(not Path('/proc', pid).exists() for pid in owned), remaining
+        properties = subprocess.check_output(['systemctl', 'show', self.config['unit'],
+            '-p', 'Result', '-p', 'ExecMainCode', '-p', 'ExecMainStatus', '-p', 'SendSIGKILL'], text=True)
+        values = dict(line.split('=', 1) for line in properties.splitlines())
+        assert values == dict(Result='success', ExecMainCode='1', ExecMainStatus='0', SendSIGKILL='no'), values
+        self.log(kind='full_shutdown', elapsed=time.monotonic() - started, owned_pids=owned,
+                 result=values, finite_completed=True, worker_cleanup='application')
 
     def run(self):
         self.wait_status(lambda s: s['ready'])
@@ -306,7 +466,10 @@ class Probe:
                 self.wait_status(lambda s: s['ready'])
                 self.check_ready()
                 self.log(kind='ordinary_service_restart', previous=previous, current=self.pid)
+            assert self.stable_fds[-1] <= self.stable_fds[0], self.stable_fds
+            self.full_shutdown()
         finally:
+            self.stop_traffic.set()
             self.stop.set()
             self.load.join()
             self.monitor.join()
