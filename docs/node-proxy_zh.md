@@ -875,7 +875,7 @@ metrics 为空则均关闭；固定 `host:p` 的 A/A′ 用 p、B 用 p+1；端�
 各代保留既有额度和单代并发余量，部署预留双实例 CPU、内存、FD、两份额度和相邻 metrics
 端口，不进行跨代额度转移。
 
-### 9.5 命名监听### 9.5 命名监听与 systemd 部署
+### 9.5 命名监听与 systemd 部署
 
 `data_listen: "fd=proxy-data"` 与 conductor `mmds.listen: "fd=proxy-mmds"`
 精确选择名称；两者可分别继续使用 TCP 地址，四种组合均支持。名称区分大小写、非空，
