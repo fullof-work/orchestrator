@@ -33,13 +33,15 @@ type Server struct {
 	drainOnce   sync.Once
 	done        chan struct{}
 	drainErr    error
+	listener    net.Listener
+	serveDone   chan struct{}
 }
 
 // New constructs a server without starting I/O. ready is called once when Serve
 // enters its accept loop. It reports this listener only, not route or App ready.
 // ctx belongs to the instance's dependencies and stays live during normal drain.
 func New(ctx context.Context, handler http.Handler, tlsConfig *tls.Config, ready func()) (*Server, error) {
-	s := &Server{connections: make(map[*trackedConn]struct{}), changed: make(chan struct{}), done: make(chan struct{}), ready: ready, tls: tlsConfig != nil}
+	s := &Server{connections: make(map[*trackedConn]struct{}), changed: make(chan struct{}), done: make(chan struct{}), serveDone: make(chan struct{}), ready: ready, tls: tlsConfig != nil}
 	s.http = &http.Server{ReadHeaderTimeout: 10 * time.Second, BaseContext: func(net.Listener) context.Context { return ctx }}
 	if tlsConfig != nil {
 		s.http.TLSConfig = tlsConfig.Clone()
@@ -55,25 +57,36 @@ func New(ctx context.Context, handler http.Handler, tlsConfig *tls.Config, ready
 	if tlsConfig == nil {
 		s.http.Handler = h2c.NewHandler(guard, h2)
 	}
+	s.trackContexts()
 	return s, nil
 }
 
 // NewHTTP1 preserves the supplied HTTP/1 server limits and protocols. Ownership
 // of server transfers to the returned drain controller before Serve is called.
 func NewHTTP1(server *http.Server, ready func()) *Server {
-	s := &Server{http: server, connections: make(map[*trackedConn]struct{}), changed: make(chan struct{}), done: make(chan struct{}), ready: ready}
+	s := &Server{http: server, connections: make(map[*trackedConn]struct{}), changed: make(chan struct{}), done: make(chan struct{}), serveDone: make(chan struct{}), ready: ready}
 	server.Handler = s.guard(server.Handler)
+	s.trackContexts()
 	return s
 }
 
 func (s *Server) guard(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
-		if s.draining {
+		connection, _ := r.Context().Value(connectionKey{}).(*trackedConn)
+		first := r.ProtoMajor == 1 && connection != nil && !connection.entered && !connection.protocolReady
+		if connection != nil {
+			connection.entered = true
+			s.notifyLocked()
+		}
+		if s.draining && !first {
 			s.mu.Unlock()
 			w.Header().Set("Connection", "close")
 			http.Error(w, "proxy is draining", http.StatusServiceUnavailable)
 			return
+		}
+		if s.draining {
+			w.Header().Set("Connection", "close")
 		}
 		s.handlers++
 		s.mu.Unlock()
@@ -84,6 +97,15 @@ func (s *Server) guard(handler http.Handler) http.Handler {
 
 // Serve consumes this instance's listener copy. It never calls socket shutdown.
 func (s *Server) Serve(listener net.Listener) error {
+	s.mu.Lock()
+	s.listener = listener
+	draining := s.draining
+	s.mu.Unlock()
+	defer close(s.serveDone)
+	if draining {
+		listener.Close()
+		return nil
+	}
 	tracked := &trackedListener{Listener: listener, server: s}
 	var err error
 	if s.tls {
@@ -92,6 +114,12 @@ func (s *Server) Serve(listener net.Listener) error {
 		err = s.http.Serve(tracked)
 	}
 	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	s.mu.Lock()
+	draining = s.draining
+	s.mu.Unlock()
+	if draining && errors.Is(err, net.ErrClosed) {
 		return nil
 	}
 	return err
@@ -110,6 +138,7 @@ func (s *Server) Drain(ctx context.Context) error {
 	s.drainOnce.Do(func() {
 		s.mu.Lock()
 		s.draining = true
+		listener := s.listener
 		s.notifyLocked()
 		s.mu.Unlock()
 		// Preserve the first deadline without inheriting caller cancellation.
@@ -121,7 +150,40 @@ func (s *Server) Drain(ctx context.Context) error {
 		go func() {
 			defer cancel()
 			defer close(s.done)
-			err := s.http.Shutdown(work)
+			// Close acceptance first and let Serve finish publishing every socket
+			// it already accepted. net/http.Shutdown otherwise drops a first request
+			// after reading its headers when its shutdown flag wins that race.
+			var err error
+			if listener != nil {
+				_ = listener.Close()
+				select {
+				case <-s.serveDone:
+				case <-work.Done():
+					err = work.Err()
+				}
+			}
+			for err == nil {
+				s.mu.Lock()
+				pending := false
+				changed := s.changed
+				for conn := range s.connections {
+					if !conn.entered && !conn.protocolReady {
+						pending = true
+					}
+				}
+				s.mu.Unlock()
+				if !pending {
+					break
+				}
+				select {
+				case <-changed:
+				case <-work.Done():
+					err = work.Err()
+				}
+			}
+			if err == nil {
+				err = s.http.Shutdown(work)
+			}
 			for err == nil {
 				s.mu.Lock()
 				complete := len(s.connections) == 0 && s.handlers == 0
@@ -188,11 +250,6 @@ func (l *trackedListener) Accept() (net.Conn, error) {
 	}
 	wrapped := &trackedConn{Conn: conn, server: l.server}
 	l.server.mu.Lock()
-	if l.server.draining {
-		l.server.mu.Unlock()
-		_ = conn.Close()
-		return nil, net.ErrClosed
-	}
 	l.server.connections[wrapped] = struct{}{}
 	l.server.notifyLocked()
 	l.server.mu.Unlock()
@@ -201,8 +258,44 @@ func (l *trackedListener) Accept() (net.Conn, error) {
 
 type trackedConn struct {
 	net.Conn
-	server *Server
-	once   sync.Once
+	server        *Server
+	once          sync.Once
+	entered       bool
+	protocolReady bool
+}
+
+type connectionKey struct{}
+
+func trackedConnection(conn net.Conn) *trackedConn {
+	if tlsConn, ok := conn.(*tls.Conn); ok {
+		conn = tlsConn.NetConn()
+	}
+	tracked, _ := conn.(*trackedConn)
+	return tracked
+}
+
+func (s *Server) trackContexts() {
+	previousContext := s.http.ConnContext
+	s.http.ConnContext = func(ctx context.Context, conn net.Conn) context.Context {
+		if previousContext != nil {
+			ctx = previousContext(ctx, conn)
+		}
+		return context.WithValue(ctx, connectionKey{}, trackedConnection(conn))
+	}
+	previousState := s.http.ConnState
+	s.http.ConnState = func(conn net.Conn, state http.ConnState) {
+		if previousState != nil {
+			previousState(conn, state)
+		}
+		if state == http.StateHijacked || state == http.StateIdle {
+			if tracked := trackedConnection(conn); tracked != nil {
+				s.mu.Lock()
+				tracked.protocolReady = true
+				s.notifyLocked()
+				s.mu.Unlock()
+			}
+		}
+	}
 }
 
 func (c *trackedConn) Close() error {

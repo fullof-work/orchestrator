@@ -123,6 +123,20 @@ func (i *Instance) drainWorkers() error {
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 	for _, phase := range []string{"drain_data", "drain_mmds", "stop"} {
+		if phase == "drain_mmds" {
+			i.mu.Lock()
+			i.status.Data = "stopped"
+			gate := i.mmdsGate
+			i.notifyLocked()
+			i.mu.Unlock()
+			if gate != nil {
+				select {
+				case <-gate:
+				case <-ctx.Done():
+					return errors.Join(ErrForcedClose, ctx.Err())
+				}
+			}
+		}
 		i.mu.Lock()
 		peers := make([]*controlPeer, 0, len(i.workers))
 		for _, w := range i.workers {

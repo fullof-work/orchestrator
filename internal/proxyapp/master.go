@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"sync"
 	"time"
 
 	proxyextension "github.com/kuasar-sandbox/orchestrator/app/proxy/extension"
 	"github.com/kuasar-sandbox/orchestrator/internal/appnet"
+	"github.com/kuasar-sandbox/orchestrator/internal/listenresource"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/netns"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyadmission"
@@ -45,12 +47,34 @@ func RunMaster(ctx context.Context, effective *EffectiveConfig, runtime *Runtime
 	if err != nil {
 		return fmt.Errorf("proxy listeners: %w", err)
 	}
-	table, err := proxyshm.Create(cfg.ShmPath, cfg.RouteCapacity)
+	createTable := proxyshm.Create
+	if runtime.privatePaths {
+		createTable = proxyshm.CreateExclusive
+	}
+	shmOwned := true
+	var table *proxyshm.Table
+	if runtime.inherited != nil && runtime.inherited.Shm != nil {
+		if runtime.inherited.ShmPath != cfg.ShmPath {
+			return fmt.Errorf("proxy continuation shared-memory path changed")
+		}
+		identity, err := identifyPath(cfg.ShmPath)
+		if err != nil || identity != runtime.inherited.ShmIdentity {
+			return fmt.Errorf("proxy continuation shared-memory ownership changed: %v", err)
+		}
+		table, err = proxyshm.CreateFromFile(cfg.ShmPath, runtime.inherited.Shm, cfg.RouteCapacity)
+		shmOwned = false
+	} else {
+		table, err = createTable(cfg.ShmPath, cfg.RouteCapacity)
+	}
 	if err != nil {
 		return fmt.Errorf("proxy: create shared route table: %w", err)
 	}
 	defer table.Close()
-	defer os.Remove(cfg.ShmPath)
+	defer func() {
+		if shmOwned {
+			_ = os.Remove(cfg.ShmPath)
+		}
+	}()
 	admission, err := proxyadmission.NewMaster(cfg.RouteCapacity, cfg.Workers)
 	if err != nil {
 		return fmt.Errorf("proxy: create shared admission arena: %w", err)
@@ -145,18 +169,40 @@ func RunMaster(ctx context.Context, effective *EffectiveConfig, runtime *Runtime
 		defer proxyNamespace.Close()
 	}
 
-	dataListener, err := listeners.open(cfg.DataListen, func(address string) (net.Listener, error) { return net.Listen("tcp", address) })
+	var dataListener net.Listener
+	if runtime.inherited != nil {
+		dataListener, err = listeners.inherit(cfg.DataListen, runtime.inherited.DataExpression, runtime.inherited.Data)
+	} else {
+		dataListener, err = listeners.open(cfg.DataListen, func(address string) (net.Listener, error) { return net.Listen("tcp", address) })
+	}
 	if err != nil {
 		return fmt.Errorf("proxy: listen data_listen %s: %w", cfg.DataListen, err)
 	}
 	defer dataListener.Close()
 
-	statsListener, err := listenUnix(cfg.StatsSocket)
+	var statsListener net.Listener
+	statsOwned := true
+	if runtime.inherited != nil && runtime.inherited.Stats != nil {
+		if cfg.StatsSocket != runtime.inherited.StatsPath {
+			return fmt.Errorf("proxy continuation stats path changed")
+		}
+		statsListener, err = listenresource.Listener(runtime.inherited.Stats)
+		statsOwned = false
+	} else {
+		statsListener, err = listenUnixMode(cfg.StatsSocket, runtime.privatePaths)
+	}
 	if err != nil {
 		return fmt.Errorf("proxy: listen stats_socket %s: %w", cfg.StatsSocket, err)
 	}
 	defer statsListener.Close()
-	defer os.Remove(cfg.StatsSocket)
+	if runtime.retain != nil || !statsOwned {
+		statsListener.(*net.UnixListener).SetUnlinkOnClose(false)
+	}
+	defer func() {
+		if statsOwned {
+			_ = os.Remove(cfg.StatsSocket)
+		}
+	}()
 	statsServer := proxystats.NewStatsServer(masterStats, table.Synced, func(sandboxID string) (proxystats.RouteIdentity, bool) {
 		route, found := table.Lookup(sandboxID)
 		if !found {
@@ -209,11 +255,17 @@ func RunMaster(ctx context.Context, effective *EffectiveConfig, runtime *Runtime
 	mmdsListen := ""
 	if mmdsPolicy != nil && mmdsPolicy.Enabled {
 		mmdsListen = mmdsPolicy.Listen
-		mmdsListener, err = listeners.open(mmdsListen, func(address string) (net.Listener, error) { return appnet.ListenTCPInNetNS(proxyNamespace, address) })
+		if runtime.inherited != nil {
+			mmdsListener, err = listeners.inherit(mmdsListen, runtime.inherited.MMDSExpression, runtime.inherited.MMDS)
+		} else {
+			mmdsListener, err = listeners.open(mmdsListen, func(address string) (net.Listener, error) { return appnet.ListenTCPInNetNS(proxyNamespace, address) })
+		}
 		if err != nil {
 			return fmt.Errorf("proxy: listen conductor MMDS address %s: %w", mmdsListen, err)
 		}
 		defer mmdsListener.Close()
+	} else if runtime.inherited != nil && runtime.inherited.MMDS != nil {
+		return fmt.Errorf("proxy continuation MMDS was disabled by authority")
 	}
 	if err := listeners.complete(); err != nil {
 		return err
@@ -227,8 +279,46 @@ func RunMaster(ctx context.Context, effective *EffectiveConfig, runtime *Runtime
 	instance.notifyLocked()
 	instance.mu.Unlock()
 
+	var metricsListener net.Listener
 	if cfg.MetricsListen != "" {
-		startMasterTask(func() { appnet.ServeMetrics(masterCtx, cfg.MetricsListen, metricSet, logger) })
+		if runtime.inherited != nil {
+			if runtime.inherited.Metrics == nil || runtime.inherited.MetricsExpression != cfg.MetricsListen {
+				return fmt.Errorf("proxy continuation metrics resource changed")
+			}
+			metricsListener, err = listenresource.Listener(runtime.inherited.Metrics)
+		} else {
+			metricsListener, err = net.Listen("tcp", cfg.MetricsListen)
+		}
+		if err != nil {
+			return fmt.Errorf("proxy listen metrics: %w", err)
+		}
+		defer metricsListener.Close()
+		instance.mu.Lock()
+		instance.status.MetricsAddress = metricsListener.Addr().String()
+		instance.mu.Unlock()
+	}
+	if runtime.retain != nil {
+		retained, err := retainResources(dataListener, mmdsListener, statsListener, metricsListener, cfg.DataListen, mmdsListen, cfg.StatsSocket, cfg.MetricsListen, cfg.ShmPath)
+		if err != nil {
+			return err
+		}
+		if err := runtime.retain(retained); err != nil {
+			retained.close()
+			return err
+		}
+		statsOwned = false
+		shmOwned = false
+	}
+	if metricsListener != nil {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/metrics", metricSet.Handler())
+		server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+		startMasterTask(func() { <-masterCtx.Done(); _ = server.Close() })
+		startMasterTask(func() {
+			if err := server.Serve(metricsListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Warn("proxy metrics server", "err", err)
+			}
+		})
 	}
 
 	for index := 0; index < cfg.Workers; index++ {

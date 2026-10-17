@@ -90,6 +90,8 @@ type Instance struct {
 	everSynced     bool
 	capabilities   []string
 	statusProvider func() Status
+	// A full-service stop may hold MMDS until every instance has drained data.
+	mmdsGate <-chan struct{}
 }
 
 func newBootID() string {

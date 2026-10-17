@@ -94,6 +94,7 @@ type App struct {
 	hooks       Hooks
 	initialized bool
 	ran         atomic.Bool
+	service     *proxyapp.Service
 
 	workerPresent    func() bool
 	receiveWorker    func() (*proxyapp.WorkerBootstrap, error)
@@ -108,6 +109,7 @@ func New(hooks Hooks) *App {
 	return &App{
 		hooks:         hooks,
 		initialized:   true,
+		service:       proxyapp.NewService(),
 		workerPresent: proxyapp.WorkerBootstrapPresent,
 		receiveWorker: proxyapp.ReceiveWorkerBootstrap,
 		receiveComponent: func() (*componentexec.Bootstrap, error) {
@@ -128,12 +130,16 @@ func (a *App) Run() error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	return a.RunContext(ctx)
+	return a.runContext(ctx, true)
 }
 
 // RunContext enters either the custom master bootstrap or the private worker
 // bootstrap. Worker state is detected before any CLI/config-file handling.
 func (a *App) RunContext(ctx context.Context) error {
+	return a.runContext(ctx, false)
+}
+
+func (a *App) runContext(ctx context.Context, signals bool) (returnErr error) {
 	if err := a.requireInitialized(); err != nil {
 		return err
 	}
@@ -143,12 +149,22 @@ func (a *App) RunContext(ctx context.Context) error {
 	if !a.ran.CompareAndSwap(false, true) {
 		return fmt.Errorf("proxy app can only be run once")
 	}
+	defer func() { a.service.FinishEntry(returnErr) }()
 	if a.workerPresent() {
 		componentexec.ClearEnvironment()
 		return a.runWorkerProcess(ctx)
 	}
+	if proxyapp.ContinuationPresent() {
+		continuation, err := proxyapp.ReceiveContinuation()
+		if err != nil {
+			return err
+		}
+		defer continuation.Close()
+		componentexec.ClearEnvironment()
+		return proxyapp.RunEntry(ctx, a.service, continuation.Input(), continuation, a.prepareService, a.runMaster)
+	}
 	proxyapp.ClearWorkerEnvironment()
-	return a.runMasterProcess(ctx)
+	return a.runMasterProcess(ctx, signals)
 }
 
 func (a *App) requireInitialized() error {
@@ -158,7 +174,7 @@ func (a *App) requireInitialized() error {
 	return nil
 }
 
-func (a *App) runMasterProcess(ctx context.Context) error {
+func (a *App) runMasterProcess(ctx context.Context, signals bool) error {
 	bootstrap, err := a.receiveComponent()
 	if errors.Is(err, componentexec.ErrNoBootstrap) {
 		return fmt.Errorf("custom proxy must be invoked through node-ctl proxy")
@@ -169,31 +185,35 @@ func (a *App) runMasterProcess(ctx context.Context) error {
 	if err := componentexec.VerifyCurrentExecutable(bootstrap.ComponentIdentity); err != nil {
 		return err
 	}
+	return proxyapp.RunEntry(ctx, a.service, proxyapp.ServiceInput{Config: bootstrap.Config, Executable: bootstrap.ComponentExecutable, Signals: signals}, nil, a.prepareService, a.runMaster)
+}
+
+func (a *App) prepareService(ctx context.Context, input proxyapp.ServiceInput) (_ *proxyapp.Startup, returnErr error) {
 	var cfg publicconfig.Proxy
-	if err := decodeConfig(bootstrap.Config, &cfg); err != nil {
-		return fmt.Errorf("custom proxy bootstrap config: %w", err)
+	if err := decodeConfig(input.Config, &cfg); err != nil {
+		return nil, fmt.Errorf("custom proxy bootstrap config: %w", err)
 	}
 	immutableExecutable := cfg.Paths.ProxyExecutable
-	if immutableExecutable == "" || immutableExecutable != bootstrap.ComponentExecutable {
-		return fmt.Errorf("custom proxy bootstrap executable does not match config")
+	if !input.Native && (immutableExecutable == "" || immutableExecutable != input.Executable) {
+		return nil, fmt.Errorf("custom proxy bootstrap executable does not match config")
 	}
 	if a.hooks.Configure != nil {
 		if err := a.hooks.Configure(ctx, &cfg); err != nil {
-			return fmt.Errorf("custom proxy configure: %w", err)
+			return nil, fmt.Errorf("custom proxy configure: %w", err)
 		}
 	}
 	if cfg.Paths.ProxyExecutable != immutableExecutable {
-		return fmt.Errorf("custom proxy Configure must not change paths.proxy_executable")
+		return nil, fmt.Errorf("custom proxy Configure must not change paths.proxy_executable")
 	}
 	effective, err := proxyapp.FreezeConfig(&cfg)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	runtimeBindings := &Runtime{}
 	process := Process{Role: RoleMaster}
 	if a.hooks.BindRuntime != nil {
 		if err := a.hooks.BindRuntime(ctx, process, runtimeBindings); err != nil {
-			return fmt.Errorf("custom proxy bind runtime for master: %w", err)
+			return nil, fmt.Errorf("custom proxy bind runtime for master: %w", err)
 		}
 	}
 	// Ownership begins at the successful BindRuntime return, before any
@@ -202,15 +222,19 @@ func (a *App) runMasterProcess(ctx context.Context) error {
 	if owned == nil {
 		owned = make(map[string]*os.File)
 	}
-	defer listenresource.Close(owned)
+	defer func() {
+		if returnErr != nil {
+			listenresource.Close(owned)
+		}
+	}()
 	received, err := activation.Receive()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer listenresource.Close(received)
 	for name, file := range received {
 		if _, exists := owned[name]; exists {
-			return fmt.Errorf("proxy listener %q delivered by both activation and BindRuntime", name)
+			return nil, fmt.Errorf("proxy listener %q delivered by both activation and BindRuntime", name)
 		}
 		owned[name] = file
 		delete(received, name) // The App's frozen collection now owns this file.
@@ -218,9 +242,9 @@ func (a *App) runMasterProcess(ctx context.Context) error {
 	runtimeBindings.ListenerFiles = owned
 	resolved, err := proxyapp.ResolveRuntime(ctx, effective.Config(), freezeRuntime(runtimeBindings))
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return a.runMaster(ctx, effective, resolved)
+	return &proxyapp.Startup{Effective: effective, Runtime: resolved, Release: func() { listenresource.Close(owned) }}, nil
 }
 
 func (a *App) runWorkerProcess(ctx context.Context) error {

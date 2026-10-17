@@ -35,6 +35,11 @@ type Bindings struct {
 // Runtime is fully resolved before a master creates shared state/listeners or
 // a worker advertises readiness.
 type Runtime struct {
+	// inherited and retain are available only to the private service engine.
+	// retain consumes the complete duplicate collection on success.
+	inherited       *retainedResources
+	retain          func(*retainedResources) error
+	privatePaths    bool
 	Instance        *Instance
 	ListenerFiles   map[string]*os.File
 	Logger          *slog.Logger

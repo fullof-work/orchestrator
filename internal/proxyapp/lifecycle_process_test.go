@@ -25,6 +25,13 @@ import (
 // listeners, supervision and private controls. Only the conductor and Guest
 // business are fixtures; real Guest acceptance is a separate E2E layer.
 func TestMain(m *testing.M) {
+	if ContinuationPresent() || (len(os.Args) > 1 && os.Args[1] == "fixture-service") {
+		if err := runFixtureService(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 	if !WorkerBootstrapPresent() {
 		os.Exit(m.Run())
 	}
@@ -57,6 +64,11 @@ func (*lifecycleFixtureExtension) Start(context.Context, proxyextension.WorkerHo
 func (*lifecycleFixtureExtension) Shutdown(context.Context) error                         { return nil }
 func (*lifecycleFixtureExtension) WrapIngress(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/fixture/id" {
+			w.Header().Set("X-Fixture-Build", fixtureBuild)
+			fmt.Fprintf(w, "%s %d", fixtureBuild, os.Getpid())
+			return
+		}
 		if r.URL.Path != "/fixture/hold" {
 			next.ServeHTTP(w, r)
 			return

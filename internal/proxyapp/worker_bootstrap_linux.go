@@ -318,11 +318,15 @@ func validateWorkerFDMapping(fds workerFDMapping, bootstrapFD int) error {
 }
 
 func newSealedWorkerFile(payload []byte) (*os.File, error) {
-	fd, err := unix.MemfdCreate("kuasar-proxy-worker-bootstrap", unix.MFD_ALLOW_SEALING|unix.MFD_CLOEXEC)
+	return newSealedRuntimeFile("kuasar-proxy-worker-bootstrap", payload)
+}
+
+func newSealedRuntimeFile(name string, payload []byte) (*os.File, error) {
+	fd, err := unix.MemfdCreate(name, unix.MFD_ALLOW_SEALING|unix.MFD_CLOEXEC)
 	if err != nil {
 		return nil, fmt.Errorf("proxy worker bootstrap: memfd: %w", err)
 	}
-	file := os.NewFile(uintptr(fd), "kuasar-proxy-worker-bootstrap")
+	file := os.NewFile(uintptr(fd), name)
 	if err := writeWorkerPayload(file, payload); err != nil {
 		file.Close()
 		return nil, fmt.Errorf("proxy worker bootstrap: write: %w", err)
