@@ -8,7 +8,10 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,9 +19,13 @@ import (
 )
 
 func testServer(t *testing.T, handler http.Handler) (*Server, string, <-chan error) {
+	return testServerTLS(t, handler, nil)
+}
+
+func testServerTLS(t *testing.T, handler http.Handler, tlsConfig *tls.Config) (*Server, string, <-chan error) {
 	t.Helper()
 	ready := make(chan struct{})
-	server, err := New(context.Background(), handler, nil, func() { close(ready) })
+	server, err := New(context.Background(), handler, tlsConfig, func() { close(ready) })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,7 +41,118 @@ func testServer(t *testing.T, handler http.Handler) (*Server, string, <-chan err
 	case <-time.After(3 * time.Second):
 		t.Fatal("accept loop not entered")
 	}
-	return server, "http://" + listener.Addr().String(), serveDone
+	scheme := "http://"
+	if tlsConfig != nil {
+		scheme = "https://"
+	}
+	return server, scheme + listener.Addr().String(), serveDone
+}
+
+// Use exactly one physical connection. In particular, ClientConn.RoundTrip
+// cannot silently retry a GOAWAY on a newly dialed HTTP/2 connection.
+func TestDrainRejectsNewBusinessOnExistingConnection(t *testing.T) {
+	for _, protocol := range []string{"http1", "h2c", "h2"} {
+		t.Run(protocol, func(t *testing.T) {
+			var tlsConfig *tls.Config
+			if protocol == "h2" {
+				certificate := httptest.NewTLSServer(nil)
+				tlsConfig = certificate.TLS.Clone()
+				certificate.Close()
+			}
+			release := make(chan struct{})
+			var releaseOnce sync.Once
+			finish := func() { releaseOnce.Do(func() { close(release) }) }
+			defer finish()
+			var newHandlers atomic.Int32
+			payload := strings.Repeat("finite-response-", 4096)
+			server, address, _ := testServerTLS(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/held" {
+					newHandlers.Add(1)
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				io.WriteString(w, "begin:")
+				http.NewResponseController(w).Flush()
+				<-release
+				io.WriteString(w, payload)
+			}), tlsConfig)
+			request, _ := http.NewRequest(http.MethodGet, address+"/held", nil)
+			ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+			defer cancel()
+			var conn net.Conn
+			var err error
+			if protocol == "h2" {
+				conn, err = tls.DialWithDialer(&net.Dialer{Timeout: time.Second}, "tcp", request.URL.Host, &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h2"}})
+			} else {
+				conn, err = net.DialTimeout("tcp", request.URL.Host, time.Second)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			conn.SetDeadline(time.Now().Add(4 * time.Second))
+			var first *http.Response
+			var reader *bufio.Reader
+			var client *http2.ClientConn
+			if protocol == "http1" {
+				reader = bufio.NewReader(conn)
+				if err := request.Write(conn); err != nil {
+					t.Fatal(err)
+				}
+				first, err = http.ReadResponse(reader, request)
+			} else {
+				transport := &http2.Transport{}
+				client, err = transport.NewClientConn(conn)
+				if err == nil {
+					first, err = client.RoundTrip(request.WithContext(ctx))
+				}
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer first.Body.Close()
+			done := make(chan error, 1)
+			go func() { done <- server.Drain(ctx) }()
+			waitDraining(t, server)
+			second, _ := http.NewRequestWithContext(ctx, http.MethodGet, address+"/new", nil)
+			var response *http.Response
+			if protocol == "http1" {
+				// Pipeline behind the still-running response, on the original
+				// keep-alive connection, after the admission barrier closed.
+				if err := second.Write(conn); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				response, err = client.RoundTrip(second)
+				if err == nil && response.StatusCode != http.StatusServiceUnavailable {
+					t.Fatalf("new stream admitted: %s", response.Status)
+				}
+				if response != nil {
+					response.Body.Close()
+				}
+			}
+			finish()
+			body, err := io.ReadAll(first.Body)
+			if err != nil || string(body) != "begin:"+payload {
+				t.Fatalf("original response incomplete: bytes=%d err=%v", len(body), err)
+			}
+			if protocol == "http1" {
+				response, err = http.ReadResponse(reader, second)
+				if err == nil && response.StatusCode != http.StatusServiceUnavailable {
+					t.Fatalf("new request admitted: %s", response.Status)
+				}
+				if response != nil {
+					response.Body.Close()
+				}
+			}
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			if got := newHandlers.Load(); got != 0 {
+				t.Fatalf("new business entered %d handlers during drain", got)
+			}
+		})
+	}
 }
 
 func waitDraining(t *testing.T, s *Server) {

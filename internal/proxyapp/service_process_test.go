@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"golang.org/x/sys/unix"
 	"io"
 	"net"
 	"net/http"
@@ -24,6 +23,7 @@ import (
 
 	proxyextension "github.com/kuasar-sandbox/orchestrator/app/proxy/extension"
 	publicconfig "github.com/kuasar-sandbox/orchestrator/config"
+	"golang.org/x/sys/unix"
 )
 
 var fixtureBuild = "initial"
@@ -35,6 +35,15 @@ func (*serviceFixtureExtension) Shutdown(context.Context) error                 
 func (e *serviceFixtureExtension) WrapManagement(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
+		case "/fixture/cancelled-restart":
+			ctx, cancel := context.WithCancel(r.Context())
+			cancel()
+			id, err := e.s.InplaceRestart(ctx)
+			if id != "" || !errors.Is(err, context.Canceled) {
+				http.Error(w, fmt.Sprintf("cancelled request: id=%s err=%v", id, err), 500)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
 		case "/fixture/restart":
 			id, err := e.s.InplaceRestart(r.Context())
 			if err != nil {
@@ -212,7 +221,19 @@ func TestServiceRealShutdownDuringRecovery(t *testing.T) {
 }
 
 func TestServiceRealExecFailureRecovery(t *testing.T) {
-	testServiceRealImageReplacement(t, serviceScenario{execFailure: true})
+	testServiceRealImageReplacement(t, serviceScenario{execFailure: true, metrics: "ipv4"})
+}
+
+func TestServiceRealMetricsResources(t *testing.T) {
+	for _, mode := range []string{"ipv4", "ipv6", "dynamic", "occupied", "boundary"} {
+		t.Run(mode, func(t *testing.T) {
+			testServiceRealImageReplacement(t, serviceScenario{metrics: mode})
+		})
+	}
+}
+
+func TestServiceRealLegacyConductor(t *testing.T) {
+	testServiceRealImageReplacement(t, serviceScenario{legacy: true})
 }
 
 func TestServiceRealCandidateFailureDuringDrain(t *testing.T) {
@@ -231,7 +252,11 @@ func TestServiceRealSuccessorFailureDuringCandidateDrain(t *testing.T) {
 	testServiceRealImageReplacement(t, serviceScenario{successorFailure: true})
 }
 
-type serviceScenario struct{ signals, recovery, stopRecovery, execFailure, candidateFailure, stopDrain, forceStopDrain, successorFailure bool }
+type serviceScenario struct {
+	signals, recovery, stopRecovery, execFailure, candidateFailure, stopDrain, forceStopDrain, successorFailure bool
+	legacy                                                                                                      bool
+	metrics                                                                                                     string
+}
 
 func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 	signals, recovery, stopRecovery := scenario.signals, scenario.recovery, scenario.stopRecovery
@@ -256,13 +281,20 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 		cfg.ShutdownTimeout = "8s"
 	}
 	cfg.InplaceRestart = signals
+	var occupiedMetrics net.Listener
+	if scenario.metrics != "" {
+		cfg.MetricsListen, occupiedMetrics = fixtureMetricsAddress(t, scenario.metrics)
+		if occupiedMetrics != nil {
+			defer occupiedMetrics.Close()
+		}
+	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	cfg.DataListen = listener.Addr().String()
 	listener.Close()
-	consumeCompletions := serveFixtureRoutes(t, cfg.ConfigSocket, false)
+	consumeCompletions := serveFixtureRoutes(t, cfg.ConfigSocket, false, routeFixtureOptions{legacy: scenario.legacy})
 	dir := filepath.Dir(cfg.StatsSocket)
 	initial, err := os.Executable()
 	if err != nil {
@@ -320,6 +352,22 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 	if status.PID != pid || status.CoordinatorPID != pid || !status.ServiceReady {
 		t.Fatalf("initial identity: %+v", status)
 	}
+	initialBoot, initialMetrics := status.BootID, status.MetricsAddress
+	if scenario.metrics != "" {
+		checkFixtureMetrics(t, initialMetrics)
+	}
+	response, err := management.Post("http://proxy/fixture/cancelled-restart", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("pre-acceptance cancellation: %d", response.StatusCode)
+	}
+	status = waitServiceStatus(t, management, func(status Status) bool { return status.Ready })
+	if status.InplaceRestart != nil || len(status.Instances) != 1 || status.BootID != initialBoot {
+		t.Fatalf("cancelled request changed the running service: %+v", status)
+	}
 	if err := os.Rename(target, deployment); err != nil {
 		t.Fatal(err)
 	}
@@ -364,9 +412,10 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 	stopFromCandidate := false
 	var stoppedCandidate int
 	var cancelledAttempt time.Time
+	rejectRestart := scenario.legacy || scenario.metrics == "boundary"
 	for iteration := 0; iteration < 2; iteration++ {
 		var releaseHeld func()
-		if (scenario.execFailure || scenario.candidateFailure || scenario.stopDrain || scenario.successorFailure) && iteration == 0 {
+		if (scenario.execFailure || scenario.candidateFailure || scenario.stopDrain || scenario.successorFailure) && iteration == 0 || scenario.metrics != "" && !rejectRestart && !(scenario.metrics == "occupied" && iteration == 0) {
 			release := make(chan struct{})
 			var once sync.Once
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -422,6 +471,17 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 			}
 			body, _ := io.ReadAll(response.Body)
 			response.Body.Close()
+			if rejectRestart {
+				if response.StatusCode != http.StatusConflict {
+					t.Fatalf("incompatible operation accepted: %d %s", response.StatusCode, body)
+				}
+				status = waitServiceStatus(t, management, func(status Status) bool { return status.Ready })
+				if status.InplaceRestart != nil || len(status.Instances) != 1 || status.BootID != initialBoot || status.Data != "serving" {
+					t.Fatalf("rejected operation changed A: %+v", status)
+				}
+				t.Logf("rejected before acceptance while A serves: %s", body)
+				continue
+			}
 			if response.StatusCode != 200 {
 				t.Fatalf("accept: %d %s", response.StatusCode, body)
 			}
@@ -431,6 +491,41 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 			t.Fatalf("operation ID %q", id)
 		}
 		previous = id
+		if scenario.metrics == "occupied" && iteration == 0 {
+			status = waitServiceStatus(t, management, func(status Status) bool {
+				return status.InplaceRestart != nil && status.InplaceRestart.Result != ""
+			})
+			if status.InplaceRestart.Result != "failed" || !strings.Contains(status.InplaceRestart.LastError, "address already in use") || !status.Ready || status.BootID != initialBoot || len(status.Instances) != 1 {
+				t.Fatalf("occupied metrics did not roll back before A drain: %+v", status)
+			}
+			occupiedMetrics.Close()
+			continue
+		}
+		var candidateMetrics string
+		if scenario.metrics != "" {
+			draining := waitServiceStatus(t, management, func(status Status) bool {
+				return status.InplaceRestart != nil && status.InplaceRestart.Phase == "draining_a" && len(status.Instances) == 2
+			})
+			candidate := draining.Instances[1]
+			candidateMetrics = candidate.MetricsAddress
+			if !candidate.Ready || candidateMetrics == initialMetrics {
+				t.Fatalf("candidate did not acquire distinct metrics: %+v", draining)
+			}
+			if scenario.metrics != "dynamic" {
+				want, _ := candidateMetricsAddress(cfg.MetricsListen)
+				if candidateMetrics != want {
+					t.Fatalf("candidate metrics=%s want=%s", candidateMetrics, want)
+				}
+			}
+			checkFixtureMetrics(t, candidateMetrics)
+			checkFixturePortHeld(t, initialMetrics)
+			candidateClient := fixtureManagement(candidate.StatsSocket)
+			checkFixtureRestartRejected(t, candidateClient, "nested")
+			checkFixtureRestartRejected(t, management, ErrRestartInProgress.Error())
+			if !scenario.execFailure || iteration != 0 {
+				releaseHeld()
+			}
+		}
 		if scenario.successorFailure && iteration == 0 {
 			originalDraining := waitServiceStatus(t, management, func(status Status) bool {
 				return status.InplaceRestart != nil && status.InplaceRestart.Phase == "draining_a" && status.Workers.Ready == 0
@@ -536,6 +631,13 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 				t.Fatalf("missing supervised recovery: %+v", recovering)
 			}
 			t.Logf("recovery: main_pid=%d candidate_pid=%d operation=%s target=%s attempts=%d last_error=%q next_attempt=%v", pid, recovering.PID, id, recovering.InplaceRestart.Target, recovering.InplaceRestart.Attempts, recovering.InplaceRestart.LastError, recovering.InplaceRestart.NextAttempt)
+			if scenario.metrics != "" {
+				if recovering.MetricsAddress != candidateMetrics {
+					t.Fatalf("retry replaced candidate metrics: %+v", recovering)
+				}
+				checkFixtureMetrics(t, candidateMetrics)
+				checkFixturePortHeld(t, initialMetrics)
+			}
 			if stopRecovery {
 				stopLoad()
 				<-loadDone
@@ -570,6 +672,17 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 			t.Fatalf("completion: %+v", status)
 		}
 		t.Logf("complete: iteration=%d main_pid=%d operation=%s target=%s attempts=%d result=%s forced=%d", iteration, pid, id, status.InplaceRestart.Target, status.InplaceRestart.Attempts, status.InplaceRestart.Result, status.InplaceRestart.ForcedCloseCount)
+		if scenario.metrics != "" {
+			if status.MetricsAddress != initialMetrics {
+				t.Fatalf("A-prime changed metrics address: %s want=%s", status.MetricsAddress, initialMetrics)
+			}
+			checkFixtureMetrics(t, initialMetrics)
+			released, err := net.Listen("tcp", candidateMetrics)
+			if err != nil {
+				t.Fatalf("candidate metrics resource leaked: %v", err)
+			}
+			released.Close()
+		}
 		actual, err := os.Stat(fmt.Sprintf("/proc/%d/exe", pid))
 		if err != nil {
 			t.Fatal(err)
@@ -589,8 +702,11 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 	if len(businessErrors) != 0 {
 		t.Fatalf("business failures without retries: %v", businessErrors)
 	}
-	if builds["target"] == 0 {
+	if !rejectRestart && builds["target"] == 0 {
 		t.Fatalf("no target business response: %v", builds)
+	}
+	if rejectRestart && builds["initial"] == 0 {
+		t.Fatalf("no ordinary business under compatibility rejection: %v", builds)
 	}
 	t.Logf("business results: builds=%v unexpected_failures=%d expected_injected_connection_losses=%v", builds, len(businessErrors), expectedLosses)
 	if !stopFromCandidate {
@@ -641,6 +757,90 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 	paths, _ := filepath.Glob(filepath.Join(dir, ".proxy-*"))
 	if len(paths) != 0 {
 		t.Fatalf("candidate resources remain: %v", paths)
+	}
+}
+
+func fixtureManagement(socket string) *http.Client {
+	return &http.Client{Transport: &http.Transport{DisableKeepAlives: true, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", socket)
+	}}, Timeout: time.Second}
+}
+
+func checkFixtureRestartRejected(t *testing.T, client *http.Client, reason string) {
+	t.Helper()
+	response, err := client.Post("http://proxy/fixture/restart", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(response.Body)
+	response.Body.Close()
+	if err != nil || response.StatusCode != http.StatusConflict || !strings.Contains(string(body), reason) {
+		t.Fatalf("restart rejection: status=%d body=%q err=%v", response.StatusCode, body, err)
+	}
+}
+
+// Selecting a free adjacent pair belongs to test setup. Production must bind
+// exactly the configured p and p+1, and the assertions below check those binds.
+func fixtureMetricsAddress(t *testing.T, mode string) (string, net.Listener) {
+	t.Helper()
+	if mode == "dynamic" {
+		return "127.0.0.1:0", nil
+	}
+	if mode == "boundary" {
+		return "127.0.0.1:65535", nil
+	}
+	host := "127.0.0.1"
+	if mode == "ipv6" {
+		host = "::1"
+	}
+	for attempt := 0; attempt < 50; attempt++ {
+		first, err := net.Listen("tcp", net.JoinHostPort(host, "0"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		address := first.Addr().String()
+		_, port, _ := net.SplitHostPort(address)
+		number, _ := strconv.Atoi(port)
+		second, err := net.Listen("tcp", net.JoinHostPort(host, strconv.Itoa(number+1)))
+		first.Close()
+		if err != nil {
+			continue
+		}
+		if mode == "occupied" {
+			return address, second
+		}
+		second.Close()
+		return address, nil
+	}
+	t.Fatal("cannot allocate an adjacent metrics pair for the fixture")
+	return "", nil
+}
+
+func checkFixturePortHeld(t *testing.T, address string) {
+	t.Helper()
+	listener, err := net.Listen("tcp", address)
+	if listener != nil {
+		listener.Close()
+	}
+	if !errors.Is(err, syscall.EADDRINUSE) {
+		t.Fatalf("metrics listener was not continuously held: %s: %v", address, err)
+	}
+}
+
+func checkFixtureMetrics(t *testing.T, address string) {
+	t.Helper()
+	checkFixturePortHeld(t, address)
+	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}, Timeout: time.Second}
+	response, err := client.Get("http://" + address + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(response.Body)
+	response.Body.Close()
+	// The fixture sends only an initial Bookmark, so its master counter
+	// registry can legitimately be empty. Check the actual exposition route.
+	if err != nil || response.StatusCode != http.StatusOK || response.Header.Get("Content-Type") != "text/plain; version=0.0.4" {
+		t.Fatalf("metrics unavailable: status=%d bytes=%d err=%v", response.StatusCode, len(body), err)
 	}
 }
 

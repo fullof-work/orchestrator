@@ -294,8 +294,14 @@ func TestMasterRealWorkersReadyAndOrderedDrain(t *testing.T) {
 	}
 }
 
-func serveFixtureRoutes(t *testing.T, socket string, metadata bool) func() {
+type routeFixtureOptions struct{ legacy bool }
+
+func serveFixtureRoutes(t *testing.T, socket string, metadata bool, options ...routeFixtureOptions) func() {
 	t.Helper()
+	capabilities := []string{routesync.InplaceRestartV1}
+	if len(options) != 0 && options[0].legacy {
+		capabilities = nil
+	}
 	if err := os.MkdirAll(filepath.Dir(socket), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -342,7 +348,7 @@ func serveFixtureRoutes(t *testing.T, socket string, metadata bool) func() {
 			registrationsMu.Unlock()
 		}
 		policy := routesync.Policy{AuthMode: "enforce", ParkTimeoutMS: 30000, MMDS: &routesync.MMDSProxyPolicy{Enabled: metadata, Listen: "fd=mmds"}}
-		if err := routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{Version: routesync.Version, Policy: policy, ProxyCapabilities: []string{routesync.InplaceRestartV1}}}); err != nil {
+		if err := routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{Version: routesync.Version, Policy: policy, ProxyCapabilities: capabilities}}); err != nil {
 			return
 		}
 		if err := routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeBookmark}); err != nil {

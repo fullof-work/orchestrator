@@ -23,10 +23,14 @@ def digest(path):
 
 
 class UnixHTTP(http.client.HTTPConnection):
+    def __init__(self, socket_path, **kwargs):
+        super().__init__('localhost', **kwargs)
+        self.socket_path = socket_path
+
     def connect(self):
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.settimeout(self.timeout)
-        self.sock.connect(self.host)
+        self.sock.connect(self.socket_path)
 
 
 class Probe:
@@ -71,7 +75,7 @@ class Probe:
         while time.monotonic() < deadline:
             try:
                 code, _, body = self.management(endpoint=endpoint)
-                assert code == 200
+                assert code == 200, (code, body)
                 last = json.loads(body)
                 assert len(last['instances']) <= 2, last
                 assert last['coordinator_pid'] == self.pid, last
