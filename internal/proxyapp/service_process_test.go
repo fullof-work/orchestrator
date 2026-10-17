@@ -23,6 +23,8 @@ import (
 
 	proxyextension "github.com/kuasar-sandbox/orchestrator/app/proxy/extension"
 	publicconfig "github.com/kuasar-sandbox/orchestrator/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxycompletion"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"golang.org/x/sys/unix"
 )
 
@@ -412,6 +414,10 @@ func TestServiceRealLegacyConductor(t *testing.T) {
 	testServiceRealImageReplacement(t, serviceScenario{legacy: true})
 }
 
+func TestServiceRealCompletionOnlyConductor(t *testing.T) {
+	testServiceRealImageReplacement(t, serviceScenario{completionOnly: true})
+}
+
 func TestServiceRealRetirementFailureRecovery(t *testing.T) {
 	testServiceRealImageReplacement(t, serviceScenario{retirementFailure: true})
 }
@@ -445,7 +451,7 @@ type serviceScenario struct {
 	retirementFailure                                                                                           bool
 	concurrent                                                                                                  bool
 	signals, recovery, stopRecovery, execFailure, candidateFailure, stopDrain, forceStopDrain, successorFailure bool
-	legacy                                                                                                      bool
+	legacy, completionOnly                                                                                      bool
 	metrics                                                                                                     string
 }
 
@@ -490,7 +496,23 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 		retirement = &fixtureRetirementFailure{blocked: true}
 		defer retirement.release()
 	}
-	consumeCompletions := serveFixtureRoutes(t, cfg.ConfigSocket, false, routeFixtureOptions{legacy: scenario.legacy, retirement: retirement})
+	consumeCompletions := serveFixtureRoutes(t, cfg.ConfigSocket, false, routeFixtureOptions{legacy: scenario.legacy, completionOnly: scenario.completionOnly, retirement: retirement})
+	var priorCompletion string
+	if scenario.completionOnly {
+		// A completed service that never received a registration ACK is absent
+		// from the authority's map. Only the next master's outbox relay can
+		// remove this signed receipt, including without restart support.
+		identity := routesync.ProxyInstance{ServiceID: newBootID(), BootID: newBootID(), Slot: "coordinator", Generation: 1, CoordinatorPID: os.Getpid()}
+		binding, private, err := proxycompletion.Create(cfg.StatsSocket, identity)
+		if err != nil {
+			t.Fatal(err)
+		}
+		identity.Completion = binding
+		if err := proxycompletion.Complete(identity, private); err != nil {
+			t.Fatal(err)
+		}
+		priorCompletion = binding.Path
+	}
 	dir := filepath.Dir(cfg.StatsSocket)
 	initial, err := os.Executable()
 	if err != nil {
@@ -610,7 +632,7 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 	stopFromCandidate := false
 	var stoppedCandidate int
 	var cancelledAttempt time.Time
-	rejectRestart := scenario.legacy || scenario.metrics == "boundary"
+	rejectRestart := scenario.legacy || scenario.completionOnly || scenario.metrics == "boundary"
 	iterations := 2
 	if scenario.preparationFault != "" {
 		iterations++ // One rejected candidate, then two complete operations.
@@ -1081,6 +1103,19 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 	}
 	t.Logf("business results: builds=%v unexpected_failures=%d expected_injected_connection_losses=%v", builds, len(businessErrors), expectedLosses)
 	if !stopFromCandidate {
+		if priorCompletion != "" {
+			deadline := time.Now().Add(3 * time.Second)
+			for {
+				_, err := os.Stat(priorCompletion)
+				if os.IsNotExist(err) {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("completion-only master did not relay prior receipt: %v", err)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
 		response, err := management.Post("http://proxy/fixture/stop", "", nil)
 		if err != nil {
 			t.Fatal(err)

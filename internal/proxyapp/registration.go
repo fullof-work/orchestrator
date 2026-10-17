@@ -14,6 +14,11 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
+func completionContractSupported(capabilities []string) bool {
+	// Earlier peers advertised completion only as part of the full contract.
+	return slices.Contains(capabilities, routesync.ProxyCompletionV1) || slices.Contains(capabilities, routesync.InplaceRestartV1)
+}
+
 // This runs before service resources are released and before done is closed.
 // Failed ACKs leave a signed durable receipt, consumed by conductor recovery or
 // a later admitted service. A live or unjoined process never produces a receipt.
@@ -45,7 +50,7 @@ func (s *Service) finishServiceRegistration() error {
 	legacy := false
 	if instance != nil {
 		instance.mu.Lock()
-		legacy = operation == nil && instance.capabilitiesKnown && !slices.Contains(instance.capabilities, routesync.InplaceRestartV1)
+		legacy = operation == nil && instance.capabilitiesKnown && !completionContractSupported(instance.capabilities)
 		instance.mu.Unlock()
 	}
 	if legacy {
@@ -76,7 +81,7 @@ func (s *Service) finishLocalRegistration() error {
 	}
 	if identity != nil && !candidate {
 		instance.mu.Lock()
-		supported := slices.Contains(instance.capabilities, routesync.InplaceRestartV1)
+		supported := completionContractSupported(instance.capabilities)
 		instance.mu.Unlock()
 		if err := s.retireInstance(baseline.config.ConfigSocket, *identity, supported); err != nil {
 			return err

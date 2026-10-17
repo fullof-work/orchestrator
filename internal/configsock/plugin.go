@@ -390,8 +390,14 @@ func (s *Server) handlePluginRegister(w http.ResponseWriter, r *http.Request) {
 	defer s.deps.Plugins.Remove(p)
 	s.log.Info("plugin registered", "id", id, "subscribe", reg.SubscribeKind(), "proxy", reg.Proxy != nil, "mmds", reg.Mmds)
 	hooks := &routesync.StreamHooks{
-		RouteStreamReady: func() { s.deps.Plugins.markRouteStreamReady(p) },
-		RouteBarrierAck:  func(barrierID string) { s.deps.Plugins.routeBarrierAck(p, barrierID) },
+		ProxyCapabilities: []string{routesync.ProxyCompletionV1},
+		RouteStreamReady:  func() { s.deps.Plugins.markRouteStreamReady(p) },
+		RouteBarrierAck:   func(barrierID string) { s.deps.Plugins.routeBarrierAck(p, barrierID) },
+	}
+	// A static PID allowlist cannot authorize the not-yet-created candidate.
+	// Preserve that gate and reject restart during preflight, before launching B.
+	if s.deps.PluginPidfile == "" {
+		hooks.ProxyCapabilities = append(hooks.ProxyCapabilities, routesync.InplaceRestartV1)
 	}
 	routesync.ServeStream(ctx, w, r.Body, s.deps.RouteSource, reg, hooks, s.log)
 	s.log.Info("plugin deregistered", "id", id)

@@ -261,8 +261,12 @@ type Hello struct {
 }
 
 // InplaceRestartV1 promises capability-based Proxy registration, all-participant
-// route barriers, and conservative multi-instance traffic statistics.
+// route barriers, conservative multi-instance traffic statistics, and completion.
 const InplaceRestartV1 = "inplace_restart_v1"
+
+// ProxyCompletionV1 promises durable statistics obligations and signed service
+// completion for admitted instances. It does not authorize a new process PID.
+const ProxyCompletionV1 = "proxy_completion_v1"
 
 // ValidateHello enforces the single supported protocol version before a client
 // processes route or command frames from the session.

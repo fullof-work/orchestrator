@@ -302,8 +302,9 @@ func TestMasterRealWorkersReadyAndOrderedDrain(t *testing.T) {
 }
 
 type routeFixtureOptions struct {
-	legacy     bool
-	retirement *fixtureRetirementFailure
+	legacy         bool
+	completionOnly bool
+	retirement     *fixtureRetirementFailure
 }
 
 func serveFixtureRoutes(t *testing.T, socket string, metadata bool, options ...routeFixtureOptions) func() {
@@ -311,6 +312,8 @@ func serveFixtureRoutes(t *testing.T, socket string, metadata bool, options ...r
 	capabilities := []string{routesync.InplaceRestartV1}
 	if len(options) != 0 && options[0].legacy {
 		capabilities = nil
+	} else if len(options) != 0 && options[0].completionOnly {
+		capabilities = []string{routesync.ProxyCompletionV1}
 	}
 	if err := os.MkdirAll(filepath.Dir(socket), 0700); err != nil {
 		t.Fatal(err)

@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"slices"
 	"sync"
 	"time"
 
@@ -257,7 +256,7 @@ func RunMaster(ctx context.Context, effective *EffectiveConfig, runtime *Runtime
 			for {
 				instance.mu.Lock()
 				changed := instance.changed
-				supported := slices.Contains(instance.capabilities, routesync.InplaceRestartV1)
+				supported := completionContractSupported(instance.capabilities)
 				instance.mu.Unlock()
 				if supported {
 					for _, receipt := range proxycompletion.Pending(cfg.StatsSocket) {

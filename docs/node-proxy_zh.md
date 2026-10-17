@@ -187,6 +187,11 @@ Sandbox schema 或日志字段。
 `inplace_restart_v1` 声明这些多实例配套能力；缺失时兼容的单实例仍可运行，
 InplaceRestart 在排空 A 前拒绝。
 
+配置 conductor `paths.plugin_pidfile` 时仍严格执行 PID 白名单。由于无法预先授权
+尚未创建的候选 PID，conductor 不声明 `inplace_restart_v1`；两种重启触发方式均在
+受理前拒绝，当前实例继续服务。仍声明 `proxy_completion_v1`，使普通停机保留持久
+统计与签名完成凭据，并支持 conductor 离线后的恢复清理。该能力不授权其他进程。
+
 MMDS 扩展不写固定表。master 对每个 active sandbox 在一个锁内替换 routes + values;
 heap entry 总数受 `route_capacity` 限制。`BeginSync` 与 routesync 断开
 都会立即清空 heap 并标记 unavailable；新 master 也从空视图开始，只有完整 `Bookmark` 后才
