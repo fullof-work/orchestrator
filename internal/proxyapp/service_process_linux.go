@@ -156,6 +156,7 @@ func (s *Service) readChild(c *serviceChild) {
 				c.status.Ready = false
 				c.notifyLocked()
 				c.mu.Unlock()
+				_ = c.wire.send(serviceMessage{Kind: "error_ack", Error: message.Error})
 			case "shutdown":
 				_ = s.requestShutdownAt(message.Deadline)
 			case "detached":

@@ -174,13 +174,12 @@ func (s *Service) runCandidate(ctx context.Context) error {
 		preparationErr = s.startLocal(ctx, boot, "proxy-"+boot, s.resources)
 		if preparationErr != nil {
 			if !s.stopping() {
-				_ = s.parent.send(serviceMessage{Kind: "error", Error: preparationErr.Error()})
-				return preparationErr
+				return s.finishCandidateError(preparationErr, messages, connectionError)
 			}
 			if errors.Is(preparationErr, ErrStopped) || errors.Is(preparationErr, context.Canceled) {
 				preparationErr = nil
 			} else {
-				_ = s.parent.send(serviceMessage{Kind: "error", Error: preparationErr.Error()})
+				return s.finishCandidateError(preparationErr, messages, connectionError)
 			}
 		}
 	}
@@ -223,7 +222,7 @@ func (s *Service) runCandidate(ctx context.Context) error {
 		case err := <-s.localDone:
 			_ = sendSnapshot()
 			if err != nil {
-				_ = s.parent.send(serviceMessage{Kind: "error", Error: err.Error()})
+				return s.finishCandidateError(err, messages, connectionError)
 			}
 			return err
 		case err := <-connectionError:
@@ -292,6 +291,46 @@ func (s *Service) runCandidate(ctx context.Context) error {
 				}
 				s.local.requestStop(time.Now().Add(s.timeout))
 			}
+		}
+	}
+}
+
+// All business has ended or failed to start before this call. Closing a Unix
+// packet socket with unread inbound packets discards even its queued outbound
+// error. Keep consuming control until A confirms it recorded the terminal error.
+// This shares one bounded control budget and never extends an existing drain.
+func (s *Service) finishCandidateError(cause error, messages <-chan serviceMessage, connectionError <-chan error) error {
+	deadline := time.Now().Add(2 * time.Second)
+	if drain := s.drainDeadline(); drain.Before(deadline) {
+		deadline = drain
+	}
+	s.mu.Lock()
+	local := s.local
+	s.mu.Unlock()
+	if local != nil {
+		local.mu.Lock()
+		if !local.deadline.IsZero() && local.deadline.Before(deadline) {
+			deadline = local.deadline
+		}
+		local.mu.Unlock()
+	}
+	if err := s.parent.send(serviceMessage{Kind: "error", Error: cause.Error(), Deadline: deadline}); err != nil {
+		return errors.Join(cause, err)
+	}
+	timer := time.NewTimer(max(time.Until(deadline), 0))
+	defer timer.Stop()
+	for {
+		select {
+		case message := <-messages:
+			if message.Kind == "error_ack" && message.Error == cause.Error() {
+				return cause
+			}
+			// Drain/release/detach cannot restart ended business. Consuming
+			// them also prevents the single reader from blocking ahead of ACK.
+		case err := <-connectionError:
+			return errors.Join(cause, err)
+		case <-timer.C:
+			return errors.Join(cause, fmt.Errorf("candidate terminal error acknowledgement timed out"))
 		}
 	}
 }
