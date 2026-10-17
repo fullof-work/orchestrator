@@ -48,9 +48,11 @@ type InstanceStatus struct {
 }
 
 type RestartStatus struct {
-	ID               RestartID  `json:"id"`
-	Phase            string     `json:"phase"`
-	Target           string     `json:"target"`
+	ID     RestartID `json:"id"`
+	Phase  string    `json:"phase"`
+	Target string    `json:"target"`
+	// Attempts includes instance preparations, failed exec attempts, and
+	// retries of retained candidate reclamation after its first drain.
 	Attempts         int        `json:"attempts"`
 	LastError        string     `json:"last_error,omitempty"`
 	NextAttempt      *time.Time `json:"next_attempt,omitempty"`

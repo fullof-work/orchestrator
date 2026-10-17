@@ -28,6 +28,29 @@ import (
 
 var fixtureBuild = "initial"
 
+// The conductor fixture records actual retirement requests. The product has
+// no fault switch, shortened clock, or alternate retry implementation.
+type fixtureRetirementFailure struct {
+	mu       sync.Mutex
+	blocked  bool
+	requests []time.Time
+}
+
+func (f *fixtureRetirementFailure) reject() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.blocked {
+		f.requests = append(f.requests, time.Now())
+	}
+	return f.blocked
+}
+
+func (f *fixtureRetirementFailure) release() {
+	f.mu.Lock()
+	f.blocked = false
+	f.mu.Unlock()
+}
+
 type serviceFixtureExtension struct{ s *Service }
 
 // Cancel only after the target really has an open process-local descriptor.
@@ -313,6 +336,10 @@ func TestServiceRealLegacyConductor(t *testing.T) {
 	testServiceRealImageReplacement(t, serviceScenario{legacy: true})
 }
 
+func TestServiceRealRetirementFailureRecovery(t *testing.T) {
+	testServiceRealImageReplacement(t, serviceScenario{retirementFailure: true})
+}
+
 func TestServiceRealCandidateFailureDuringDrain(t *testing.T) {
 	testServiceRealImageReplacement(t, serviceScenario{candidateFailure: true})
 }
@@ -330,6 +357,7 @@ func TestServiceRealSuccessorFailureDuringCandidateDrain(t *testing.T) {
 }
 
 type serviceScenario struct {
+	retirementFailure                                                                                           bool
 	concurrent                                                                                                  bool
 	signals, recovery, stopRecovery, execFailure, candidateFailure, stopDrain, forceStopDrain, successorFailure bool
 	legacy                                                                                                      bool
@@ -372,7 +400,12 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 	}
 	cfg.DataListen = listener.Addr().String()
 	listener.Close()
-	consumeCompletions := serveFixtureRoutes(t, cfg.ConfigSocket, false, routeFixtureOptions{legacy: scenario.legacy})
+	var retirement *fixtureRetirementFailure
+	if scenario.retirementFailure {
+		retirement = &fixtureRetirementFailure{blocked: true}
+		defer retirement.release()
+	}
+	consumeCompletions := serveFixtureRoutes(t, cfg.ConfigSocket, false, routeFixtureOptions{legacy: scenario.legacy, retirement: retirement})
 	dir := filepath.Dir(cfg.StatsSocket)
 	initial, err := os.Executable()
 	if err != nil {
@@ -766,6 +799,45 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 					t.Fatal(err)
 				}
 			}
+		}
+		if scenario.retirementFailure && iteration == 0 {
+			var previousNext time.Time
+			var firstAttempts int
+			var candidateBoot string
+			for retry, delay := range []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 10 * time.Second, 10 * time.Second} {
+				retrying := waitServiceStatus(t, management, func(status Status) bool {
+					return status.InplaceRestart != nil && status.InplaceRestart.NextAttempt != nil && status.InplaceRestart.NextAttempt.After(previousNext)
+				})
+				if !retrying.Ready || !retrying.ServiceReady || retrying.InplaceRestart.ID != id || retrying.InplaceRestart.Result != "" || !strings.Contains(retrying.InplaceRestart.LastError, "HTTP 503") || len(retrying.Instances) != 2 {
+					t.Fatalf("retirement failure lost service or ownership: %+v", retrying)
+				}
+				candidate := retrying.Instances[1]
+				if retry == 0 {
+					firstAttempts, candidateBoot = retrying.InplaceRestart.Attempts, candidate.BootID
+					checkFixtureRestartRejected(t, management, ErrRestartInProgress.Error())
+				} else if candidate.BootID != candidateBoot {
+					t.Fatalf("reclamation started another candidate: %+v", retrying)
+				}
+				if err := unix.Kill(candidate.PID, 0); err != unix.ESRCH {
+					t.Fatalf("candidate process not reaped before retirement: %d %v", candidate.PID, err)
+				}
+				retirement.mu.Lock()
+				requests := append([]time.Time(nil), retirement.requests...)
+				retirement.mu.Unlock()
+				if len(requests) != retry+1 {
+					t.Fatalf("retirement attempts=%d want=%d", len(requests), retry+1)
+				}
+				at, next := requests[retry], *retrying.InplaceRestart.NextAttempt
+				if (!previousNext.IsZero() && at.Before(previousNext)) || next.Sub(at) < delay || next.Sub(at) > delay+time.Second {
+					t.Fatalf("retirement backoff: request=%s previous_next=%s next=%s want_delay=%s", at, previousNext, next, delay)
+				}
+				if retrying.InplaceRestart.Attempts != firstAttempts+retry {
+					t.Errorf("retirement retry absent from status counter: retry=%d first=%d attempts=%d", retry, firstAttempts, retrying.InplaceRestart.Attempts)
+				}
+				t.Logf("retirement recovery: retry=%d attempts=%d request=%s next=%s main_pid=%d candidate_boot=%s", retry, retrying.InplaceRestart.Attempts, at.Format(time.RFC3339Nano), next.Format(time.RFC3339Nano), pid, candidateBoot)
+				previousNext = next
+			}
+			retirement.release()
 		}
 		status = waitServiceStatus(t, management, func(status Status) bool {
 			return status.InplaceRestart != nil && status.InplaceRestart.ID == id && status.InplaceRestart.Result != ""

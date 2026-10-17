@@ -28,6 +28,7 @@ type serviceChild struct {
 	canShutdown    bool
 	draining       bool
 	forcedRecorded bool
+	reapAttempts   int
 	err            error
 	done           chan struct{}
 	changed        chan struct{}
@@ -388,7 +389,16 @@ func (s *Service) reapChild(c *serviceChild, deadline time.Time, hold bool) (ret
 	}()
 	c.mu.Lock()
 	c.draining = true
+	c.reapAttempts++
+	retrying := c.reapAttempts > 1
 	c.mu.Unlock()
+	if retrying {
+		s.mu.Lock()
+		if s.operation != nil && s.operation.Result == "" {
+			s.operation.Attempts++
+		}
+		s.mu.Unlock()
+	}
 	_ = c.wire.send(serviceMessage{Kind: "drain", Deadline: deadline, HoldMMDS: hold})
 	timer := time.NewTimer(max(time.Until(deadline), 0))
 	defer timer.Stop()

@@ -294,7 +294,10 @@ func TestMasterRealWorkersReadyAndOrderedDrain(t *testing.T) {
 	}
 }
 
-type routeFixtureOptions struct{ legacy bool }
+type routeFixtureOptions struct {
+	legacy     bool
+	retirement *fixtureRetirementFailure
+}
 
 func serveFixtureRoutes(t *testing.T, socket string, metadata bool, options ...routeFixtureOptions) func() {
 	t.Helper()
@@ -331,6 +334,10 @@ func serveFixtureRoutes(t *testing.T, socket string, metadata bool, options ...r
 			var identity routesync.ProxyInstance
 			if json.NewDecoder(r.Body).Decode(&identity) != nil {
 				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if len(options) != 0 && options[0].retirement != nil && identity.Slot == "candidate" && options[0].retirement.reject() {
+				w.WriteHeader(http.StatusServiceUnavailable)
 				return
 			}
 			if complete, err := proxycompletion.Verify(identity); err == nil && complete {
