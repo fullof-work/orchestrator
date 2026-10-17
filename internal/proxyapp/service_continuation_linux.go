@@ -148,6 +148,9 @@ func (s *Service) runCandidate(ctx context.Context) error {
 			}
 			if message.Kind == "drain" && !message.Deadline.IsZero() {
 				s.mu.Lock()
+				if s.candidateDeadline.IsZero() || message.Deadline.Before(s.candidateDeadline) {
+					s.candidateDeadline = message.Deadline
+				}
 				if s.localDone == nil {
 					s.stopUnstartedLocalLocked()
 				}
@@ -306,6 +309,9 @@ func (s *Service) finishCandidateError(cause error, messages <-chan serviceMessa
 	}
 	s.mu.Lock()
 	local := s.local
+	if !s.candidateDeadline.IsZero() && s.candidateDeadline.Before(deadline) {
+		deadline = s.candidateDeadline
+	}
 	s.mu.Unlock()
 	if local != nil {
 		local.mu.Lock()
@@ -324,6 +330,10 @@ func (s *Service) finishCandidateError(cause error, messages <-chan serviceMessa
 		case message := <-messages:
 			if message.Kind == "error_ack" && message.Error == cause.Error() {
 				return cause
+			}
+			if message.Kind == "drain" && !message.Deadline.IsZero() && message.Deadline.Before(deadline) {
+				deadline = message.Deadline
+				timer.Reset(max(time.Until(deadline), 0))
 			}
 			// Drain/release/detach cannot restart ended business. Consuming
 			// them also prevents the single reader from blocking ahead of ACK.

@@ -133,7 +133,7 @@ func TestCandidateStopDuringPreparationPreventsRunner(t *testing.T) {
 }
 
 func TestCandidateControlDuringPreparation(t *testing.T) {
-	for _, mode := range []string{"disconnect", "error_and_drain", "failed_snapshot"} {
+	for _, mode := range []string{"disconnect", "error_and_drain", "error_and_drain_no_ack", "failed_snapshot"} {
 		t.Run(mode, func(t *testing.T) {
 			left, right, err := newServicePair()
 			if err != nil {
@@ -164,7 +164,7 @@ func TestCandidateControlDuringPreparation(t *testing.T) {
 			service.prepare = func(ctx context.Context, _ ServiceInput) (*Startup, error) {
 				close(entered)
 				<-ctx.Done()
-				if mode == "error_and_drain" {
+				if mode == "error_and_drain" || mode == "error_and_drain_no_ack" {
 					return nil, failure
 				}
 				return nil, ctx.Err()
@@ -192,8 +192,22 @@ func TestCandidateControlDuringPreparation(t *testing.T) {
 			if mode == "disconnect" {
 				parent.conn.Close()
 			} else {
-				if err := parent.send(serviceMessage{Kind: "drain", Deadline: time.Now().Add(time.Second), HoldMMDS: true}); err != nil {
+				deadline := time.Now().Add(time.Second)
+				if mode == "error_and_drain_no_ack" {
+					deadline = time.Now().Add(20 * time.Millisecond)
+				}
+				if err := parent.send(serviceMessage{Kind: "drain", Deadline: deadline, HoldMMDS: true}); err != nil {
 					t.Fatal(err)
+				}
+				if mode == "error_and_drain" {
+					parent.conn.SetReadDeadline(deadline)
+					message, err := parent.read()
+					if err != nil || message.Kind != "error" || message.Error != failure.Error() {
+						t.Fatalf("terminal error not delivered: %+v, %v", message, err)
+					}
+					if err := parent.send(serviceMessage{Kind: "error_ack", Error: message.Error}); err != nil {
+						t.Fatal(err)
+					}
 				}
 			}
 			select {
@@ -203,7 +217,7 @@ func TestCandidateControlDuringPreparation(t *testing.T) {
 					if err == nil {
 						t.Fatal("control loss was hidden")
 					}
-				case "error_and_drain":
+				case "error_and_drain", "error_and_drain_no_ack":
 					if !errors.Is(err, failure) {
 						t.Fatalf("preparation error was hidden: %v", err)
 					}

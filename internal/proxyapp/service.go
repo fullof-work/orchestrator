@@ -77,6 +77,7 @@ type Service struct {
 	finished          sync.Once
 	knownService      *Status
 	candidate         bool
+	candidateDeadline time.Time // instance drain received before business starts
 	parent            *serviceWire
 	err               error
 	stopErr           error
