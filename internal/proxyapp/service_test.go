@@ -5,14 +5,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/kuasar-sandbox/orchestrator/internal/proxycompletion"
-	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/proxycompletion"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"golang.org/x/sys/unix"
 )
 
@@ -220,6 +220,95 @@ func TestStopRecordKeepsFirstDeadlineAndSurvivesDuplicate(t *testing.T) {
 	}
 	if got, err := continued.read(); err != nil || !got.Equal(first) {
 		t.Fatalf("lost stop=%v %v", got, err)
+	}
+}
+
+func TestShutdownPersistsBeforeExecAndCancelsOnlyCallerWait(t *testing.T) {
+	service := NewService()
+	service.started = true
+	var err error
+	service.stopRecord, err = newStopRecord()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.stopRecord.file.Close()
+	// Hold exactly the critical section used by StartProcess and exec. A
+	// stop intent must survive exec even while its old Go caller is blocked.
+	service.actionMu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			service.actionMu.Unlock()
+		}
+	}()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { result <- service.Shutdown(ctx) }()
+	select {
+	case <-service.stop:
+	case <-time.After(time.Second):
+		t.Error("stop was not published while exec held the action mutex")
+	}
+	first, err := service.stopRecord.read()
+	if err != nil || first.IsZero() {
+		t.Errorf("stop intent was not durable before exec: %v %v", first, err)
+	}
+	cancel()
+	returned := false
+	select {
+	case err := <-result:
+		returned = true
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("caller cancellation: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Error("caller cancellation waited for the engine critical section")
+	}
+	service.actionMu.Unlock()
+	locked = false
+	if !returned {
+		select {
+		case <-result:
+		case <-time.After(time.Second):
+			t.Fatal("Shutdown caller did not return after releasing the mutex")
+		}
+	}
+	if err := service.shutdownAll(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := service.stopRecord.read()
+	if err != nil || (!first.IsZero() && !first.Equal(second)) {
+		t.Fatalf("stop deadline changed after caller cancellation: %v %v", second, err)
+	}
+}
+
+func TestShutdownBeforeStopRecordPublicationKeepsDeadline(t *testing.T) {
+	service := NewService()
+	service.started = true
+	if err := service.requestShutdown(); err != nil {
+		t.Fatal(err)
+	}
+	first := service.stopDeadline
+	if first.IsZero() {
+		t.Fatal("stop before record allocation lost its deadline")
+	}
+	record, err := newStopRecord()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer record.file.Close()
+	service.mu.Lock()
+	err = service.installStopRecordLocked(record)
+	service.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.requestShutdown(); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := record.read(); err != nil || !got.Equal(first) {
+		t.Fatalf("record publication reset the stop budget: %v, %v", got, err)
 	}
 }
 

@@ -18,9 +18,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func (s *Service) restore(c *Continuation) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// Run holds mu across role restoration and publication to lifecycle callers.
+func (s *Service) restoreLocked(c *Continuation) error {
 	e := c.envelope
 	s.input = e.Input
 	s.operation = &e.Operation
@@ -76,7 +75,10 @@ func (s *Service) restore(c *Continuation) error {
 		recordFile.Close()
 		return err
 	}
-	s.stopRecord = record
+	if err := s.installStopRecordLocked(record); err != nil {
+		recordFile.Close()
+		return err
+	}
 	s.resources = &retainedResources{Data: c.take(e.Files.Data), MMDS: c.take(e.Files.MMDS), Stats: c.take(e.Files.Stats), Shm: c.take(e.Files.Shm), Metrics: c.take(e.Files.Metrics), DataExpression: e.DataExpression, MMDSExpression: e.MMDSExpression, StatsPath: e.StatsPath, ShmPath: e.ShmPath, StatsIdentity: e.StatsIdentity, ShmIdentity: e.ShmIdentity, MetricsExpression: e.MetricsExpression}
 	target := c.take(e.Files.Target)
 	if target == nil {
@@ -115,13 +117,11 @@ func (s *Service) runCandidate(ctx context.Context) error {
 		return err
 	}
 	if !deadline.IsZero() {
-		return nil
+		s.mu.Lock()
+		s.stopDeadline = deadline
+		s.mu.Unlock()
 	}
 	boot := s.parent.boot
-	if err := s.startLocal(ctx, boot, "proxy-"+boot, s.resources); err != nil {
-		_ = s.parent.send(serviceMessage{Kind: "error", Error: err.Error()})
-		return err
-	}
 	messages := make(chan serviceMessage, 1)
 	connectionError := make(chan error, 1)
 	readerCtx, cancelReader := context.WithCancel(context.Background())
@@ -130,8 +130,28 @@ func (s *Service) runCandidate(ctx context.Context) error {
 		for {
 			message, err := s.parent.read()
 			if err != nil {
+				s.mu.Lock()
+				if s.localDone == nil {
+					s.stopUnstartedLocalLocked()
+				}
+				s.mu.Unlock()
 				connectionError <- err
 				return
+			}
+			// Read-only service snapshots need no business-loop action. Consume
+			// them here so they cannot delay a stop while Configure is running.
+			if message.Kind == "service" && message.Service != nil {
+				s.mu.Lock()
+				s.knownService = message.Service
+				s.mu.Unlock()
+				continue
+			}
+			if message.Kind == "drain" && !message.Deadline.IsZero() {
+				s.mu.Lock()
+				if s.localDone == nil {
+					s.stopUnstartedLocalLocked()
+				}
+				s.mu.Unlock()
 			}
 			select {
 			case messages <- message:
@@ -140,9 +160,40 @@ func (s *Service) runCandidate(ctx context.Context) error {
 			}
 		}
 	}()
+	s.mu.Lock()
+	earlyStop := !s.stopDeadline.IsZero()
+	s.mu.Unlock()
+	var preparationErr error
+	if earlyStop {
+		// B has no business to drain, but it still forwards a whole-service
+		// request and remains under A's control until A acknowledges by drain.
+		if err := s.requestShutdown(); err != nil {
+			return err
+		}
+	} else {
+		preparationErr = s.startLocal(ctx, boot, "proxy-"+boot, s.resources)
+		if preparationErr != nil {
+			if !s.stopping() {
+				_ = s.parent.send(serviceMessage{Kind: "error", Error: preparationErr.Error()})
+				return preparationErr
+			}
+			if errors.Is(preparationErr, ErrStopped) || errors.Is(preparationErr, context.Canceled) {
+				preparationErr = nil
+			} else {
+				_ = s.parent.send(serviceMessage{Kind: "error", Error: preparationErr.Error()})
+			}
+		}
+	}
+	// local may contain a failed snapshot with no runner. Only a published
+	// completion channel denotes business which must actually be joined.
+	hasBusiness := s.localDone != nil
 	var gate chan struct{}
 	paused := false
 	sendSnapshot := func() error {
+		if !hasBusiness {
+			status := InstanceStatus{PID: os.Getpid(), BootID: boot, Phase: "stopping", Data: "stopped", MMDS: "stopped"}
+			return s.parent.send(serviceMessage{Kind: "snapshot", Status: &status, CanShutdown: true})
+		}
 		status := s.local.Snapshot()
 		compatible := s.local.extensionCompatible()
 		if s.localExtension != nil {
@@ -153,12 +204,18 @@ func (s *Service) runCandidate(ctx context.Context) error {
 	}
 	ctxDone := ctx.Done()
 	for {
-		s.local.mu.Lock()
-		changed := s.local.changed
-		s.local.mu.Unlock()
+		var changed <-chan struct{}
+		if hasBusiness {
+			s.local.mu.Lock()
+			changed = s.local.changed
+			s.local.mu.Unlock()
+		}
 		if paused {
 			changed = nil
 		} else if err := sendSnapshot(); err != nil {
+			if !hasBusiness {
+				return errors.Join(preparationErr, err)
+			}
 			s.local.requestStop(time.Now().Add(s.timeout))
 		}
 		select {
@@ -170,6 +227,9 @@ func (s *Service) runCandidate(ctx context.Context) error {
 			}
 			return err
 		case err := <-connectionError:
+			if !hasBusiness {
+				return errors.Join(preparationErr, err)
+			}
 			s.local.requestStop(time.Now().Add(s.timeout))
 			if gate != nil {
 				close(gate)
@@ -184,6 +244,9 @@ func (s *Service) runCandidate(ctx context.Context) error {
 			case "drain":
 				if message.Deadline.IsZero() {
 					return fmt.Errorf("candidate drain deadline missing")
+				}
+				if !hasBusiness {
+					return preparationErr
 				}
 				if message.HoldMMDS {
 					s.stopOnce.Do(func() { close(s.stop) })
@@ -203,11 +266,17 @@ func (s *Service) runCandidate(ctx context.Context) error {
 			case "detach":
 				paused = true
 				if err := s.parent.send(serviceMessage{Kind: "detached"}); err != nil {
+					if !hasBusiness {
+						return errors.Join(preparationErr, err)
+					}
 					s.local.requestStop(time.Now().Add(s.timeout))
 				}
 			case "resume":
 				paused = false
 				if err := sendSnapshot(); err != nil {
+					if !hasBusiness {
+						return errors.Join(preparationErr, err)
+					}
 					s.local.requestStop(time.Now().Add(s.timeout))
 				}
 			case "service": // Coordinator updates preserve whole-service /status on B.
@@ -218,6 +287,9 @@ func (s *Service) runCandidate(ctx context.Context) error {
 					s.mu.Unlock()
 				}
 			default:
+				if !hasBusiness {
+					return errors.Join(preparationErr, fmt.Errorf("unexpected service message %q", message.Kind))
+				}
 				s.local.requestStop(time.Now().Add(s.timeout))
 			}
 		}

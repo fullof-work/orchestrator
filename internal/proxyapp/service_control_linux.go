@@ -91,7 +91,10 @@ func (w *serviceWire) send(message serviceMessage) error {
 		return fmt.Errorf("proxy service message exceeds limit")
 	}
 	deadline := time.Now().Add(2 * time.Second)
-	if !message.Deadline.IsZero() && message.Deadline.Before(deadline) {
+	// A whole-service stop must reach the coordinator even if restoration has
+	// already consumed its business budget. Preserve the expired deadline in
+	// the packet while allowing this bounded control write to be delivered.
+	if message.Kind != "shutdown" && !message.Deadline.IsZero() && message.Deadline.Before(deadline) {
 		deadline = message.Deadline
 	}
 	_ = w.conn.SetWriteDeadline(deadline)

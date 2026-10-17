@@ -12,11 +12,26 @@ import (
 
 // stopRecord persists the first full-service stop deadline across exec. Only
 // the main coordinator writes it; B forwards public stop requests over control.
-// WriteAt completes before taking the engine mutex, so an accepted stop cannot
+// WriteAt completes before taking the launch/exec mutex, so an accepted stop cannot
 // disappear with a Go goroutine during the image transition.
 type stopRecord struct {
 	mu   sync.Mutex
 	file *os.File
+}
+
+// The state mutex covers publication and a stop racing the initial record
+// allocation or continuation restore. Preserve its first deadline rather than
+// starting another budget when the descriptor becomes available.
+func (s *Service) installStopRecordLocked(record *stopRecord) error {
+	if !s.stopDeadline.IsZero() {
+		deadline, err := record.request(s.stopDeadline)
+		if err != nil {
+			return err
+		}
+		s.stopDeadline = deadline
+	}
+	s.stopRecord = record
+	return nil
 }
 
 func newStopRecord() (*stopRecord, error) {

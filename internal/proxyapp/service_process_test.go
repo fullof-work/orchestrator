@@ -61,6 +61,7 @@ func (e *serviceFixtureExtension) WrapManagement(next http.Handler) http.Handler
 }
 
 func runFixtureService() error {
+	service := NewService()
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 	var continuation *Continuation
@@ -83,11 +84,22 @@ func runFixtureService() error {
 		}
 		input = ServiceInput{Config: raw, Executable: os.Args[3], Native: true, Signals: true}
 	}
-	service := NewService()
+	if continuation != nil {
+		if err := fixtureStopBeforeRun(service, input, continuation.envelope.Mode); err != nil {
+			service.FinishEntry(err)
+			return err
+		}
+	}
 	prepare := func(ctx context.Context, input ServiceInput) (*Startup, error) {
 		var cfg publicconfig.Proxy
 		if err := json.Unmarshal(input.Config, &cfg); err != nil {
 			return nil, err
+		}
+		if continuation != nil {
+			mode := continuation.envelope.Mode
+			if _, err := os.Stat(filepath.Join(filepath.Dir(cfg.StatsSocket), "stop-before-run-"+mode)); err == nil {
+				_ = os.WriteFile(filepath.Join(filepath.Dir(cfg.StatsSocket), "entry-prepared-"+mode), nil, 0600)
+			}
 		}
 		// This fault hook exists only in the test executable, after restored
 		// supervision and before application preparation can fail.
@@ -103,12 +115,86 @@ func runFixtureService() error {
 		return &Startup{Effective: effective, Runtime: &Runtime{Logger: testMasterLogger(), MasterExtension: &serviceFixtureExtension{s: service}}}, nil
 	}
 	err := RunEntry(ctx, service, input, continuation, prepare, RunMaster)
+	if continuation != nil {
+		var cfg publicconfig.Proxy
+		if json.Unmarshal(input.Config, &cfg) == nil {
+			service.mu.Lock()
+			body, _ := json.Marshal(struct {
+				Deadline time.Time
+				Started  bool
+			}{service.stopDeadline, service.local != nil})
+			service.mu.Unlock()
+			_ = os.WriteFile(filepath.Join(filepath.Dir(cfg.StatsSocket), "entry-result-"+continuation.envelope.Mode+".json"), body, 0600)
+		}
+	}
 	var config publicconfig.Proxy
 	if json.Unmarshal(input.Config, &config) == nil {
+		if continuation == nil || continuation.envelope.Mode == "resume" {
+			service.mu.Lock()
+			state, _ := json.Marshal(struct{ Deadline time.Time }{service.stopDeadline})
+			service.mu.Unlock()
+			_ = os.WriteFile(filepath.Join(filepath.Dir(config.StatsSocket), "coordinator-stop.json"), state, 0600)
+		}
 		result, _ := json.Marshal(map[string]bool{"forced": errors.Is(service.Shutdown(context.Background()), ErrForcedClose)})
 		_ = os.WriteFile(filepath.Join(filepath.Dir(config.StatsSocket), "service-result.json"), result, 0600)
 	}
 	return err
+}
+
+// This injection belongs only to the test executable. It models a programmatic
+// caller racing startup before any continuation descriptor has been restored by
+// Service.Run, and allows the parent test to observe the actual process first.
+func fixtureStopBeforeRun(service *Service, input ServiceInput, mode string) error {
+	var cfg publicconfig.Proxy
+	if err := json.Unmarshal(input.Config, &cfg); err != nil {
+		return err
+	}
+	dir := filepath.Dir(cfg.StatsSocket)
+	if _, err := os.Stat(filepath.Join(dir, "stop-before-run-"+mode)); os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- service.Shutdown(ctx) }()
+	var accepted time.Time
+	for {
+		var changed <-chan struct{}
+		service.mu.Lock()
+		accepted, changed = service.earlyStopAt, service.changed
+		service.mu.Unlock()
+		if !accepted.IsZero() {
+			break
+		}
+		select {
+		case <-changed:
+		case err := <-done:
+			return fmt.Errorf("pre-Run stop returned before restoration: %v", err)
+		case <-time.After(time.Second):
+			return fmt.Errorf("pre-Run stop was not recorded")
+		}
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		return fmt.Errorf("pre-Run caller cancellation: %v", err)
+	}
+	body, _ := json.Marshal(struct {
+		PID      int
+		Accepted time.Time
+	}{os.Getpid(), accepted})
+	if err := os.WriteFile(filepath.Join(dir, "entry-stop-"+mode+".json"), body, 0600); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(filepath.Join(dir, "continue-entry")); err == nil {
+			return nil
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return fmt.Errorf("fixture entry was not released")
 }
 
 func TestServiceRealImageReplacement(t *testing.T) {

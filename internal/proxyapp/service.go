@@ -57,6 +57,7 @@ type Service struct {
 	operation         *RestartStatus
 	target            *restartTarget
 	stopRecord        *stopRecord
+	stopDeadline      time.Time
 	stop              chan struct{}
 	stopOnce          sync.Once
 	stopMMDS          chan struct{}
@@ -67,6 +68,11 @@ type Service struct {
 	preparing         bool
 	running           bool
 	started           bool
+	entryPending      bool
+	entryReady        chan struct{}
+	entryFinished     sync.Once
+	entryErr          error
+	earlyStopAt       time.Time
 	closing           bool
 	finished          sync.Once
 	knownService      *Status
@@ -81,7 +87,10 @@ type Service struct {
 
 // NewService performs no I/O. Runtime resources are acquired by Run.
 func NewService() *Service {
-	return &Service{stop: make(chan struct{}), done: make(chan struct{}), changed: make(chan struct{}), requests: make(chan struct{}, 1), timeout: 30 * time.Second, coordinatorPID: os.Getpid(), serviceID: newBootID()}
+	// Observe only the private marker; descriptor ownership still starts in
+	// ReceiveContinuation. An early stop must await restoration of B/A-prime's
+	// role and supervision instead of treating it as an unused ordinary App.
+	return &Service{entryPending: ContinuationPresent(), entryReady: make(chan struct{}), stop: make(chan struct{}), done: make(chan struct{}), changed: make(chan struct{}), requests: make(chan struct{}, 1), timeout: 30 * time.Second, coordinatorPID: os.Getpid(), serviceID: newBootID()}
 }
 
 func (s *Service) notifyLocked() { close(s.changed); s.changed = make(chan struct{}) }
@@ -169,8 +178,18 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		return s.result()
 	default:
 	}
-	if err := s.requestShutdown(); err != nil {
-		return err
+	// Initiation belongs to the service as well: a candidate's control write
+	// or a launch/exec critical section must not hold the caller past its
+	// context. Cancellation leaves this request and the fixed drain running.
+	requested := make(chan error, 1)
+	go func() { requested <- s.requestShutdown() }()
+	select {
+	case err := <-requested:
+		if err != nil {
+			return err
+		}
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 	select {
 	case <-s.done:
@@ -190,14 +209,34 @@ func (s *Service) FinishEntry(err error) {
 	}
 	s.started = true
 	s.err = err
+	s.entryErr = err
+	s.entryPending = false
+	s.entryFinished.Do(func() { close(s.entryReady) })
 	s.finished.Do(func() { close(s.done) })
 	s.notifyLocked()
 }
 
 func (s *Service) requestShutdown() error {
-	s.actionMu.Lock()
-	defer s.actionMu.Unlock()
+	return s.requestShutdownAt(time.Time{})
+}
+
+func (s *Service) requestShutdownAt(requestedDeadline time.Time) error {
 	s.mu.Lock()
+	if s.entryPending {
+		if s.earlyStopAt.IsZero() {
+			s.earlyStopAt = time.Now()
+			s.notifyLocked()
+		}
+		ready := s.entryReady
+		s.mu.Unlock()
+		<-ready
+		return s.requestShutdownAt(requestedDeadline)
+	}
+	if s.entryErr != nil {
+		err := s.entryErr
+		s.mu.Unlock()
+		return err
+	}
 	if s.closing {
 		s.mu.Unlock()
 		return nil
@@ -210,22 +249,38 @@ func (s *Service) requestShutdown() error {
 		return nil
 	}
 	record, timeout, parent, candidate := s.stopRecord, s.timeout, s.parent, s.candidate
-	s.mu.Unlock()
+	deadline := s.stopDeadline
+	if deadline.IsZero() {
+		deadline = requestedDeadline
+		if deadline.IsZero() {
+			deadline = time.Now().Add(timeout)
+		}
+	}
 	if candidate {
+		s.stopDeadline = deadline
+		if s.localDone == nil {
+			s.stopUnstartedLocalLocked()
+		}
+		s.mu.Unlock()
 		if parent == nil {
 			return ErrNotReady
 		}
-		return parent.send(serviceMessage{Kind: "shutdown"})
+		return parent.send(serviceMessage{Kind: "shutdown", Deadline: deadline})
 	}
-	if record == nil {
-		s.stopOnce.Do(func() { close(s.stop) })
-		return nil
+	if record != nil {
+		var err error
+		deadline, err = record.request(deadline)
+		if err != nil {
+			s.mu.Unlock()
+			return err
+		}
 	}
-	deadline, err := record.request(time.Now().Add(timeout))
-	if err != nil {
-		return err
-	}
+	// Publish before waiting for actionMu. If exec has already passed its
+	// final check, the successor still receives this same durable record.
+	// Keeping mu until the write also excludes releaseService's file close.
+	s.stopDeadline = deadline
 	s.stopOnce.Do(func() { close(s.stop) })
+	s.mu.Unlock()
 	s.beginShutdown(deadline)
 	return nil
 }
@@ -233,7 +288,20 @@ func (s *Service) requestShutdown() error {
 // Stop accepting immediately, even when the coordinator is waiting for an
 // earlier drain or cleanup. MMDS stays available behind the shared data barrier.
 func (s *Service) beginShutdown(deadline time.Time) chan struct{} {
+	// A launch which passed its final stop check must publish its child before
+	// either stop initiator freezes the complete service's participant set.
+	s.actionMu.Lock()
+	defer s.actionMu.Unlock()
 	s.mu.Lock()
+	if s.closing {
+		if s.stopMMDS == nil {
+			s.stopMMDS = make(chan struct{})
+			close(s.stopMMDS)
+		}
+		gate := s.stopMMDS
+		s.mu.Unlock()
+		return gate
+	}
 	if s.prepareCancel != nil {
 		s.prepareCancel()
 	}
@@ -372,6 +440,42 @@ func (s *Service) Run(ctx context.Context, input ServiceInput, continuation *Con
 	s.input = input
 	s.prepare = prepare
 	s.runner = runner
+	// Publish startup only after inherited role, control and child supervision
+	// have been restored under this same lock. No stop can observe a temporary
+	// default coordinator role or freeze an incomplete participant set.
+	var restoreErr error
+	if continuation != nil {
+		restoreErr = s.restoreLocked(continuation)
+	} else if s.entryPending {
+		restoreErr = fmt.Errorf("proxy continuation was not received")
+	} else {
+		var record *stopRecord
+		record, restoreErr = newStopRecord()
+		if restoreErr == nil {
+			restoreErr = s.installStopRecordLocked(record)
+			if restoreErr != nil {
+				record.file.Close()
+			}
+		}
+	}
+	if restoreErr == nil && !s.earlyStopAt.IsZero() {
+		s.stopDeadline = s.earlyStopAt.Add(s.timeout)
+		if !s.candidate {
+			s.stopDeadline, restoreErr = s.stopRecord.request(s.stopDeadline)
+		}
+	}
+	if restoreErr == nil && !s.candidate {
+		s.ownershipRestored = true
+		var deadline time.Time
+		deadline, restoreErr = s.stopRecord.read()
+		if !deadline.IsZero() {
+			s.stopDeadline = deadline
+			s.stopOnce.Do(func() { close(s.stop) })
+		}
+	}
+	s.entryErr = restoreErr
+	s.entryPending = false
+	s.entryFinished.Do(func() { close(s.entryReady) })
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
@@ -385,31 +489,14 @@ func (s *Service) Run(ctx context.Context, input ServiceInput, continuation *Con
 	defer func() { returnErr = errors.Join(returnErr, s.finishServiceRegistration()) }()
 	if continuation != nil {
 		defer continuation.Close()
-		if err := s.restore(continuation); err != nil {
-			// A malformed inherited contract is fatal, unlike a retryable
-			// application initialization error. Even then, supervise and finish
-			// any already-restored child instead of abandoning it.
-			return errors.Join(err, s.reapChild(s.child, time.Now().Add(s.timeout), false))
-		}
-	} else {
-		record, err := newStopRecord()
-		if err != nil {
-			return err
-		}
-		s.mu.Lock()
-		s.stopRecord = record
-		s.mu.Unlock()
+	}
+	if restoreErr != nil {
+		// A malformed inherited contract is fatal, unlike retryable application
+		// preparation. Finish any restored child without abandoning supervision.
+		return errors.Join(restoreErr, s.reapChild(s.child, time.Now().Add(s.timeout), false))
 	}
 	if s.candidate {
 		return s.runCandidate(ctx)
-	}
-	s.ownershipRestored = true
-	deadline, err := s.stopRecord.read()
-	if err != nil {
-		return err
-	}
-	if !deadline.IsZero() {
-		s.stopOnce.Do(func() { close(s.stop) })
 	}
 	if s.stopping() {
 		return s.shutdownAll()
@@ -459,9 +546,9 @@ func (s *Service) Run(ctx context.Context, input ServiceInput, continuation *Con
 
 func (s *Service) startLocal(ctx context.Context, boot, id string, resources *retainedResources) error {
 	s.mu.Lock()
-	if s.stopping() {
+	if err := s.checkLocalStartLocked(); err != nil {
 		s.mu.Unlock()
-		return ErrStopped
+		return err
 	}
 	if s.localDone != nil {
 		s.mu.Unlock()
@@ -481,6 +568,13 @@ func (s *Service) startLocal(ctx context.Context, boot, id string, resources *re
 	startup, err := s.prepare(ctx, input)
 	if err != nil {
 		s.mu.Lock()
+		if s.stopping() {
+			s.mu.Unlock()
+			if errors.Is(err, context.Canceled) {
+				return errors.Join(ErrStopped, err)
+			}
+			return err
+		}
 		if s.baseline != nil {
 			operation := RestartID("")
 			if s.operation != nil {
@@ -509,9 +603,9 @@ func (s *Service) startLocal(ctx context.Context, boot, id string, resources *re
 		}
 	}()
 	s.mu.Lock()
-	if s.stopping() {
+	if err := s.checkLocalStartLocked(); err != nil {
 		s.mu.Unlock()
-		return ErrStopped
+		return err
 	}
 	if s.baseline == nil {
 		s.baseline = startup.Effective
@@ -582,6 +676,32 @@ func (s *Service) startLocal(ctx context.Context, boot, id string, resources *re
 		}
 		done <- err
 	}()
+	return nil
+}
+
+// An unstarted candidate has no data/MMDS work to protect. Cancel its
+// preparation, but let an already-running B follow A's shared MMDS barrier.
+func (s *Service) stopUnstartedLocalLocked() {
+	s.stopOnce.Do(func() { close(s.stop) })
+	if s.prepareCancel != nil {
+		s.prepareCancel()
+	}
+}
+
+func (s *Service) checkLocalStartLocked() error {
+	if s.stopping() {
+		return ErrStopped
+	}
+	if s.candidate {
+		deadline, err := s.stopRecord.read()
+		if err != nil {
+			return err
+		}
+		if !s.stopDeadline.IsZero() || !deadline.IsZero() {
+			s.stopUnstartedLocalLocked()
+			return ErrStopped
+		}
+	}
 	return nil
 }
 

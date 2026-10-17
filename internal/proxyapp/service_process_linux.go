@@ -156,7 +156,7 @@ func (s *Service) readChild(c *serviceChild) {
 				c.notifyLocked()
 				c.mu.Unlock()
 			case "shutdown":
-				_ = s.requestShutdown()
+				_ = s.requestShutdownAt(message.Deadline)
 			case "detached":
 				close(c.detached)
 				return
