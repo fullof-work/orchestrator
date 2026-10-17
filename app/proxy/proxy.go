@@ -82,8 +82,11 @@ func (*Runtime) UnmarshalJSON([]byte) error {
 	return fmt.Errorf("proxy Runtime is process-local and cannot be deserialized")
 }
 
-// Hooks are the only startup customization points. Configure runs exactly once
-// in the master; BindRuntime runs once in the master and once in every worker.
+// Hooks are the startup customization points. Each master incarnation calls
+// Configure from the same accepted original input; workers use its frozen
+// result. BindRuntime runs in each master and each worker epoch. Runtime objects
+// and background tasks belong to that incarnation and must not outlive its
+// optional extension Shutdown completion.
 type Hooks struct {
 	Configure   func(context.Context, *Config) error
 	BindRuntime func(context.Context, Process, *Runtime) error

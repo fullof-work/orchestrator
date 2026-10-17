@@ -45,9 +45,15 @@ func openRestartTarget(ctx context.Context, path string) (_ *restartTarget, retu
 	if !stat.Mode().IsRegular() || stat.Mode().Perm()&0111 == 0 {
 		return nil, fmt.Errorf("%w: target is not an executable regular file", ErrIncompatible)
 	}
+	if stat.Mode().Perm()&0022 != 0 {
+		return nil, fmt.Errorf("%w: target must not be group/world writable", ErrIncompatible)
+	}
 	header, err := elf.NewFile(file)
 	if err != nil {
 		return nil, fmt.Errorf("%w: target ELF: %v", ErrIncompatible, err)
+	}
+	if header.Type != elf.ET_EXEC && header.Type != elf.ET_DYN {
+		return nil, fmt.Errorf("%w: target ELF is not a program image", ErrIncompatible)
 	}
 	want, ok := map[string]elf.Machine{"amd64": elf.EM_X86_64, "arm64": elf.EM_AARCH64}[runtime.GOARCH]
 	if !ok || header.Machine != want || header.Class != elf.ELFCLASS64 {
@@ -56,6 +62,11 @@ func openRestartTarget(ctx context.Context, path string) (_ *restartTarget, retu
 	var identity unix.Stat_t
 	if err := unix.Fstat(int(file.Fd()), &identity); err != nil {
 		return nil, err
+	}
+	// Preserve the ordinary component dispatch ownership policy when selecting
+	// a new image, including a native node-ctl image at the deployment path.
+	if (os.Geteuid() == 0 && identity.Uid != 0) || (os.Geteuid() != 0 && identity.Uid != 0 && identity.Uid != uint32(os.Geteuid())) {
+		return nil, fmt.Errorf("%w: target ownership does not match service dispatch policy", ErrIncompatible)
 	}
 	hash := sha256.New()
 	if _, err := io.Copy(hash, &contextReader{ctx: ctx, reader: io.NewSectionReader(file, 0, stat.Size())}); err != nil {

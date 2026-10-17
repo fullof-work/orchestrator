@@ -17,19 +17,20 @@ import (
 )
 
 type serviceChild struct {
-	mu          sync.Mutex
-	pid         int
-	boot        string
-	wire        *serviceWire
-	resources   *retainedResources
-	status      InstanceStatus
-	canShutdown bool
-	draining    bool
-	err         error
-	done        chan struct{}
-	changed     chan struct{}
-	detached    chan struct{}
-	readerDone  chan struct{}
+	mu             sync.Mutex
+	pid            int
+	boot           string
+	wire           *serviceWire
+	resources      *retainedResources
+	status         InstanceStatus
+	canShutdown    bool
+	draining       bool
+	forcedRecorded bool
+	err            error
+	done           chan struct{}
+	changed        chan struct{}
+	detached       chan struct{}
+	readerDone     chan struct{}
 }
 
 func (c *serviceChild) snapshot() InstanceStatus {
@@ -319,6 +320,17 @@ func (s *Service) startChild() (child *serviceChild, returnErr error) {
 	}()
 	// The child path resolves after descriptor remapping and names exactly the
 	// already-opened target, even if the deployment path changes meanwhile.
+	s.actionMu.Lock()
+	defer s.actionMu.Unlock()
+	if s.stopping() {
+		return nil, ErrStopped
+	}
+	s.mu.Lock()
+	occupied := s.child != nil
+	s.mu.Unlock()
+	if occupied {
+		return nil, fmt.Errorf("proxy candidate still owns resources")
+	}
 	process, err := os.StartProcess("/proc/self/fd/"+strconv.Itoa(envelope.Files.Target), []string{s.input.Executable}, &os.ProcAttr{Files: files, Env: append(cleanContinuationEnvironment(), continuationEnvironment+"="+strconv.Itoa(bootstrapFD)), Sys: &syscall.SysProcAttr{Setpgid: true}})
 	if err != nil {
 		return nil, err
@@ -361,6 +373,13 @@ func (s *Service) reapChild(c *serviceChild, deadline time.Time, hold bool) erro
 	}
 	if err != nil {
 		err = errors.Join(ErrForcedClose, err)
+		c.mu.Lock()
+		record := !c.forcedRecorded
+		c.forcedRecorded = true
+		c.mu.Unlock()
+		if record {
+			s.recordForced()
+		}
 	}
 	if c.resources != nil {
 		c.resources.close()

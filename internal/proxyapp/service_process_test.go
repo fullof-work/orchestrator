@@ -3,16 +3,19 @@ package proxyapp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"golang.org/x/sys/unix"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -40,6 +43,15 @@ func (e *serviceFixtureExtension) WrapManagement(next http.Handler) http.Handler
 		case "/fixture/stop":
 			go e.s.Shutdown(context.Background())
 			w.WriteHeader(202)
+		case "/fixture/fail-local":
+			w.WriteHeader(202)
+			w.(http.Flusher).Flush()
+			e.s.mu.Lock()
+			instance := e.s.local
+			e.s.mu.Unlock()
+			// Test-only recoverable instance termination. The coordinator and
+			// its control/reaping responsibilities remain alive.
+			instance.requestStop(time.Now().Add(e.s.timeout))
 		default:
 			next.ServeHTTP(w, r)
 		}
@@ -92,27 +104,59 @@ func runFixtureService() error {
 }
 
 func TestServiceRealImageReplacement(t *testing.T) {
-	testServiceRealImageReplacement(t, false, false, false)
+	testServiceRealImageReplacement(t, serviceScenario{})
 }
 
 func TestServiceRealSignalReplacement(t *testing.T) {
-	testServiceRealImageReplacement(t, true, false, false)
+	testServiceRealImageReplacement(t, serviceScenario{signals: true})
 }
 func TestServiceRealAutomaticRecovery(t *testing.T) {
-	testServiceRealImageReplacement(t, false, true, false)
+	testServiceRealImageReplacement(t, serviceScenario{recovery: true})
 }
 func TestServiceRealShutdownDuringRecovery(t *testing.T) {
-	testServiceRealImageReplacement(t, false, true, true)
+	testServiceRealImageReplacement(t, serviceScenario{recovery: true, stopRecovery: true})
 }
 
-func testServiceRealImageReplacement(t *testing.T, signals, recovery, stopRecovery bool) {
+func TestServiceRealExecFailureRecovery(t *testing.T) {
+	testServiceRealImageReplacement(t, serviceScenario{execFailure: true})
+}
+
+func TestServiceRealCandidateFailureDuringDrain(t *testing.T) {
+	testServiceRealImageReplacement(t, serviceScenario{candidateFailure: true})
+}
+
+func TestServiceRealShutdownDuringOriginalDrain(t *testing.T) {
+	testServiceRealImageReplacement(t, serviceScenario{stopDrain: true})
+}
+
+func TestServiceRealSuccessorFailureDuringCandidateDrain(t *testing.T) {
+	testServiceRealImageReplacement(t, serviceScenario{successorFailure: true})
+}
+
+type serviceScenario struct{ signals, recovery, stopRecovery, execFailure, candidateFailure, stopDrain, successorFailure bool }
+
+func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
+	signals, recovery, stopRecovery := scenario.signals, scenario.recovery, scenario.stopRecovery
 	if testing.Short() {
 		t.Skip("real compatible target build and process lifecycle")
 	}
 	effective, _ := testMasterEffective(t)
 	cfg := effective.Config()
+	// Keep real Unix endpoints below the kernel limit independently of Go's
+	// full test-name-based temporary directory. Product length checks stay on.
+	shortRoot, err := os.MkdirTemp("", "proxy-lifecycle-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(shortRoot) })
+	cfg.ConfigSocket = filepath.Join(shortRoot, "config.sock")
+	cfg.StatsSocket = filepath.Join(shortRoot, "stats.sock")
+	cfg.ShmPath = filepath.Join(shortRoot, "routes.shm")
 	cfg.Workers = 2
 	cfg.ShutdownTimeout = "3s"
+	if scenario.successorFailure {
+		cfg.ShutdownTimeout = "8s"
+	}
 	cfg.InplaceRestart = signals
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -183,6 +227,8 @@ func testServiceRealImageReplacement(t *testing.T, signals, recovery, stopRecove
 	}
 	var mu sync.Mutex
 	var businessErrors []error
+	var expectedLosses []error
+	var faultWindow atomic.Bool
 	var builds = map[string]int{}
 	loadCtx, stopLoad := context.WithCancel(context.Background())
 	loadDone := make(chan struct{})
@@ -205,7 +251,11 @@ func testServiceRealImageReplacement(t *testing.T, signals, recovery, stopRecove
 			}
 			if err != nil {
 				mu.Lock()
-				businessErrors = append(businessErrors, err)
+				if faultWindow.Load() && (errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET)) {
+					expectedLosses = append(expectedLosses, err)
+				} else {
+					businessErrors = append(businessErrors, err)
+				}
 				mu.Unlock()
 			}
 		}
@@ -216,6 +266,34 @@ func testServiceRealImageReplacement(t *testing.T, signals, recovery, stopRecove
 	var stoppedCandidate int
 	var cancelledAttempt time.Time
 	for iteration := 0; iteration < 2; iteration++ {
+		var releaseHeld func()
+		if (scenario.execFailure || scenario.candidateFailure || scenario.stopDrain || scenario.successorFailure) && iteration == 0 {
+			release := make(chan struct{})
+			var once sync.Once
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				select {
+				case <-release:
+					fmt.Fprint(w, "complete\n")
+				case <-r.Context().Done():
+				}
+			}))
+			defer upstream.Close()
+			defer once.Do(func() { close(release) })
+			request, _ := http.NewRequest("GET", "http://"+cfg.DataListen+"/fixture/hold", nil)
+			request.Header.Set("X-Fixture-Target", upstream.URL)
+			response, err := client.Do(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			releaseHeld = func() {
+				once.Do(func() { close(release) })
+				body, err := io.ReadAll(response.Body)
+				response.Body.Close()
+				if err != nil || string(body) != "begin\ncomplete\n" {
+					t.Fatalf("held request truncated: %q %v", body, err)
+				}
+			}
+		}
 		if recovery && iteration == 0 {
 			if err := os.WriteFile(filepath.Join(dir, "fail-resume"), nil, 0600); err != nil {
 				t.Fatal(err)
@@ -246,7 +324,88 @@ func testServiceRealImageReplacement(t *testing.T, signals, recovery, stopRecove
 			t.Fatalf("operation ID %q", id)
 		}
 		previous = id
-		if recovery && iteration == 0 {
+		if scenario.successorFailure && iteration == 0 {
+			waitServiceStatus(t, management, func(status Status) bool {
+				return status.InplaceRestart != nil && status.InplaceRestart.Phase == "draining_a"
+			})
+			// A no longer accepts, so this finite request belongs to B.
+			releaseCandidate := holdServiceRequest(t, client, cfg.DataListen)
+			releaseHeld()
+			draining := waitServiceStatus(t, management, func(status Status) bool {
+				return status.InplaceRestart != nil && status.InplaceRestart.Phase == "draining_b" && status.Ready
+			})
+			response, err := management.Post("http://proxy/fixture/fail-local", "", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			response.Body.Close()
+			recovered := waitServiceStatus(t, management, func(status Status) bool {
+				return status.Ready && status.BootID != draining.BootID
+			})
+			if recovered.InplaceRestart.ID != id || len(recovered.Instances) != 2 || recovered.Instances[1].PID != draining.Instances[1].PID || recovered.Instances[1].Data != "draining" {
+				t.Fatalf("successor recovery did not preserve B drain: %+v", recovered)
+			}
+			t.Logf("A-prime recovered during B drain: main_pid=%d old_boot=%s new_boot=%s candidate_pid=%d attempts=%d", pid, draining.BootID, recovered.BootID, recovered.Instances[1].PID, recovered.InplaceRestart.Attempts)
+			releaseCandidate()
+		}
+		if scenario.stopDrain && iteration == 0 {
+			draining := waitServiceStatus(t, management, func(status Status) bool {
+				return status.InplaceRestart != nil && status.InplaceRestart.Phase == "draining_a" && len(status.Instances) == 2
+			})
+			candidate := draining.Instances[1]
+			candidateClient := &http.Client{Transport: &http.Transport{DisableKeepAlives: true, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", candidate.StatsSocket)
+			}}, Timeout: time.Second}
+			stopLoad()
+			<-loadDone
+			response, err := management.Post("http://proxy/fixture/stop", "", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			response.Body.Close()
+			// B must stop data while A still holds its finite response. Waiting
+			// for A's complete drain before telling B would deadlock this check.
+			stopping := waitServiceStatus(t, candidateClient, func(status Status) bool { return status.Data == "stopped" })
+			if stopping.ServiceReady || stopping.Ready {
+				t.Fatalf("stopping service advertised readiness: %+v", stopping)
+			}
+			releaseHeld()
+			stopFromCandidate, stoppedCandidate = true, candidate.PID
+			break
+		}
+		if scenario.candidateFailure && iteration == 0 {
+			draining := waitServiceStatus(t, management, func(status Status) bool {
+				return status.InplaceRestart != nil && status.InplaceRestart.Phase == "draining_a" && len(status.Instances) == 2
+			})
+			failedPID := draining.Instances[1].PID
+			faultWindow.Store(true)
+			if err := unix.Kill(failedPID, syscall.SIGKILL); err != nil {
+				t.Fatal(err)
+			}
+			replaced := waitServiceStatus(t, management, func(status Status) bool {
+				return len(status.Instances) == 2 && status.Instances[1].PID != failedPID && status.Instances[1].Ready
+			})
+			faultWindow.Store(false)
+			if replaced.InplaceRestart.ID != id || replaced.Data != "draining" {
+				t.Fatalf("B recovery did not preserve A drain: %+v", replaced)
+			}
+			if err := unix.Kill(failedPID, 0); err != unix.ESRCH {
+				t.Fatalf("failed candidate not reaped: %v", err)
+			}
+			releaseHeld()
+		}
+		if scenario.execFailure && iteration == 0 {
+			waitServiceStatus(t, management, func(status Status) bool {
+				return status.InplaceRestart != nil && status.InplaceRestart.Phase == "draining_a"
+			})
+			// Change only this task-owned executable's mode after B is serving.
+			// execve now returns real EACCES; the running B remains unaffected.
+			if err := os.Chmod(deployment, 0600); err != nil {
+				t.Fatal(err)
+			}
+			releaseHeld()
+		}
+		if (recovery || scenario.execFailure) && iteration == 0 {
 			var candidatePath string
 			until := time.Now().Add(5 * time.Second)
 			for time.Now().Before(until) {
@@ -283,14 +442,24 @@ func testServiceRealImageReplacement(t *testing.T, signals, recovery, stopRecove
 				cancelledAttempt = *recovering.InplaceRestart.NextAttempt
 				break
 			}
-			if err := os.Remove(filepath.Join(dir, "fail-resume")); err != nil {
-				t.Fatal(err)
+			if scenario.execFailure {
+				if err := os.Chmod(deployment, 0700); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := os.Remove(filepath.Join(dir, "fail-resume")); err != nil {
+					t.Fatal(err)
+				}
 			}
 		}
 		status = waitServiceStatus(t, management, func(status Status) bool {
 			return status.InplaceRestart != nil && status.InplaceRestart.ID == id && status.InplaceRestart.Result != ""
 		})
-		if status.InplaceRestart.Result != "completed" || !status.Ready || len(status.Instances) != 1 || status.PID != pid {
+		wantResult := "completed"
+		if scenario.candidateFailure && iteration == 0 {
+			wantResult = "completed_with_forced_close"
+		}
+		if status.InplaceRestart.Result != wantResult || !status.Ready || len(status.Instances) != 1 || status.PID != pid {
 			t.Fatalf("completion: %+v", status)
 		}
 		t.Logf("complete: iteration=%d main_pid=%d operation=%s target=%s attempts=%d result=%s forced=%d", iteration, pid, id, status.InplaceRestart.Target, status.InplaceRestart.Attempts, status.InplaceRestart.Result, status.InplaceRestart.ForcedCloseCount)
@@ -316,6 +485,7 @@ func testServiceRealImageReplacement(t *testing.T, signals, recovery, stopRecove
 	if builds["target"] == 0 {
 		t.Fatalf("no target business response: %v", builds)
 	}
+	t.Logf("business results: builds=%v unexpected_failures=%d expected_injected_connection_losses=%v", builds, len(businessErrors), expectedLosses)
 	if !stopFromCandidate {
 		response, err := management.Post("http://proxy/fixture/stop", "", nil)
 		if err != nil {
@@ -352,6 +522,39 @@ func testServiceRealImageReplacement(t *testing.T, signals, recovery, stopRecove
 	paths, _ := filepath.Glob(filepath.Join(dir, ".proxy-*"))
 	if len(paths) != 0 {
 		t.Fatalf("candidate resources remain: %v", paths)
+	}
+}
+
+func holdServiceRequest(t *testing.T, client *http.Client, address string) func() {
+	t.Helper()
+	release := make(chan struct{})
+	var once sync.Once
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+			fmt.Fprint(w, "complete\n")
+		case <-r.Context().Done():
+		}
+	}))
+	request, _ := http.NewRequest("GET", "http://"+address+"/fixture/hold", nil)
+	request.Header.Set("X-Fixture-Target", upstream.URL)
+	response, err := client.Do(request)
+	if err != nil {
+		upstream.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		once.Do(func() { close(release) })
+		response.Body.Close()
+		upstream.Close()
+	})
+	return func() {
+		once.Do(func() { close(release) })
+		body, err := io.ReadAll(response.Body)
+		response.Body.Close()
+		if err != nil || string(body) != "begin\ncomplete\n" {
+			t.Fatalf("finite candidate response truncated: %q %v", body, err)
+		}
 	}
 }
 

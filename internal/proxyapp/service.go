@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"sync"
 	"time"
@@ -28,7 +29,10 @@ type MasterRunner func(context.Context, *EffectiveConfig, *Runtime) error
 // Service coordinates one original-PID instance and at most one child. All
 // public actions, management responses and private control use this same state.
 type Service struct {
-	mu             sync.Mutex
+	mu sync.Mutex
+	// actionMu orders stop acceptance against process creation and exec. No
+	// application callback or drain runs while it is held.
+	actionMu       sync.Mutex
 	input          ServiceInput
 	baseline       *EffectiveConfig
 	prepare        PrepareService
@@ -43,6 +47,8 @@ type Service struct {
 	stopRecord     *stopRecord
 	stop           chan struct{}
 	stopOnce       sync.Once
+	stopMMDS       chan struct{}
+	stopReleased   sync.Once
 	done           chan struct{}
 	changed        chan struct{}
 	requests       chan struct{}
@@ -56,6 +62,7 @@ type Service struct {
 	parent         *serviceWire
 	err            error
 	timeout        time.Duration
+	logger         *slog.Logger
 }
 
 // NewService performs no I/O. Runtime resources are acquired by Run.
@@ -84,14 +91,18 @@ func (s *Service) Status() Status {
 	}
 	if s.candidate && s.knownService != nil {
 		local := result.InstanceStatus
-		result = *s.knownService
+		result = copyStatus(*s.knownService)
 		result.InstanceStatus = local
-		result.Instances = append([]InstanceStatus(nil), result.Instances...)
 		for index := range result.Instances {
 			if result.Instances[index].BootID == local.BootID {
 				result.Instances[index] = local
 			}
 		}
+		ready := false
+		for _, instance := range result.Instances {
+			ready = ready || instance.Ready
+		}
+		result.ServiceReady = result.ServiceReady && ready && !s.stopping()
 		return result
 	}
 	if s.operation != nil {
@@ -170,6 +181,8 @@ func (s *Service) FinishEntry(err error) {
 }
 
 func (s *Service) requestShutdown() error {
+	s.actionMu.Lock()
+	defer s.actionMu.Unlock()
 	s.mu.Lock()
 	if s.closing {
 		s.mu.Unlock()
@@ -194,11 +207,38 @@ func (s *Service) requestShutdown() error {
 		s.stopOnce.Do(func() { close(s.stop) })
 		return nil
 	}
-	if _, err := record.request(time.Now().Add(timeout)); err != nil {
+	deadline, err := record.request(time.Now().Add(timeout))
+	if err != nil {
 		return err
 	}
 	s.stopOnce.Do(func() { close(s.stop) })
+	s.beginShutdown(deadline)
 	return nil
+}
+
+// Stop accepting immediately, even when the coordinator is waiting for an
+// earlier drain or cleanup. MMDS stays available behind the shared data barrier.
+func (s *Service) beginShutdown(deadline time.Time) chan struct{} {
+	s.mu.Lock()
+	if s.stopMMDS != nil {
+		gate := s.stopMMDS
+		s.mu.Unlock()
+		return gate
+	}
+	s.stopMMDS = make(chan struct{})
+	gate, instance, child, done := s.stopMMDS, s.local, s.child, s.localDone
+	s.mu.Unlock()
+	if instance != nil && done != nil {
+		instance.mu.Lock()
+		instance.mmdsGate = gate
+		instance.mu.Unlock()
+		instance.requestStop(deadline)
+	}
+	if child != nil {
+		_ = child.wire.send(serviceMessage{Kind: "drain", Deadline: deadline, HoldMMDS: true})
+	}
+	go s.releaseShutdownMMDS(deadline, instance, done, child, gate)
+	return gate
 }
 
 func (s *Service) stopping() bool {
@@ -268,13 +308,18 @@ func (s *Service) InplaceRestart(ctx context.Context) (RestartID, error) {
 		target.file.Close()
 		return "", err
 	}
-	if s.stopping() || !local.Snapshot().Ready {
+	if s.stopping() {
+		target.file.Close()
+		return "", ErrStopped
+	}
+	if !local.Snapshot().Ready {
 		target.file.Close()
 		return "", ErrNotReady
 	}
 	id := RestartID(newBootID())
 	s.target = target
 	s.operation = &RestartStatus{ID: id, Phase: "preparing_b", Target: target.description()}
+	s.logOperationLocked()
 	s.notifyLocked()
 	s.requests <- struct{}{}
 	return id, nil
@@ -310,11 +355,15 @@ func (s *Service) Run(ctx context.Context, input ServiceInput, continuation *Con
 		s.finished.Do(func() { close(s.done) })
 		s.mu.Unlock()
 	}()
+	defer s.releaseService()
 	if continuation != nil {
-		if err := s.restore(continuation); err != nil {
-			return err
-		}
 		defer continuation.Close()
+		if err := s.restore(continuation); err != nil {
+			// A malformed inherited contract is fatal, unlike a retryable
+			// application initialization error. Even then, supervise and finish
+			// any already-restored child instead of abandoning it.
+			return errors.Join(err, s.reapChild(s.child, time.Now().Add(s.timeout), false))
+		}
 	} else {
 		record, err := newStopRecord()
 		if err != nil {
@@ -324,7 +373,6 @@ func (s *Service) Run(ctx context.Context, input ServiceInput, continuation *Con
 		s.stopRecord = record
 		s.mu.Unlock()
 	}
-	defer s.releaseService()
 	if s.candidate {
 		return s.runCandidate(ctx)
 	}
@@ -383,6 +431,19 @@ func (s *Service) startLocal(ctx context.Context, boot, id string, resources *re
 	input.Config = append(json.RawMessage(nil), input.Config...)
 	startup, err := s.prepare(ctx, input)
 	if err != nil {
+		s.mu.Lock()
+		if s.baseline != nil {
+			operation := RestartID("")
+			if s.operation != nil {
+				operation = s.operation.ID
+			}
+			instance := NewInstance(id, boot, operation, s.baseline.config.Workers)
+			instance.finish(err)
+			s.local = instance
+			s.localDone = nil
+			s.notifyLocked()
+		}
+		s.mu.Unlock()
 		return err
 	}
 	if startup == nil || startup.Effective == nil || startup.Runtime == nil {
@@ -441,6 +502,7 @@ func (s *Service) startLocal(ctx context.Context, boot, id string, resources *re
 	s.local = instance
 	s.timeout = config.ShutdownTimeoutDur()
 	s.localExtension = startup.Runtime.MasterExtension
+	s.logger = startup.Runtime.Logger
 	done := make(chan error, 1)
 	s.localDone = done
 	s.notifyLocked()
@@ -464,6 +526,7 @@ func (s *Service) phase(phase string, err error) {
 	if err != nil {
 		s.operation.LastError = err.Error()
 	}
+	s.logOperationLocked()
 	s.notifyLocked()
 }
 
@@ -471,6 +534,7 @@ func (s *Service) operationComplete(result string, err error) {
 	s.phase("completed", err)
 	s.mu.Lock()
 	s.operation.Result = result
+	s.logOperationLocked()
 	target := s.target
 	s.target = nil
 	s.notifyLocked()
@@ -481,6 +545,8 @@ func (s *Service) operationComplete(result string, err error) {
 }
 
 func (s *Service) releaseService() {
+	s.actionMu.Lock()
+	defer s.actionMu.Unlock()
 	s.mu.Lock()
 	s.closing = true
 	resources, target, record := s.resources, s.target, s.stopRecord
@@ -496,6 +562,9 @@ func (s *Service) releaseService() {
 	}
 	if record != nil {
 		record.file.Close()
+	}
+	if s.parent != nil {
+		s.parent.conn.Close()
 	}
 }
 
@@ -514,6 +583,7 @@ func (s *Service) backoff(attempt int, err error) bool {
 	s.operation.Phase = "recovering"
 	s.operation.LastError = err.Error()
 	s.operation.NextAttempt = &next
+	s.logOperationLocked()
 	s.notifyLocked()
 	s.mu.Unlock()
 	timer := time.NewTimer(time.Until(next))
@@ -524,4 +594,16 @@ func (s *Service) backoff(attempt int, err error) bool {
 	case <-s.stop:
 		return false
 	}
+}
+
+func (s *Service) logOperationLocked() {
+	logger := s.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	op := s.operation
+	logger.Info("proxy InplaceRestart", "id", op.ID, "phase", op.Phase,
+		"target", op.Target, "attempts", op.Attempts, "last_error", op.LastError,
+		"next_attempt", op.NextAttempt, "result", op.Result,
+		"forced_close_count", op.ForcedCloseCount)
 }

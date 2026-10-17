@@ -179,7 +179,10 @@ func (s *Service) runCandidate(ctx context.Context) error {
 				if message.Deadline.IsZero() {
 					return fmt.Errorf("candidate drain deadline missing")
 				}
-				if message.HoldMMDS && !s.local.stopped() {
+				if message.HoldMMDS {
+					s.stopOnce.Do(func() { close(s.stop) })
+				}
+				if message.HoldMMDS && gate == nil {
 					gate = make(chan struct{})
 					s.local.mu.Lock()
 					s.local.mmdsGate = gate
@@ -287,6 +290,8 @@ func (s *Service) execTarget() error {
 			return err
 		}
 	}
+	s.actionMu.Lock()
+	defer s.actionMu.Unlock()
 	deadline, err := record.read()
 	if err != nil {
 		return err

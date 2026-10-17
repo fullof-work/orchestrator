@@ -117,7 +117,9 @@ func (i *Instance) notifyLocked() { close(i.changed); i.changed = make(chan stru
 
 func (i *Instance) recalculateLocked() {
 	i.status.Workers.Ready = 0
+	prepared := true
 	for _, w := range i.workers {
+		prepared = prepared && w.alive && w.prepared
 		if w.alive && w.ready {
 			i.status.Workers.Ready++
 		}
@@ -145,6 +147,9 @@ func (i *Instance) recalculateLocked() {
 	if i.stopping {
 		i.status.Phase = "draining"
 		return
+	}
+	if i.initialized && prepared && i.status.Phase == "starting" {
+		i.status.Phase = "prepared"
 	}
 	if i.status.Ready {
 		i.status.Phase = "serving"

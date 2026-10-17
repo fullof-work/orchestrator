@@ -40,6 +40,25 @@ func TestFinishEntryWakesReadyWaiter(t *testing.T) {
 	}
 }
 
+func TestCandidateStatusOwnsSnapshot(t *testing.T) {
+	service := NewService()
+	service.candidate = true
+	next := time.Now()
+	service.knownService = &Status{
+		InstanceStatus: InstanceStatus{Reasons: []string{"original"}},
+		Instances:      []InstanceStatus{{BootID: "peer", Reasons: []string{"original"}}},
+		InplaceRestart: &RestartStatus{Phase: "recovering", NextAttempt: &next},
+	}
+	status := service.Status()
+	status.Instances[0].Reasons[0] = "modified"
+	status.InplaceRestart.Phase = "modified"
+	*status.InplaceRestart.NextAttempt = time.Time{}
+	again := service.Status()
+	if again.Instances[0].Reasons[0] != "original" || again.InplaceRestart.Phase != "recovering" || again.InplaceRestart.NextAttempt.IsZero() {
+		t.Fatalf("caller mutated retained state: %+v", again)
+	}
+}
+
 func TestStopRecordKeepsFirstDeadlineAndSurvivesDuplicate(t *testing.T) {
 	record, err := newStopRecord()
 	if err != nil {
