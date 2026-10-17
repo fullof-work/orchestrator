@@ -345,10 +345,17 @@ func (s *Service) startChild() (child *serviceChild, returnErr error) {
 	return child, nil
 }
 
-func (s *Service) reapChild(c *serviceChild, deadline time.Time, hold bool) error {
+func (s *Service) reapChild(c *serviceChild, deadline time.Time, hold bool) (returnErr error) {
 	if c == nil {
 		return nil
 	}
+	defer func() {
+		s.mu.Lock()
+		if s.stopping() {
+			s.stopErr = errors.Join(s.stopErr, returnErr)
+		}
+		s.mu.Unlock()
+	}()
 	c.mu.Lock()
 	c.draining = true
 	c.mu.Unlock()

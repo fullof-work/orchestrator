@@ -138,6 +138,9 @@ class Probe:
             self.stop.wait(.02)
 
     def finite(self, key):
+        # One Guest serves every entry/source combination. Never reuse a released
+        # request key from a previous mode or accepted operation.
+        key = f'{self.initial_pid}-{time.monotonic_ns()}-{key}'
         connection, headers = self.connection()
         connection.request('GET', '/finite?id=' + key, headers=headers)
         response = connection.getresponse()

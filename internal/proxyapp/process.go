@@ -2,6 +2,7 @@ package proxyapp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -19,7 +20,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/proxystats"
 )
 
-func runWorkerProcess(ctx context.Context, instance *Instance, workerIndex int, workerID string, epoch uint64, effective *EffectiveConfig, proxyNamespace *netns.NetNS, dataListener, mmdsListener net.Listener, view *proxyshm.MasterView, admission *proxyadmission.Master, stats *proxystats.MasterStats, logger *slog.Logger) error {
+func runWorkerProcess(ctx context.Context, instance *Instance, workerIndex int, workerID string, epoch uint64, effective *EffectiveConfig, proxyNamespace *netns.NetNS, dataListener, mmdsListener net.Listener, view *proxyshm.MasterView, admission *proxyadmission.Master, stats *proxystats.MasterStats, logger *slog.Logger) (returnErr error) {
 	if effective == nil || view == nil || admission == nil || stats == nil || logger == nil {
 		return fmt.Errorf("proxy worker process: unresolved startup state")
 	}
@@ -113,7 +114,7 @@ func runWorkerProcess(ctx context.Context, instance *Instance, workerIndex int, 
 	if !instance.attachWorker(workerIndex, epoch, peer) {
 		return nil
 	}
-	defer instance.workerExited(workerIndex, epoch)
+	defer func() { instance.workerExited(workerIndex, epoch, returnErr) }()
 
 	removeNotify := view.RegisterNotifyWriter(notifyWrite)
 	defer removeNotify()
@@ -199,7 +200,7 @@ func runWorkerProcess(ctx context.Context, instance *Instance, workerIndex int, 
 				result = fmt.Errorf("proxy worker %s stats stream: %w", workerID, err)
 			}
 			cancelWorker()
-			<-waitResult
+			result = errors.Join(result, <-waitResult)
 			waiting = false
 		case err := <-controlResult:
 			controlResult = nil
@@ -209,7 +210,7 @@ func runWorkerProcess(ctx context.Context, instance *Instance, workerIndex int, 
 			instance.workerFault(workerIndex, epoch)
 			result = fmt.Errorf("proxy worker %s control: %w", workerID, err)
 			cancelWorker()
-			<-waitResult
+			result = errors.Join(result, <-waitResult)
 			waiting = false
 		case err := <-waitResult:
 			result = err
@@ -220,6 +221,12 @@ func runWorkerProcess(ctx context.Context, instance *Instance, workerIndex int, 
 			}
 			waiting = false
 		}
+	}
+	// Wait may win the select before the control reader applies the final
+	// stopped acknowledgement. The exited process has closed its control FD:
+	// consume every queued frame through EOF before publishing worker exit.
+	if controlResult != nil {
+		<-controlResult
 	}
 	stats.WorkerExited(workerID, epoch)
 	workerBegun = false

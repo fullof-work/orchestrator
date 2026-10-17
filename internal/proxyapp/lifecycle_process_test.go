@@ -49,7 +49,7 @@ func TestMain(m *testing.M) {
 			return err
 		}
 		defer worker.Close()
-		return worker.Run(context.Background(), &Runtime{Logger: testMasterLogger(), WorkerExtension: &lifecycleFixtureExtension{}})
+		return worker.Run(context.Background(), &Runtime{Logger: testMasterLogger(), WorkerExtension: &lifecycleFixtureExtension{shutdownFault: bootstrap.EffectiveConfig().Config().ShmPath + ".shutdown-fault"}})
 	}()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -58,10 +58,21 @@ func TestMain(m *testing.M) {
 	os.Exit(0)
 }
 
-type lifecycleFixtureExtension struct{}
+type lifecycleFixtureExtension struct{ shutdownFault string }
 
 func (*lifecycleFixtureExtension) Start(context.Context, proxyextension.WorkerHost) error { return nil }
-func (*lifecycleFixtureExtension) Shutdown(context.Context) error                         { return nil }
+func (e *lifecycleFixtureExtension) Shutdown(context.Context) error {
+	mode, _ := os.ReadFile(e.shutdownFault)
+	switch string(mode) {
+	case "exit":
+		// Only the test worker exits here, after its MMDS-drained ACK and
+		// before the extension/stopped ACK. This is a real nonzero wait result.
+		os.Exit(23)
+	case "error":
+		return errors.New("fixture worker extension completion failed")
+	}
+	return nil
+}
 func (*lifecycleFixtureExtension) WrapIngress(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/fixture/id" {
@@ -306,4 +317,68 @@ func serveFixtureRoutes(t *testing.T, socket string, metadata bool) {
 	}), &http2.Server{})}
 	go server.Serve(listener)
 	t.Cleanup(func() { server.Close(); listener.Close() })
+}
+
+func TestMasterReportsWorkerCompletionFailure(t *testing.T) {
+	for _, mode := range []string{"error", "exit"} {
+		t.Run(mode, func(t *testing.T) {
+			effective, _ := testMasterEffective(t)
+			cfg := effective.Config()
+			dir, err := os.MkdirTemp("", "proxy-completion-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.RemoveAll(dir)
+			cfg.ConfigSocket = filepath.Join(dir, "config.sock")
+			cfg.StatsSocket = filepath.Join(dir, "stats.sock")
+			cfg.ShmPath = filepath.Join(dir, "routes.shm")
+			cfg.DataListen = "fd=data"
+			cfg.Workers = 2
+			if err := os.WriteFile(cfg.ShmPath+".shutdown-fault", []byte(mode), 0600); err != nil {
+				t.Fatal(err)
+			}
+			serveFixtureRoutes(t, cfg.ConfigSocket, false)
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			file, err := listenerFile(listener)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer file.Close()
+			effective, err = FreezeConfig(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			instance := NewInstance("proxy", "", "", cfg.Workers)
+			done := make(chan error, 1)
+			go func() {
+				done <- RunMaster(context.Background(), effective, &Runtime{Logger: testMasterLogger(), Instance: instance, ListenerFiles: map[string]*os.File{"data": file}})
+			}()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := instance.WaitReady(ctx); err != nil {
+				t.Fatal(err)
+			}
+			instance.mu.Lock()
+			pids := []int{instance.workers[0].pid, instance.workers[1].pid}
+			instance.mu.Unlock()
+			instance.requestStop(time.Now().Add(time.Second))
+			select {
+			case err := <-done:
+				if !errors.Is(err, ErrForcedClose) {
+					t.Fatalf("lost completion failure: %v", err)
+				}
+			case <-ctx.Done():
+				t.Fatal("worker completion did not finish")
+			}
+			for _, pid := range pids {
+				if err := unix.Kill(pid, 0); err != unix.ESRCH {
+					t.Fatalf("worker %d not reaped: %v", pid, err)
+				}
+			}
+		})
+	}
 }

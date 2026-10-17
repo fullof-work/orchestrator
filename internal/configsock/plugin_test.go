@@ -89,6 +89,35 @@ func TestProxyRouteBarrierAllOfParticipants(t *testing.T) {
 	}
 }
 
+func TestProxyRouteBarrierRejectsParticipantJoiningBeforeCommit(t *testing.T) {
+	r := NewRegistry()
+	first := addReadyPlugin(r, "proxy-a")
+	b, err := r.BeginProxyRouteBarrier()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Cancel()
+	r.routeBarrierAck(first, b.ID())
+	if err := b.Wait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	second := addReadyPlugin(r, "proxy-b")
+	if err := b.Commit(); !errors.Is(err, ErrProxyRouteLeaseChanged) {
+		t.Fatalf("barrier certified a view without the joining participant: %v", err)
+	}
+	next, err := r.BeginProxyRouteBarrier()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer next.Cancel()
+	r.markRouteStreamReady(second) // duplicate readiness does not change the set.
+	r.routeBarrierAck(first, next.ID())
+	r.routeBarrierAck(second, next.ID())
+	if err := next.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestProxyRouteBarrierFailsOnDisconnectAndReplacement(t *testing.T) {
 	for _, test := range []struct {
 		name string

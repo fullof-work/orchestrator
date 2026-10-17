@@ -3,6 +3,7 @@ package proxyapp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -66,6 +67,66 @@ func TestFinishEntryWakesReadyWaiter(t *testing.T) {
 	service.FinishEntry(failure)
 	if err := service.WaitReady(context.Background()); !errors.Is(err, failure) {
 		t.Fatal(err)
+	}
+}
+
+func TestShutdownCancelsLocalPreparation(t *testing.T) {
+	for _, resumed := range []bool{false, true} {
+		t.Run(fmt.Sprint(resumed), func(t *testing.T) {
+			service := NewService()
+			entered := make(chan struct{})
+			prepare := func(ctx context.Context, _ ServiceInput) (*Startup, error) {
+				close(entered)
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}
+			done := make(chan error, 1)
+			if resumed {
+				// An A-prime attempt has a live service and a separate preparation
+				// timeout. Complete Shutdown must cancel it immediately as well.
+				service.started = true
+				service.prepare = prepare
+				service.stopRecord, _ = newStopRecord()
+				defer service.stopRecord.file.Close()
+				go func() {
+					err := service.startLocal(context.Background(), "resumed", "proxy", nil)
+					done <- err
+					service.finished.Do(func() { close(service.done) })
+				}()
+			} else {
+				go func() { done <- service.Run(context.Background(), ServiceInput{}, nil, prepare, RunMaster) }()
+			}
+			<-entered
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if err := service.Shutdown(ctx); err != nil {
+				t.Fatalf("Shutdown did not cancel preparation: %v", err)
+			}
+			err := <-done
+			if resumed && !errors.Is(err, context.Canceled) || !resumed && err != nil {
+				t.Fatalf("unexpected preparation result: %v", err)
+			}
+		})
+	}
+}
+
+func TestShutdownRetainsPreviouslyConsumedDrainResult(t *testing.T) {
+	service := NewService()
+	service.started = true
+	service.stopRecord, _ = newStopRecord()
+	defer service.stopRecord.file.Close()
+	service.local = NewInstance("proxy", "boot", "", 0)
+	service.localDone = make(chan error, 1)
+	service.localDone <- ErrForcedClose
+	service.local.status.Data = "stopped"
+	if err := service.requestShutdown(); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.drainLocal(time.Now()); !errors.Is(err, ErrForcedClose) {
+		t.Fatal(err)
+	}
+	if err := service.shutdownAll(); !errors.Is(err, ErrForcedClose) {
+		t.Fatalf("consumed instance result was lost: %v", err)
 	}
 }
 

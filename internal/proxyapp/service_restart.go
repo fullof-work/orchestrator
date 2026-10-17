@@ -24,6 +24,9 @@ func (s *Service) drainLocal(deadline time.Time) error {
 	if s.localDone == done {
 		s.localDone = nil
 	}
+	if s.stopping() {
+		s.stopErr = errors.Join(s.stopErr, err)
+	}
 	s.mu.Unlock()
 	if errors.Is(err, ErrForcedClose) {
 		s.recordForced()
@@ -427,6 +430,7 @@ func (s *Service) shutdownAll() error {
 	go func() { results <- s.reapChild(child, deadline, false) }()
 	err = errors.Join(<-results, <-results)
 	s.mu.Lock()
+	err = errors.Join(err, s.stopErr)
 	active := s.operation != nil && s.operation.Result == ""
 	s.mu.Unlock()
 	if active {

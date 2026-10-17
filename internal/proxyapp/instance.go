@@ -19,14 +19,14 @@ func (i *Instance) attachWorker(index int, epoch uint64, peer *controlPeer) bool
 	return true
 }
 
-func (i *Instance) workerExited(index int, epoch uint64) {
+func (i *Instance) workerExited(index int, epoch uint64, exitErr error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	if i.workers[index].epoch != epoch {
 		return
 	}
-	if i.stopping && i.workers[index].alive && !i.workers[index].mmdsDone {
-		i.err = errors.Join(i.err, ErrForcedClose)
+	if i.stopping && i.workers[index].alive && (!i.workers[index].stopped || exitErr != nil) {
+		i.err = errors.Join(i.err, ErrForcedClose, exitErr)
 	}
 	i.workers[index].alive = false
 	i.workers[index].ready = false
@@ -86,6 +86,7 @@ func (i *Instance) workerEvent(index int, epoch uint64, message controlMessage) 
 			i.mu.Unlock()
 			return fmt.Errorf("proxy worker stopped before MMDS drained")
 		}
+		w.stopped = true
 	default:
 		i.mu.Unlock()
 		return fmt.Errorf("proxy worker invalid lifecycle event %q", message.Kind)

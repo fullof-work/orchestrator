@@ -37,6 +37,7 @@ type Service struct {
 	input          ServiceInput
 	baseline       *EffectiveConfig
 	prepare        PrepareService
+	prepareCancel  context.CancelFunc
 	runner         MasterRunner
 	local          *Instance
 	localDone      chan error
@@ -62,6 +63,7 @@ type Service struct {
 	candidate      bool
 	parent         *serviceWire
 	err            error
+	stopErr        error
 	timeout        time.Duration
 	logger         *slog.Logger
 	coordinatorPID int
@@ -222,6 +224,9 @@ func (s *Service) requestShutdown() error {
 // earlier drain or cleanup. MMDS stays available behind the shared data barrier.
 func (s *Service) beginShutdown(deadline time.Time) chan struct{} {
 	s.mu.Lock()
+	if s.prepareCancel != nil {
+		s.prepareCancel()
+	}
 	if s.stopMMDS != nil {
 		gate := s.stopMMDS
 		s.mu.Unlock()
@@ -409,6 +414,9 @@ func (s *Service) Run(ctx context.Context, input ServiceInput, continuation *Con
 			return err
 		}
 	} else if err := s.startLocal(ctx, "", routesync.ProxyPluginID, nil); err != nil {
+		if s.stopping() {
+			return s.shutdownAll()
+		}
 		return err
 	}
 	for {
@@ -432,9 +440,20 @@ func (s *Service) Run(ctx context.Context, input ServiceInput, continuation *Con
 }
 
 func (s *Service) startLocal(ctx context.Context, boot, id string, resources *retainedResources) error {
+	s.mu.Lock()
 	if s.stopping() {
+		s.mu.Unlock()
 		return ErrStopped
 	}
+	ctx, cancel := context.WithCancel(ctx)
+	s.prepareCancel = cancel
+	s.mu.Unlock()
+	defer func() {
+		cancel()
+		s.mu.Lock()
+		s.prepareCancel = nil
+		s.mu.Unlock()
+	}()
 	input := s.input
 	input.Config = append(json.RawMessage(nil), input.Config...)
 	startup, err := s.prepare(ctx, input)

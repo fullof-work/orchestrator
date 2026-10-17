@@ -102,7 +102,13 @@ func runFixtureService() error {
 		}
 		return &Startup{Effective: effective, Runtime: &Runtime{Logger: testMasterLogger(), MasterExtension: &serviceFixtureExtension{s: service}}}, nil
 	}
-	return RunEntry(ctx, service, input, continuation, prepare, RunMaster)
+	err := RunEntry(ctx, service, input, continuation, prepare, RunMaster)
+	var config publicconfig.Proxy
+	if json.Unmarshal(input.Config, &config) == nil {
+		result, _ := json.Marshal(map[string]bool{"forced": errors.Is(service.Shutdown(context.Background()), ErrForcedClose)})
+		_ = os.WriteFile(filepath.Join(filepath.Dir(config.StatsSocket), "service-result.json"), result, 0600)
+	}
+	return err
 }
 
 func TestServiceRealImageReplacement(t *testing.T) {
@@ -131,11 +137,15 @@ func TestServiceRealShutdownDuringOriginalDrain(t *testing.T) {
 	testServiceRealImageReplacement(t, serviceScenario{stopDrain: true})
 }
 
+func TestServiceRealForcedShutdownDuringOriginalDrain(t *testing.T) {
+	testServiceRealImageReplacement(t, serviceScenario{stopDrain: true, forceStopDrain: true})
+}
+
 func TestServiceRealSuccessorFailureDuringCandidateDrain(t *testing.T) {
 	testServiceRealImageReplacement(t, serviceScenario{successorFailure: true})
 }
 
-type serviceScenario struct{ signals, recovery, stopRecovery, execFailure, candidateFailure, stopDrain, successorFailure bool }
+type serviceScenario struct{ signals, recovery, stopRecovery, execFailure, candidateFailure, stopDrain, forceStopDrain, successorFailure bool }
 
 func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 	signals, recovery, stopRecovery := scenario.signals, scenario.recovery, scenario.stopRecovery
@@ -256,6 +266,7 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 				if faultWindow.Load() && (errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET)) {
 					expectedLosses = append(expectedLosses, err)
 				} else {
+					t.Logf("unexpected connection result: during_injected_failure=%v type=%T error=%v", faultWindow.Load(), err, err)
 					businessErrors = append(businessErrors, err)
 				}
 				mu.Unlock()
@@ -288,9 +299,17 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 				t.Fatal(err)
 			}
 			releaseHeld = func() {
-				once.Do(func() { close(release) })
+				if !scenario.forceStopDrain {
+					once.Do(func() { close(release) })
+				}
 				body, err := io.ReadAll(response.Body)
 				response.Body.Close()
+				if scenario.forceStopDrain {
+					if err == nil || string(body) != "begin\n" {
+						t.Fatalf("forced original request did not expose truncation: %q %v", body, err)
+					}
+					return
+				}
 				if err != nil || string(body) != "begin\ncomplete\n" {
 					t.Fatalf("held request truncated: %q %v", body, err)
 				}
@@ -498,7 +517,16 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 	select {
 	case err := <-done:
 		done <- err
-		if err != nil {
+		if scenario.forceStopDrain {
+			body, readErr := os.ReadFile(filepath.Join(dir, "service-result.json"))
+			var result struct {
+				Forced bool `json:"forced"`
+			}
+			if err == nil || readErr != nil || json.Unmarshal(body, &result) != nil || !result.Forced {
+				t.Fatalf("public Shutdown lost the original forced result: exit=%v read=%v body=%s", err, readErr, body)
+			}
+			t.Logf("complete service Shutdown preserved forced close of A; B and workers reaped")
+		} else if err != nil {
 			t.Fatal(err)
 		}
 	case <-time.After(5 * time.Second):

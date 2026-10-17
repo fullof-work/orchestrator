@@ -96,7 +96,15 @@ func (r *Registry) Remove(p *Plugin) {
 func (r *Registry) markRouteStreamReady(p *Plugin) {
 	r.mu.Lock()
 	if r.m[p.ID] == p {
+		joining := !p.ready
 		p.ready = true
+		if joining && proxyRouteParticipantReady(p) {
+			// A new subscriber may have snapshotted before a pending mutation.
+			// Existing barriers cannot certify its view without its own ACK.
+			for _, b := range r.barriers {
+				b.failLocked(ErrProxyRouteLeaseChanged)
+			}
+		}
 	}
 	r.mu.Unlock()
 }
@@ -231,6 +239,12 @@ func (b *proxyRouteBarrier) Commit() error {
 	}
 	for epoch, p := range b.required {
 		if p.epoch != epoch || !p.ready || r.m[p.ID] != p {
+			delete(r.barriers, b.id)
+			return ErrProxyRouteLeaseChanged
+		}
+	}
+	for _, p := range r.m {
+		if proxyRouteParticipantReady(p) && b.required[p.epoch] != p {
 			delete(r.barriers, b.id)
 			return ErrProxyRouteLeaseChanged
 		}

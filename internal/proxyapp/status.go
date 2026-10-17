@@ -71,10 +71,10 @@ type Status struct {
 }
 
 type workerState struct {
-	pid                                                     int
-	epoch                                                   uint64
-	peer                                                    *controlPeer
-	alive, prepared, ready, dataDone, mmdsDone, canShutdown bool
+	pid                                                              int
+	epoch                                                            uint64
+	peer                                                             *controlPeer
+	alive, prepared, ready, dataDone, mmdsDone, stopped, canShutdown bool
 }
 
 // Instance owns one generation's control state. The service coordinator owns
