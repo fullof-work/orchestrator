@@ -120,20 +120,21 @@ func (r *Registry) routeBarrierAck(p *Plugin, barrierID string) {
 }
 
 // BeginProxyRouteBarrier captures the complete current traffic-serving proxy
-// participant set. V1 has one trusted ProxyPluginID lease, but proxyRouteBarrier
-// deliberately implements all-of completion over a set.
+// participant set. IDs identify leases; the admitted capabilities identify roles.
 func (r *Registry) BeginProxyRouteBarrier() (routesync.RouteBarrier, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	p := r.m[routesync.ProxyPluginID]
-	if !proxyRouteParticipantReady(p) {
-		return nil, ErrProxyRouteUnavailable
+	var participants []*Plugin
+	for _, p := range r.m {
+		if proxyRouteParticipantReady(p) {
+			participants = append(participants, p)
+		}
 	}
-	return r.beginRouteBarrierLocked([]*Plugin{p})
+	return r.beginRouteBarrierLocked(participants)
 }
 
 func proxyRouteParticipantReady(p *Plugin) bool {
-	return p != nil && p.ready && p.ID == routesync.ProxyPluginID &&
+	return p != nil && p.ready &&
 		p.Caps.Subscribe != nil && p.Caps.Subscribe.Kind == routesync.KindRouteWake &&
 		p.Caps.Proxy != nil
 }
@@ -265,13 +266,47 @@ func (b *proxyRouteBarrier) failLocked(err error) {
 // ProxyStatsTarget returns the master-only stats endpoint from the current
 // trusted proxy registration. The registration connection remains its lease.
 func (r *Registry) ProxyStatsTarget() (string, bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	plugin := r.m[routesync.ProxyPluginID]
-	if plugin == nil || plugin.Caps.Proxy == nil || plugin.Caps.Proxy.StatsSocket == nil || plugin.Caps.Proxy.StatsSocket.Path == "" {
+	targets, ok := r.ProxyStatsTargets()
+	if !ok || len(targets) != 1 {
 		return "", false
 	}
-	return plugin.Caps.Proxy.StatsSocket.Path, true
+	return targets[0].Socket, true
+}
+
+// ProxyStatsRegistration captures an endpoint and its exact registration epoch.
+// Reading all captured endpoints and rechecking this set prevents mixed leases.
+type ProxyStatsRegistration struct {
+	InstanceID string
+	Epoch      uint64
+	Socket     string
+}
+
+func (r *Registry) ProxyStatsTargets() ([]ProxyStatsRegistration, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var targets []ProxyStatsRegistration
+	seen := map[string]bool{}
+	for _, p := range r.m {
+		if p.Caps.Proxy == nil {
+			continue
+		}
+		endpoint := p.Caps.Proxy.StatsSocket
+		if endpoint == nil || endpoint.Path == "" || seen[endpoint.Path] {
+			return nil, false
+		}
+		seen[endpoint.Path] = true
+		targets = append(targets, ProxyStatsRegistration{p.ID, p.epoch, endpoint.Path})
+	}
+	slices.SortFunc(targets, func(a, b ProxyStatsRegistration) int {
+		if a.InstanceID < b.InstanceID {
+			return -1
+		}
+		if a.InstanceID > b.InstanceID {
+			return 1
+		}
+		return 0
+	})
+	return targets, len(targets) != 0
 }
 
 // handlePluginRegister authenticates the subscriber (plugin_pidfile / socket perms),
@@ -318,9 +353,8 @@ func (s *Server) handlePluginRegister(w http.ResponseWriter, r *http.Request) {
 	s.log.Info("plugin deregistered", "id", id)
 }
 
-func isTrustedMMDSProxyRegistration(id string, reg routesync.Register) bool {
-	return id == routesync.ProxyPluginID &&
-		reg.Subscribe != nil && reg.Subscribe.Kind == routesync.KindRouteWake &&
+func isTrustedMMDSProxyRegistration(_ string, reg routesync.Register) bool {
+	return reg.Subscribe != nil && reg.Subscribe.Kind == routesync.KindRouteWake &&
 		reg.Proxy != nil && reg.Mmds
 }
 

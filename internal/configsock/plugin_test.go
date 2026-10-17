@@ -67,9 +67,7 @@ func TestProxyRouteBarrierAllOfParticipants(t *testing.T) {
 	r := NewRegistry()
 	first := addReadyPlugin(r, "proxy-a")
 	second := addReadyPlugin(r, "proxy-b")
-	r.mu.Lock()
-	b, err := r.beginRouteBarrierLocked([]*Plugin{first, second})
-	r.mu.Unlock()
+	b, err := r.BeginProxyRouteBarrier()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,7 +210,38 @@ func TestTrustedMMDSProxyRegistrationShape(t *testing.T) {
 			t.Fatal("non-proxy MMDS registration was trusted")
 		}
 	}
-	if isTrustedMMDSProxyRegistration("observer", trusted) {
-		t.Fatal("non-proxy plugin id was trusted")
+	if !isTrustedMMDSProxyRegistration("proxy-candidate", trusted) {
+		t.Fatal("admitted Proxy capabilities were coupled to a fixed instance id")
+	}
+}
+
+func TestRegistryStatsSetIncludesDrainingAndDetectsLeaseChanges(t *testing.T) {
+	r := NewRegistry()
+	first := addReadyPlugin(r, "proxy-a")
+	second := addReadyPlugin(r, "proxy-b")
+	first.Caps.Proxy.StatsSocket = &routesync.Socket{Path: "/run/a.sock"}
+	second.Caps.Proxy.StatsSocket = &routesync.Socket{Path: "/run/b.sock"}
+	targets, ok := r.ProxyStatsTargets()
+	if !ok || len(targets) != 2 {
+		t.Fatalf("targets=%+v ok=%v", targets, ok)
+	}
+	second.ready = false // Not being ready cannot imply that its inflight work is zero.
+	current, ok := r.ProxyStatsTargets()
+	if !ok || len(current) != 2 {
+		t.Fatalf("lost nonready live instance: %+v", current)
+	}
+	replacement := &Plugin{ID: first.ID, Caps: first.Caps, cancel: func() {}}
+	r.Add(replacement)
+	current, ok = r.ProxyStatsTargets()
+	if !ok || current[0].Epoch == targets[0].Epoch {
+		t.Fatal("replacement did not change captured identity")
+	}
+	second.Caps.Proxy.StatsSocket = &routesync.Socket{Path: "/run/a.sock"}
+	if _, ok := r.ProxyStatsTargets(); ok {
+		t.Fatal("aliased stats endpoints accepted")
+	}
+	second.Caps.Proxy.StatsSocket = nil
+	if _, ok := r.ProxyStatsTargets(); ok {
+		t.Fatal("unreadable live instance omitted")
 	}
 }

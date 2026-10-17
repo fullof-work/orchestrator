@@ -4,6 +4,8 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"github.com/kuasar-sandbox/orchestrator/app/activation"
+	"github.com/kuasar-sandbox/orchestrator/internal/listenresource"
 	"log/slog"
 	"os/signal"
 	"syscall"
@@ -51,7 +53,12 @@ func runProxy(args []string, logger *slog.Logger) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	runtime, err := proxyapp.ResolveRuntime(ctx, effective.Config(), proxyapp.Bindings{Logger: logger})
+	files, err := activation.Receive()
+	if err != nil {
+		return err
+	}
+	defer listenresource.Close(files)
+	runtime, err := proxyapp.ResolveRuntime(ctx, effective.Config(), proxyapp.Bindings{Logger: logger, ListenerFiles: files})
 	if err != nil {
 		return err
 	}

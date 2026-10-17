@@ -128,7 +128,7 @@ func serveAuthority(ctx context.Context, w io.Writer, flush func(), body io.Read
 	if !includeMMDS {
 		policy.MMDS = nil
 	}
-	if err := WriteMsg(w, &Msg{Type: TypeHello, Hello: &Hello{Version: Version, Policy: policy}}); err != nil {
+	if err := WriteMsg(w, &Msg{Type: TypeHello, Hello: &Hello{Version: Version, Policy: policy, ProxyCapabilities: []string{InplaceRestartV1}}}); err != nil {
 		return
 	}
 	flush()

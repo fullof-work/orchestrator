@@ -12,13 +12,17 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
+	"os"
 	"os/signal"
 	"sync/atomic"
 	"syscall"
 
+	"github.com/kuasar-sandbox/orchestrator/app/activation"
 	proxyextension "github.com/kuasar-sandbox/orchestrator/app/proxy/extension"
 	publicconfig "github.com/kuasar-sandbox/orchestrator/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/componentexec"
+	"github.com/kuasar-sandbox/orchestrator/internal/listenresource"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyapp"
 	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
 )
@@ -51,8 +55,14 @@ func (f TLSMaterialProviderFunc) TLSMaterial(ctx context.Context) (TLSMaterial, 
 // Runtime holds non-serializable process-local startup bindings. A fresh value
 // is bound in the master and every worker epoch.
 type Runtime struct {
-	Logger *slog.Logger
-	TLS    TLSMaterialProvider
+	// ListenerFiles supplies named TCP listeners to the master. Successful
+	// BindRuntime transfers ownership of every delivered file to App, including
+	// on later startup failure. A failing hook retains ownership. The name set
+	// is frozen on return; callers retaining a handle must deliver a duplicate.
+	// Workers receive listeners through the private bootstrap, not this field.
+	ListenerFiles map[string]*os.File
+	Logger        *slog.Logger
+	TLS           TLSMaterialProvider
 	// MasterExtension is the one trusted, statically linked extension used by
 	// the master process. Worker processes ignore this field.
 	MasterExtension proxyextension.MasterExtension
@@ -186,6 +196,26 @@ func (a *App) runMasterProcess(ctx context.Context) error {
 			return fmt.Errorf("custom proxy bind runtime for master: %w", err)
 		}
 	}
+	// Ownership begins at the successful BindRuntime return, before any
+	// environment adaptation or runtime-material validation can fail.
+	owned := maps.Clone(runtimeBindings.ListenerFiles)
+	if owned == nil {
+		owned = make(map[string]*os.File)
+	}
+	defer listenresource.Close(owned)
+	received, err := activation.Receive()
+	if err != nil {
+		return err
+	}
+	defer listenresource.Close(received)
+	for name, file := range received {
+		if _, exists := owned[name]; exists {
+			return fmt.Errorf("proxy listener %q delivered by both activation and BindRuntime", name)
+		}
+		owned[name] = file
+		delete(received, name) // The App's frozen collection now owns this file.
+	}
+	runtimeBindings.ListenerFiles = owned
 	resolved, err := proxyapp.ResolveRuntime(ctx, effective.Config(), freezeRuntime(runtimeBindings))
 	if err != nil {
 		return err
@@ -221,6 +251,11 @@ func (a *App) runWorkerProcess(ctx context.Context) error {
 		}
 	}
 	effective := bootstrap.EffectiveConfig()
+	owned := maps.Clone(runtimeBindings.ListenerFiles)
+	defer listenresource.Close(owned)
+	if len(owned) != 0 {
+		return fmt.Errorf("proxy worker BindRuntime must not deliver ListenerFiles")
+	}
 	resolved, err := proxyapp.ResolveRuntime(ctx, effective.Config(), freezeRuntime(runtimeBindings))
 	if err != nil {
 		return err
@@ -249,7 +284,8 @@ func decodeConfig(raw []byte, out *publicconfig.Proxy) error {
 
 func freezeRuntime(runtime *Runtime) proxyapp.Bindings {
 	bindings := proxyapp.Bindings{
-		Logger: runtime.Logger, MasterExtension: runtime.MasterExtension,
+		ListenerFiles: maps.Clone(runtime.ListenerFiles),
+		Logger:        runtime.Logger, MasterExtension: runtime.MasterExtension,
 		WorkerExtension: runtime.WorkerExtension,
 	}
 	if runtime.TLS != nil {
