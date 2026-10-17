@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"sync"
@@ -27,6 +28,9 @@ type Server struct {
 	connections map[*trackedConn]struct{}
 	changed     chan struct{}
 	draining    bool
+	forcing     bool
+	deadline    time.Time
+	closeErr    error
 	handlers    int
 	ready       func()
 	acceptOnce  sync.Once
@@ -77,6 +81,7 @@ func (s *Server) guard(handler http.Handler) http.Handler {
 		first := r.ProtoMajor == 1 && connection != nil && !connection.entered && !connection.protocolReady
 		if connection != nil {
 			connection.entered = true
+			connection.http1 = r.ProtoMajor == 1
 			s.notifyLocked()
 		}
 		if s.draining && !first {
@@ -138,6 +143,7 @@ func (s *Server) Drain(ctx context.Context) error {
 	s.drainOnce.Do(func() {
 		s.mu.Lock()
 		s.draining = true
+		s.deadline, _ = ctx.Deadline()
 		listener := s.listener
 		s.notifyLocked()
 		s.mu.Unlock()
@@ -182,14 +188,26 @@ func (s *Server) Drain(ctx context.Context) error {
 				}
 			}
 			if err == nil {
-				err = s.http.Shutdown(work)
+				shutdown := make(chan error, 1)
+				go func() { shutdown <- s.http.Shutdown(work) }()
+				select {
+				case err = <-shutdown:
+				case <-work.Done():
+					// Shutdown may be inside an idle connection's Close, including
+					// TLS close_notify. Bound that work by our original deadline too.
+					err = work.Err()
+					s.ForceClose()
+					<-shutdown
+				}
 			}
 			for err == nil {
 				s.mu.Lock()
 				complete := len(s.connections) == 0 && s.handlers == 0
+				closeErr := s.closeErr
 				changed := s.changed
 				s.mu.Unlock()
 				if complete {
+					err = closeErr
 					break
 				}
 				select {
@@ -217,18 +235,24 @@ func (s *Server) Drain(ctx context.Context) error {
 func (s *Server) ForceClose() {
 	s.mu.Lock()
 	s.draining = true
+	s.forcing = true
+	if len(s.connections) != 0 || s.handlers != 0 {
+		s.closeErr = errors.Join(s.closeErr, ErrForcedClose)
+	}
 	s.notifyLocked()
-	s.mu.Unlock()
-	_ = s.http.Close()
-	s.mu.Lock()
 	connections := make([]*trackedConn, 0, len(s.connections))
 	for conn := range s.connections {
 		connections = append(connections, conn)
 	}
 	s.mu.Unlock()
 	for _, conn := range connections {
-		_ = conn.Close()
+		// A normal HTTP/1 Close can be consuming unread pipelined input while
+		// net/http holds its connection lock. Interrupt that read before asking
+		// http.Close to take the same lock, and bypass the graceful closeOnce.
+		_ = conn.Conn.Close()
+		conn.forget()
 	}
+	_ = s.http.Close()
 }
 
 func (s *Server) notifyLocked() { close(s.changed); s.changed = make(chan struct{}) }
@@ -250,6 +274,11 @@ func (l *trackedListener) Accept() (net.Conn, error) {
 	}
 	wrapped := &trackedConn{Conn: conn, server: l.server}
 	l.server.mu.Lock()
+	if l.server.forcing {
+		l.server.mu.Unlock()
+		_ = conn.Close()
+		return nil, net.ErrClosed
+	}
 	l.server.connections[wrapped] = struct{}{}
 	l.server.notifyLocked()
 	l.server.mu.Unlock()
@@ -260,8 +289,12 @@ type trackedConn struct {
 	net.Conn
 	server        *Server
 	once          sync.Once
+	closeOnce     sync.Once
+	closeErr      error
 	entered       bool
 	protocolReady bool
+	http1         bool
+	hijacked      bool
 }
 
 type connectionKey struct{}
@@ -291,6 +324,9 @@ func (s *Server) trackContexts() {
 			if tracked := trackedConnection(conn); tracked != nil {
 				s.mu.Lock()
 				tracked.protocolReady = true
+				if state == http.StateHijacked {
+					tracked.hijacked = true
+				}
 				s.notifyLocked()
 				s.mu.Unlock()
 			}
@@ -299,14 +335,42 @@ func (s *Server) trackContexts() {
 }
 
 func (c *trackedConn) Close() error {
-	err := c.Conn.Close()
+	c.closeOnce.Do(func() {
+		c.server.mu.Lock()
+		graceful := c.server.draining && !c.server.forcing && c.http1 && !c.hijacked
+		deadline := c.server.deadline
+		c.server.mu.Unlock()
+		if tcp, ok := c.Conn.(*net.TCPConn); graceful && ok {
+			// net/http has finished writing this HTTP/1 response. Closing TCP
+			// with unread pipelined requests can send RST and discard that output
+			// at the peer. Send FIN first and consume further input without ever
+			// admitting it to a handler. The peer finishes the close handshake;
+			// an uncooperative peer consumes only the original drain budget.
+			if err := tcp.CloseWrite(); err == nil {
+				_ = tcp.SetReadDeadline(deadline)
+				_, err := io.Copy(io.Discard, tcp)
+				var timeout net.Error
+				if errors.As(err, &timeout) && timeout.Timeout() {
+					c.server.mu.Lock()
+					c.server.closeErr = errors.Join(c.server.closeErr, ErrForcedClose, err)
+					c.server.notifyLocked()
+					c.server.mu.Unlock()
+				}
+			}
+		}
+		c.closeErr = c.Conn.Close()
+		c.forget()
+	})
+	return c.closeErr
+}
+
+func (c *trackedConn) forget() {
 	c.once.Do(func() {
 		c.server.mu.Lock()
 		delete(c.server.connections, c)
 		c.server.notifyLocked()
 		c.server.mu.Unlock()
 	})
-	return err
 }
 
 // Preserve TCP half-close for CONNECT; closing writes does not end the tunnel.

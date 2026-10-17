@@ -51,10 +51,11 @@ func testServerTLS(t *testing.T, handler http.Handler, tlsConfig *tls.Config) (*
 // Use exactly one physical connection. In particular, ClientConn.RoundTrip
 // cannot silently retry a GOAWAY on a newly dialed HTTP/2 connection.
 func TestDrainRejectsNewBusinessOnExistingConnection(t *testing.T) {
-	for _, protocol := range []string{"http1", "h2c", "h2"} {
+	for _, protocol := range []string{"http1", "http1tls", "h2c", "h2"} {
 		t.Run(protocol, func(t *testing.T) {
+			http1 := protocol == "http1" || protocol == "http1tls"
 			var tlsConfig *tls.Config
-			if protocol == "h2" {
+			if protocol == "h2" || protocol == "http1tls" {
 				certificate := httptest.NewTLSServer(nil)
 				tlsConfig = certificate.TLS.Clone()
 				certificate.Close()
@@ -81,8 +82,12 @@ func TestDrainRejectsNewBusinessOnExistingConnection(t *testing.T) {
 			defer cancel()
 			var conn net.Conn
 			var err error
-			if protocol == "h2" {
-				conn, err = tls.DialWithDialer(&net.Dialer{Timeout: time.Second}, "tcp", request.URL.Host, &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h2"}})
+			if tlsConfig != nil {
+				alpn := "h2"
+				if http1 {
+					alpn = "http/1.1"
+				}
+				conn, err = tls.DialWithDialer(&net.Dialer{Timeout: time.Second}, "tcp", request.URL.Host, &tls.Config{InsecureSkipVerify: true, NextProtos: []string{alpn}})
 			} else {
 				conn, err = net.DialTimeout("tcp", request.URL.Host, time.Second)
 			}
@@ -94,7 +99,7 @@ func TestDrainRejectsNewBusinessOnExistingConnection(t *testing.T) {
 			var first *http.Response
 			var reader *bufio.Reader
 			var client *http2.ClientConn
-			if protocol == "http1" {
+			if http1 {
 				reader = bufio.NewReader(conn)
 				if err := request.Write(conn); err != nil {
 					t.Fatal(err)
@@ -116,7 +121,7 @@ func TestDrainRejectsNewBusinessOnExistingConnection(t *testing.T) {
 			waitDraining(t, server)
 			second, _ := http.NewRequestWithContext(ctx, http.MethodGet, address+"/new", nil)
 			var response *http.Response
-			if protocol == "http1" {
+			if http1 {
 				// Pipeline behind the still-running response, on the original
 				// keep-alive connection, after the admission barrier closed.
 				if err := second.Write(conn); err != nil {
@@ -136,7 +141,7 @@ func TestDrainRejectsNewBusinessOnExistingConnection(t *testing.T) {
 			if err != nil || string(body) != "begin:"+payload {
 				t.Fatalf("original response incomplete: bytes=%d err=%v", len(body), err)
 			}
-			if protocol == "http1" {
+			if http1 {
 				response, err = http.ReadResponse(reader, second)
 				if err == nil && response.StatusCode != http.StatusServiceUnavailable {
 					t.Fatalf("new request admitted: %s", response.Status)
@@ -144,12 +149,84 @@ func TestDrainRejectsNewBusinessOnExistingConnection(t *testing.T) {
 				if response != nil {
 					response.Body.Close()
 				}
+				// Complete the TCP handshake after observing the server's FIN,
+				// as http.Transport does when a connection stops accepting work.
+				conn.Close()
 			}
 			if err := <-done; err != nil {
 				t.Fatal(err)
 			}
 			if got := newHandlers.Load(); got != 0 {
 				t.Fatalf("new business entered %d handlers during drain", got)
+			}
+		})
+	}
+}
+
+func TestHTTP1CloseHandshakeSharesDrainDeadlineAndCanBeForced(t *testing.T) {
+	for _, force := range []bool{false, true} {
+		t.Run(map[bool]string{false: "deadline", true: "force"}[force], func(t *testing.T) {
+			release := make(chan struct{})
+			var releaseOnce sync.Once
+			finish := func() { releaseOnce.Do(func() { close(release) }) }
+			defer finish()
+			server, address, _ := testServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				io.WriteString(w, "begin:")
+				http.NewResponseController(w).Flush()
+				<-release
+				io.WriteString(w, "complete")
+			}))
+			request, _ := http.NewRequest(http.MethodGet, address, nil)
+			conn, err := net.DialTimeout("tcp", request.URL.Host, time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			conn.SetDeadline(time.Now().Add(3 * time.Second))
+			if err := request.Write(conn); err != nil {
+				t.Fatal(err)
+			}
+			reader := bufio.NewReader(conn)
+			response, err := http.ReadResponse(reader, request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			budget := time.Second
+			if force {
+				budget = 10 * time.Second
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), budget)
+			defer cancel()
+			go server.Drain(ctx)
+			waitDraining(t, server)
+			finish()
+			body, err := io.ReadAll(response.Body)
+			response.Body.Close()
+			if err != nil || string(body) != "begin:complete" {
+				t.Fatalf("finite response truncated: %q %v", body, err)
+			}
+			if _, err := reader.ReadByte(); !errors.Is(err, io.EOF) {
+				t.Fatalf("server did not finish writes: %v", err)
+			}
+			// Deliberately retain our write side after receiving FIN. This is
+			// transport cleanup only: the response above must still be complete.
+			if force {
+				done := make(chan struct{})
+				go func() { server.ForceClose(); close(done) }()
+				select {
+				case <-done:
+				case <-time.After(time.Second):
+					t.Fatal("ForceClose blocked behind the HTTP server lock")
+				}
+			}
+			wait, stopWait := context.WithTimeout(context.Background(), 2*time.Second)
+			defer stopWait()
+			err = server.Drain(wait)
+			if !errors.Is(err, ErrForcedClose) {
+				t.Fatalf("interrupted close handshake was not classified as forced: %v", err)
+			}
+			if errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, ErrForcedClose) {
+				t.Fatalf("drain did not finish within its original budget: %v", err)
 			}
 		})
 	}
