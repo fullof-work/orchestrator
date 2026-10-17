@@ -28,6 +28,38 @@ import (
 
 var fixtureBuild = "initial"
 
+var fixtureTargetOnce sync.Once
+var fixtureTargetDirectory string
+var fixtureTargetError error
+
+// Every scenario uses the same source and target build marker. Compile that
+// immutable image once per test process, then copy it into each scenario's
+// private deployment so chmod/replacement faults cannot affect another test.
+func fixtureTargetBinary(t *testing.T) string {
+	t.Helper()
+	fixtureTargetOnce.Do(func() {
+		fixtureTargetDirectory, fixtureTargetError = os.MkdirTemp("", "proxy-target-build-")
+		if fixtureTargetError != nil {
+			return
+		}
+		buildArgs := []string{"test", "-c", "-o", filepath.Join(fixtureTargetDirectory, "target-proxy"), "-ldflags", "-X github.com/kuasar-sandbox/orchestrator/internal/proxyapp.fixtureBuild=target"}
+		if fixtureRace {
+			buildArgs = append(buildArgs, "-race")
+		}
+		buildArgs = append(buildArgs, ".")
+		started := time.Now()
+		output, err := exec.Command("go", buildArgs...).CombinedOutput()
+		if err != nil {
+			fixtureTargetError = fmt.Errorf("target build: %w\n%s", err, output)
+		}
+		t.Logf("compiled compatible target once in %s (race=%v)", time.Since(started), fixtureRace)
+	})
+	if fixtureTargetError != nil {
+		t.Fatal(fixtureTargetError)
+	}
+	return filepath.Join(fixtureTargetDirectory, "target-proxy")
+}
+
 // The conductor fixture records actual retirement requests. The product has
 // no fault switch, shortened clock, or alternate retry implementation.
 type fixtureRetirementFailure struct {
@@ -80,6 +112,32 @@ func (c *fixtureCancelOnTargetOpen) Err() error {
 
 func (*serviceFixtureExtension) Start(context.Context, proxyextension.MasterHost) error { return nil }
 func (*serviceFixtureExtension) Shutdown(context.Context) error                         { return nil }
+
+// Fail actual candidate worker processes before they can advertise readiness.
+// Only the test executable consults this file; A's workers use ordinary paths.
+func fixtureCandidateWorkerFailure(bootstrap *WorkerBootstrap) error {
+	cfg := bootstrap.EffectiveConfig().Config()
+	if !strings.HasPrefix(filepath.Base(cfg.StatsSocket), ".proxy-") {
+		return nil
+	}
+	dir := filepath.Dir(cfg.StatsSocket)
+	fault, err := os.ReadFile(filepath.Join(dir, "candidate-fault"))
+	if err != nil || string(fault) != "worker" {
+		return nil
+	}
+	body, err := json.Marshal(struct {
+		PID      int
+		Identity controlIdentity
+	}{os.Getpid(), bootstrap.identity})
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("candidate-worker-fault-%d.json", os.Getpid())), body, 0600); err != nil {
+		return err
+	}
+	return fmt.Errorf("fixture candidate worker initialization failed")
+}
+
 func (e *serviceFixtureExtension) WrapManagement(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -359,7 +417,7 @@ func TestServiceRealRetirementFailureRecovery(t *testing.T) {
 }
 
 func TestServiceRealCandidatePreparationRollback(t *testing.T) {
-	for _, fault := range []string{"initialization", "configuration", "control"} {
+	for _, fault := range []string{"initialization", "configuration", "control", "worker"} {
 		t.Run(fault, func(t *testing.T) {
 			testServiceRealImageReplacement(t, serviceScenario{preparationFault: fault})
 		})
@@ -446,15 +504,7 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 		t.Fatal(err)
 	}
 	target := filepath.Join(dir, "target-proxy")
-	buildArgs := []string{"test", "-c", "-o", target, "-ldflags", "-X github.com/kuasar-sandbox/orchestrator/internal/proxyapp.fixtureBuild=target"}
-	if fixtureRace {
-		buildArgs = append(buildArgs, "-race")
-	}
-	buildArgs = append(buildArgs, ".")
-	build := exec.Command("go", buildArgs...)
-	if output, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("target build: %v\n%s", err, output)
-	}
+	copyExecutable(t, fixtureTargetBinary(t), target)
 	logfile, err := os.Create(filepath.Join(dir, "service.log"))
 	if err != nil {
 		t.Fatal(err)
@@ -619,6 +669,7 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 				t.Fatal(err)
 			}
 		}
+		operationRequestedAt := time.Now()
 		var id RestartID
 		if signals {
 			for repeat := 0; repeat < 4; repeat++ {
@@ -667,7 +718,15 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 		}
 		previous = id
 		if scenario.preparationFault != "" && iteration == 0 {
-			rolledBack := waitServiceStatus(t, management, func(status Status) bool {
+			waitBudget := 20 * time.Second
+			if scenario.preparationFault == "worker" {
+				// Persistent worker failures consume the real preparation budget.
+				waitBudget = candidatePrepareTimeout + cfg.ShutdownTimeoutDur() + 5*time.Second
+			}
+			rolledBack := waitServiceStatusFor(t, management, waitBudget, func(status Status) bool {
+				if scenario.preparationFault == "worker" && (!status.Ready || status.BootID != initialBoot || status.Data != "serving") {
+					t.Fatalf("unready candidate workers interrupted A: %+v", status)
+				}
 				return status.InplaceRestart != nil && status.InplaceRestart.ID == id && status.InplaceRestart.Result != ""
 			})
 			if rolledBack.InplaceRestart.Result != "failed" || rolledBack.InplaceRestart.LastError == "" || !rolledBack.Ready || !rolledBack.ServiceReady || rolledBack.BootID != initialBoot || len(rolledBack.Instances) != 1 || rolledBack.Data != "serving" {
@@ -677,6 +736,7 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 				"initialization": "fixture candidate initialization failed",
 				"configuration":  "Configure changed the accepted declarative configuration",
 				"control":        "EOF",
+				"worker":         "context deadline exceeded",
 			}[scenario.preparationFault]
 			errorMatches := strings.Contains(rolledBack.InplaceRestart.LastError, expectedError)
 			if scenario.preparationFault == "control" {
@@ -693,6 +753,45 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 			failedPID, err := strconv.Atoi(string(body))
 			if err != nil || failedPID <= 0 || unix.Kill(failedPID, 0) != unix.ESRCH {
 				t.Fatalf("failed candidate was not reaped: %s %v", body, err)
+			}
+			if scenario.preparationFault == "worker" {
+				elapsed := time.Since(operationRequestedAt)
+				if elapsed < 30*time.Second {
+					t.Fatalf("candidate preparation ended before its required 30s budget: %s", elapsed)
+				}
+				paths, err := filepath.Glob(filepath.Join(dir, "candidate-worker-fault-*.json"))
+				if err != nil || len(paths) < cfg.Workers {
+					t.Fatalf("candidate worker fault did not run: %v %v", paths, err)
+				}
+				epochs := make(map[string]map[uint64]bool)
+				boots := make(map[string]bool)
+				for _, path := range paths {
+					body, err := os.ReadFile(path)
+					var failed struct {
+						PID      int
+						Identity controlIdentity
+					}
+					if err != nil || json.Unmarshal(body, &failed) != nil || failed.PID <= 0 || unix.Kill(failed.PID, 0) != unix.ESRCH {
+						t.Fatalf("failed candidate worker was not reaped: %s %v", body, err)
+					}
+					if failed.Identity.RestartID != id || failed.Identity.BootID == "" || failed.Identity.BootID == initialBoot {
+						t.Fatalf("worker fault belongs to another instance or operation: %+v", failed)
+					}
+					boots[failed.Identity.BootID] = true
+					if epochs[failed.Identity.WorkerID] == nil {
+						epochs[failed.Identity.WorkerID] = make(map[uint64]bool)
+					}
+					epochs[failed.Identity.WorkerID][failed.Identity.WorkerEpoch] = true
+				}
+				if len(boots) != 1 || len(epochs) != cfg.Workers {
+					t.Fatalf("unexpected candidate generations or worker set: boots=%v epochs=%v", boots, epochs)
+				}
+				for worker, generations := range epochs {
+					if len(generations) < 2 || generations[0] {
+						t.Fatalf("persistent worker failure was not retried across valid epochs: %s epochs=%v", worker, generations)
+					}
+				}
+				t.Logf("candidate preparation exhausted its real budget in %s; reaped %d worker processes from one BootID, epochs=%v", elapsed, len(paths), epochs)
 			}
 			for _, suffix := range []string{".sock", ".shm"} {
 				paths, err := filepath.Glob(filepath.Join(dir, ".proxy-*"+suffix))
@@ -1181,7 +1280,12 @@ func copyExecutable(t *testing.T, source, dest string) {
 
 func waitServiceStatus(t *testing.T, client *http.Client, condition func(Status) bool) Status {
 	t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
+	return waitServiceStatusFor(t, client, 20*time.Second, condition)
+}
+
+func waitServiceStatusFor(t *testing.T, client *http.Client, budget time.Duration, condition func(Status) bool) Status {
+	t.Helper()
+	deadline := time.Now().Add(budget)
 	var last Status
 	var lastErr error
 	for time.Now().Before(deadline) {

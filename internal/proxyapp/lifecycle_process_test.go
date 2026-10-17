@@ -35,7 +35,11 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	}
 	if !WorkerBootstrapPresent() {
-		os.Exit(m.Run())
+		code := m.Run()
+		if fixtureTargetDirectory != "" {
+			_ = os.RemoveAll(fixtureTargetDirectory)
+		}
+		os.Exit(code)
 	}
 	err := func() error {
 		bootstrap, err := ReceiveWorkerBootstrap()
@@ -44,6 +48,9 @@ func TestMain(m *testing.M) {
 		}
 		defer bootstrap.Close()
 		if err := bootstrap.VerifyExecutable(); err != nil {
+			return err
+		}
+		if err := fixtureCandidateWorkerFailure(bootstrap); err != nil {
 			return err
 		}
 		worker, err := PrepareWorker(bootstrap)
