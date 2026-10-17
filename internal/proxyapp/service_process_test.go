@@ -1107,6 +1107,9 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 		if err := unix.Kill(stoppedCandidate, 0); err != unix.ESRCH {
 			t.Fatalf("candidate was not reaped: %v", err)
 		}
+		if err := unix.Kill(-stoppedCandidate, 0); err != unix.ESRCH {
+			t.Fatalf("candidate process group still contains workers: %v", err)
+		}
 		// Cross the already-advertised retry deadline before checking cleanup.
 		if remaining := time.Until(cancelledAttempt.Add(100 * time.Millisecond)); remaining > 0 {
 			time.Sleep(remaining)
