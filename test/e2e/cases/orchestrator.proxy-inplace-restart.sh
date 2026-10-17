@@ -46,7 +46,7 @@ for mode in builtin:address builtin:datafd builtin:mmdsfd builtin:bothfd custom:
     # Exercise the existing PID admission rule with only the fixed main PID.
     # The launcher updates it on ordinary service restart, then exec preserves it.
     plugin_pidfile="$WORK/proxy-main.pid"
-    sed -i "/^paths:$/a\\  plugin_pidfile: $plugin_pidfile" "$WORK/config.yaml"
+    sed -i "s#^paths: {#paths: { plugin_pidfile: $plugin_pidfile,#" "$WORK/config.yaml"
     grep -q "plugin_pidfile: $plugin_pidfile" "$WORK/config.yaml" || fail "missing paths for PID admission"
     case "$source" in
         mmdsfd|bothfd) sed -i "s/listen: \"$PROXY_NS_IP:$MMDS_PORT\"/listen: fd=proxy-mmds/" "$WORK/config.yaml";;
