@@ -930,16 +930,15 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 				t.Fatal(err)
 			}
 			response.Body.Close()
-			// B has no held work and can exit while A still drains. Its management
-			// socket need not remain alive; the coordinator retains its exit status.
+			// B has no held business and drains independently while A still has
+			// its held response. Endpoint completion is distinct from process
+			// exit/reaping, which the final whole-service assertions check.
 			stopping := waitServiceStatus(t, management, func(status Status) bool {
-				return len(status.Instances) == 2 && status.Instances[1].Phase == "stopped"
+				return len(status.Instances) == 2 && status.Instances[1].Data == "stopped" &&
+					(status.Instances[1].MMDS == "disabled" || status.Instances[1].MMDS == "stopped")
 			})
-			if stopping.ServiceReady || stopping.Ready {
-				t.Fatalf("stopping service advertised readiness: %+v", stopping)
-			}
-			if err := unix.Kill(candidate.PID, 0); err != unix.ESRCH {
-				t.Fatalf("idle candidate did not end independently: %v", err)
+			if stopping.ServiceReady || stopping.Ready || stopping.Data != "draining" {
+				t.Fatalf("independent drain state: %+v", stopping)
 			}
 			releaseHeld()
 			stopFromCandidate, stoppedCandidate = true, candidate.PID

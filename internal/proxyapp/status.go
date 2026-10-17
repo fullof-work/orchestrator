@@ -97,7 +97,6 @@ type Instance struct {
 	capabilities      []string
 	capabilitiesKnown bool
 	statusProvider    func() Status
-	// A full-service stop may hold MMDS until every instance has drained data.
 }
 
 func newBootID() string {
