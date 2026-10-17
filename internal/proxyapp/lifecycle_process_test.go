@@ -110,9 +110,9 @@ func (*lifecycleFixtureExtension) WrapIngress(next http.Handler) http.Handler {
 }
 
 func TestMasterRealWorkersReadyAndOrderedDrain(t *testing.T) {
-	for _, scenario := range []struct{ metadata, force bool }{{false, false}, {true, false}, {true, true}} {
+	for _, scenario := range []struct{ metadata, force, endingError bool }{{false, false, false}, {true, false, false}, {true, true, false}, {true, false, true}} {
 		metadata, force := scenario.metadata, scenario.force
-		t.Run(fmt.Sprintf("mmds-%v-forced-%v", metadata, force), func(t *testing.T) {
+		t.Run(fmt.Sprintf("mmds-%v-forced-%v-extension-error-%v", metadata, force, scenario.endingError), func(t *testing.T) {
 			effective, _ := testMasterEffective(t)
 			cfg := effective.Config()
 			cfg.Workers = 2
@@ -151,9 +151,69 @@ func TestMasterRealWorkersReadyAndOrderedDrain(t *testing.T) {
 			instance := NewInstance("proxy", "", "", cfg.Workers)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
+			backgroundCanceled := make(chan struct{})
+			backgroundDone := make(chan struct{})
+			releaseBackground := make(chan struct{})
+			var releaseOnce sync.Once
+			releaseTask := func() { releaseOnce.Do(func() { close(releaseBackground) }) }
+			defer releaseTask()
+			shutdownEntered := make(chan struct{})
+			shutdownErr := errors.New("fixture master extension completion failed")
+			var started context.Context
+			var shutdownDeadline time.Time
+			var masterExtension proxyextension.MasterExtension
+			if !force {
+				masterExtension = &endingMasterExtension{
+					start: func(ctx context.Context, _ proxyextension.MasterHost) error {
+						started = ctx
+						go func() {
+							<-ctx.Done()
+							close(backgroundCanceled)
+							<-releaseBackground
+							close(backgroundDone)
+						}()
+						return nil
+					},
+					shutdown: func(ctx context.Context) error {
+						defer close(shutdownEntered)
+						if started.Err() != context.Canceled {
+							return errors.New("master extension context still live at Shutdown")
+						}
+						instance.mu.Lock()
+						deadline := instance.deadline
+						allEnded := len(instance.workers) == cfg.Workers
+						for _, worker := range instance.workers {
+							allEnded = allEnded && !worker.alive && worker.dataDone && worker.mmdsDone
+						}
+						instance.mu.Unlock()
+						if got, ok := ctx.Deadline(); !ok || !got.Equal(shutdownDeadline) || !deadline.Equal(shutdownDeadline) || !allEnded {
+							return errors.New("master extension Shutdown preceded worker completion or reset deadline")
+						}
+						if _, err := os.Stat(cfg.ShmPath); err != nil {
+							return fmt.Errorf("shared state released before master extension: %w", err)
+						}
+						// Announce callback entry separately from return; the test
+						// releases background completion only after observing it.
+						select {
+						case shutdownEntered <- struct{}{}:
+						case <-ctx.Done():
+							return ctx.Err()
+						}
+						select {
+						case <-backgroundDone:
+						case <-ctx.Done():
+							return ctx.Err()
+						}
+						if scenario.endingError {
+							return shutdownErr
+						}
+						return nil
+					},
+				}
+			}
 			done := make(chan error, 1)
 			go func() {
-				done <- RunMaster(ctx, effective, &Runtime{Logger: testMasterLogger(), ListenerFiles: files, Instance: instance})
+				done <- RunMaster(ctx, effective, &Runtime{Logger: testMasterLogger(), ListenerFiles: files, Instance: instance, MasterExtension: masterExtension})
 			}()
 			wait, stop := context.WithTimeout(context.Background(), 10*time.Second)
 			defer stop()
@@ -221,7 +281,8 @@ func TestMasterRealWorkersReadyAndOrderedDrain(t *testing.T) {
 			if force {
 				budget = 200 * time.Millisecond
 			}
-			instance.requestStop(time.Now().Add(budget))
+			shutdownDeadline = time.Now().Add(budget)
+			instance.requestStop(shutdownDeadline)
 			probe, _ := http.NewRequest("GET", "http://proxy/readyz", nil)
 			unready := doUnixRequest(t, cfg.StatsSocket, probe)
 			unready.Body.Close()
@@ -244,6 +305,16 @@ func TestMasterRealWorkersReadyAndOrderedDrain(t *testing.T) {
 				t.Fatalf("master ended with business inflight: %v", err)
 			default:
 			}
+			if !force && started.Err() != nil {
+				t.Fatal("master extension context canceled while data was inflight")
+			}
+			select {
+			case <-backgroundCanceled:
+				t.Fatal("master extension canceled while data was inflight")
+			case <-shutdownEntered:
+				t.Fatal("master extension Shutdown started while data was inflight")
+			default:
+			}
 			if !force {
 				close(release)
 				released = true
@@ -255,9 +326,22 @@ func TestMasterRealWorkersReadyAndOrderedDrain(t *testing.T) {
 			if force && (err == nil || string(body) != "begin\n") {
 				t.Fatalf("forced close must be visible, body=%q err=%v", body, err)
 			}
+			if !force {
+				select {
+				case <-shutdownEntered:
+				case <-wait.Done():
+					t.Fatal("master extension Shutdown did not run")
+				}
+				select {
+				case err := <-done:
+					t.Fatalf("master returned before extension background completion: %v", err)
+				default:
+				}
+				releaseTask()
+			}
 			select {
 			case err := <-done:
-				if (!force && err != nil) || (force && !errors.Is(err, ErrForcedClose)) {
+				if (!force && !scenario.endingError && err != nil) || ((force || scenario.endingError) && !errors.Is(err, ErrForcedClose)) || (scenario.endingError && !errors.Is(err, shutdownErr)) {
 					instance.mu.Lock()
 					for index, worker := range instance.workers {
 						t.Logf("worker %d pid=%d epoch=%d alive=%v prepared=%v ready=%v dataDone=%v mmdsDone=%v", index, worker.pid, worker.epoch, worker.alive, worker.prepared, worker.ready, worker.dataDone, worker.mmdsDone)
