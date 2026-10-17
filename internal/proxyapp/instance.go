@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 )
 
 func (i *Instance) attachWorker(index int, epoch uint64, peer *controlPeer) bool {
@@ -25,7 +24,7 @@ func (i *Instance) workerExited(index int, epoch uint64, exitErr error) {
 	if i.workers[index].epoch != epoch {
 		return
 	}
-	if i.stopping && i.workers[index].alive && (!i.workers[index].stopped || exitErr != nil) {
+	if i.stopping && i.workers[index].alive && !i.workers[index].stopped {
 		i.err = errors.Join(i.err, ErrForcedClose, exitErr)
 	}
 	i.workers[index].alive = false
@@ -76,15 +75,11 @@ func (i *Instance) workerEvent(index int, epoch uint64, message controlMessage) 
 		w.dataDone = w.dataDone || message.Kind == "data_drained"
 		w.ready = false
 	case "mmds_drained":
-		if !w.dataDone {
-			i.mu.Unlock()
-			return fmt.Errorf("proxy worker MMDS drained before data")
-		}
 		w.mmdsDone = true
 	case "stopped":
-		if !w.mmdsDone {
+		if !w.dataDone || !w.mmdsDone {
 			i.mu.Unlock()
-			return fmt.Errorf("proxy worker stopped before MMDS drained")
+			return fmt.Errorf("proxy worker stopped before endpoints drained")
 		}
 		w.stopped = true
 	default:
@@ -111,46 +106,24 @@ func (i *Instance) workerFinishing(index int, epoch uint64) bool {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	w := i.workers[index]
-	return w.epoch == epoch && i.stopping && w.mmdsDone
+	return w.epoch == epoch && i.stopping && w.dataDone && w.mmdsDone
 }
 
-// drainWorkers enforces a global data barrier before any MMDS listener stops.
-// Dependencies remain live until the caller reaps every worker. Any unresponsive
-// control connection consumes only the original absolute deadline.
+// drainWorkers stops both endpoints independently, then ends workers only
+// after both have drained. The instance shares one deadline across all workers.
 func (i *Instance) drainWorkers() error {
 	i.mu.Lock()
 	deadline := i.deadline
 	i.mu.Unlock()
-	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	ctx, cancel := drainContext(deadline)
 	defer cancel()
-	for _, phase := range []string{"drain_data", "drain_mmds", "stop"} {
-		if phase == "drain_mmds" {
-			i.mu.Lock()
-			i.status.Data = "stopped"
-			gate := i.mmdsGate
-			i.notifyLocked()
-			i.mu.Unlock()
-			if gate != nil {
-				select {
-				case <-gate:
-				case <-ctx.Done():
-					return errors.Join(ErrForcedClose, ctx.Err())
-				}
-			}
-		}
+	for _, phase := range []string{"drain", "stop"} {
 		i.mu.Lock()
 		peers := make([]*controlPeer, 0, len(i.workers))
 		for _, w := range i.workers {
 			if w.alive {
 				peers = append(peers, w.peer)
 			}
-		}
-		if phase == "drain_mmds" {
-			i.status.Data = "stopped"
-			if i.status.MMDS != "disabled" {
-				i.status.MMDS = "draining"
-			}
-			i.notifyLocked()
 		}
 		i.mu.Unlock()
 		// Send independently: an unresponsive worker cannot delay another worker's
@@ -173,7 +146,7 @@ func (i *Instance) drainWorkers() error {
 			i.mu.Lock()
 			complete := true
 			for _, w := range i.workers {
-				if w.alive && ((phase == "drain_data" && !w.dataDone) || (phase == "drain_mmds" && !w.mmdsDone) || phase == "stop") {
+				if w.alive && ((phase == "drain" && (!w.dataDone || !w.mmdsDone)) || phase == "stop") {
 					complete = false
 				}
 			}
@@ -215,8 +188,5 @@ func (i *Instance) remainingContext() (context.Context, context.CancelFunc) {
 	i.mu.Lock()
 	deadline := i.deadline
 	i.mu.Unlock()
-	if deadline.IsZero() {
-		deadline = time.Now()
-	}
-	return context.WithDeadline(context.Background(), deadline)
+	return drainContext(deadline)
 }

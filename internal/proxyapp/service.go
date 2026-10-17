@@ -1,7 +1,6 @@
 package proxyapp
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,7 +12,6 @@ import (
 	"time"
 
 	proxyextension "github.com/kuasar-sandbox/orchestrator/app/proxy/extension"
-	"github.com/kuasar-sandbox/orchestrator/internal/proxycompletion"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
@@ -44,13 +42,6 @@ type Service struct {
 	localDone         chan error
 	localEnded        bool
 	localResult       error
-	localIdentity     *routesync.ProxyInstance
-	completion        routesync.ProxyCompletion
-	completionKey     []byte
-	ownershipRestored bool
-	serviceID         string
-	localGeneration   uint64
-	childGeneration   uint64
 	localExtension    any
 	resources         *retainedResources
 	child             *serviceChild
@@ -58,10 +49,10 @@ type Service struct {
 	target            *restartTarget
 	stopRecord        *stopRecord
 	stopDeadline      time.Time
+	stopRequested     bool
 	stop              chan struct{}
 	stopOnce          sync.Once
-	stopMMDS          chan struct{}
-	stopReleased      sync.Once
+	stopStarted       bool
 	done              chan struct{}
 	changed           chan struct{}
 	requests          chan struct{}
@@ -73,12 +64,16 @@ type Service struct {
 	entryFinished     sync.Once
 	entryErr          error
 	earlyStopAt       time.Time
+	earlyAutomatic    bool
 	closing           bool
 	finished          sync.Once
 	knownService      *Status
 	candidate         bool
 	candidateDeadline time.Time // instance drain received before business starts
 	parent            *serviceWire
+	candidateDialMu   sync.Mutex
+	candidateDialID   uint64
+	configReplies     chan serviceMessage
 	err               error
 	stopErr           error
 	timeout           time.Duration
@@ -91,7 +86,7 @@ func NewService() *Service {
 	// Observe only the private marker; descriptor ownership still starts in
 	// ReceiveContinuation. An early stop must await restoration of B/A-prime's
 	// role and supervision instead of treating it as an unused ordinary App.
-	return &Service{entryPending: ContinuationPresent(), entryReady: make(chan struct{}), stop: make(chan struct{}), done: make(chan struct{}), changed: make(chan struct{}), requests: make(chan struct{}, 1), timeout: 30 * time.Second, coordinatorPID: os.Getpid(), serviceID: newBootID()}
+	return &Service{entryPending: ContinuationPresent(), entryReady: make(chan struct{}), stop: make(chan struct{}), done: make(chan struct{}), changed: make(chan struct{}), requests: make(chan struct{}, 1), coordinatorPID: os.Getpid()}
 }
 
 func (s *Service) notifyLocked() { close(s.changed); s.changed = make(chan struct{}) }
@@ -167,8 +162,9 @@ func (s *Service) WaitReady(ctx context.Context) error {
 
 func (s *Service) result() error { s.mu.Lock(); defer s.mu.Unlock(); return s.err }
 
-// Shutdown requests one bounded stop of the entire service, including B. The
-// first request fixes the deadline; caller cancellation only ends this wait.
+// Shutdown requests graceful stop of the entire service, including B. A positive
+// configured timeout bounds the drain; zero leaves this explicit drain unbounded.
+// The first request fixes the deadline; caller cancellation only ends this wait.
 // Handlers should request shutdown asynchronously rather than wait for themselves.
 func (s *Service) Shutdown(ctx context.Context) error {
 	if ctx == nil {
@@ -221,17 +217,26 @@ func (s *Service) requestShutdown() error {
 	return s.requestShutdownAt(time.Time{})
 }
 
+func (s *Service) requestAutomaticShutdown() error {
+	return s.requestShutdownRequest(time.Time{}, true)
+}
+
 func (s *Service) requestShutdownAt(requestedDeadline time.Time) error {
+	return s.requestShutdownRequest(requestedDeadline, false)
+}
+
+func (s *Service) requestShutdownRequest(requestedDeadline time.Time, automatic bool) error {
 	s.mu.Lock()
 	if s.entryPending {
 		if s.earlyStopAt.IsZero() {
 			s.earlyStopAt = time.Now()
+			s.earlyAutomatic = automatic
 			s.notifyLocked()
 		}
 		ready := s.entryReady
 		s.mu.Unlock()
 		<-ready
-		return s.requestShutdownAt(requestedDeadline)
+		return s.requestShutdownRequest(requestedDeadline, automatic)
 	}
 	if s.entryErr != nil {
 		err := s.entryErr
@@ -251,13 +256,14 @@ func (s *Service) requestShutdownAt(requestedDeadline time.Time) error {
 	}
 	record, timeout, parent, candidate := s.stopRecord, s.timeout, s.parent, s.candidate
 	deadline := s.stopDeadline
-	if deadline.IsZero() {
+	if !s.stopRequested {
 		deadline = requestedDeadline
-		if deadline.IsZero() {
+		if deadline.IsZero() && (automatic || timeout > 0) {
 			deadline = time.Now().Add(timeout)
 		}
 	}
 	if candidate {
+		s.stopRequested = true
 		s.stopDeadline = deadline
 		if s.localDone == nil {
 			s.stopUnstartedLocalLocked()
@@ -280,54 +286,38 @@ func (s *Service) requestShutdownAt(requestedDeadline time.Time) error {
 	// final check, the successor still receives this same durable record.
 	// Keeping mu until the write also excludes releaseService's file close.
 	s.stopDeadline = deadline
+	s.stopRequested = true
 	s.stopOnce.Do(func() { close(s.stop) })
 	s.mu.Unlock()
 	s.beginShutdown(deadline)
 	return nil
 }
 
-// Stop accepting immediately, even when the coordinator is waiting for an
-// earlier drain or cleanup. MMDS stays available behind the shared data barrier.
-func (s *Service) beginShutdown(deadline time.Time) chan struct{} {
-	// A launch which passed its final stop check must publish its child before
-	// either stop initiator freezes the complete service's participant set.
+// Stop both endpoints in each owned instance. Each drains its own accepted
+// work; there is no cross-endpoint or cross-worker request-sequence guarantee.
+func (s *Service) beginShutdown(deadline time.Time) {
 	s.actionMu.Lock()
 	defer s.actionMu.Unlock()
 	s.mu.Lock()
-	if s.closing {
-		if s.stopMMDS == nil {
-			s.stopMMDS = make(chan struct{})
-			close(s.stopMMDS)
-		}
-		gate := s.stopMMDS
+	if s.closing || s.stopStarted {
 		s.mu.Unlock()
-		return gate
+		return
 	}
+	s.stopStarted = true
 	if s.prepareCancel != nil {
 		s.prepareCancel()
 	}
-	if s.stopMMDS != nil {
-		gate := s.stopMMDS
-		s.mu.Unlock()
-		return gate
-	}
-	s.stopMMDS = make(chan struct{})
-	gate, instance, child, done := s.stopMMDS, s.local, s.child, s.localDone
+	instance, child, done := s.local, s.child, s.localDone
 	s.mu.Unlock()
 	if instance != nil && done != nil {
-		instance.mu.Lock()
-		instance.mmdsGate = gate
-		instance.mu.Unlock()
 		instance.requestStop(deadline)
 	}
 	if child != nil {
 		child.mu.Lock()
 		child.draining = true
 		child.mu.Unlock()
-		_ = child.wire.send(serviceMessage{Kind: "drain", Deadline: deadline, HoldMMDS: true})
+		_ = child.wire.send(serviceMessage{Kind: "drain", Deadline: deadline})
 	}
-	go s.releaseShutdownMMDS(deadline, instance, done, child, gate)
-	return gate
 }
 
 func (s *Service) stopping() bool {
@@ -366,13 +356,17 @@ func (s *Service) InplaceRestart(ctx context.Context) (RestartID, error) {
 		s.mu.Unlock()
 		return "", ErrNotReady
 	}
+	if s.timeout <= 0 {
+		s.mu.Unlock()
+		return "", fmt.Errorf("%w: InplaceRestart requires a positive shutdown_timeout", ErrIncompatible)
+	}
 	local, extension, input := s.local, s.localExtension, s.input
 	local.mu.Lock()
 	supported := slices.Contains(local.capabilities, routesync.InplaceRestartV1)
 	local.mu.Unlock()
 	if !supported || !local.extensionCompatible() {
 		s.mu.Unlock()
-		return "", fmt.Errorf("%w: conductor or worker completion contract", ErrIncompatible)
+		return "", fmt.Errorf("%w: conductor or worker shutdown contract", ErrIncompatible)
 	}
 	if extension != nil {
 		if _, ok := extension.(proxyextension.Shutdown); !ok {
@@ -383,6 +377,10 @@ func (s *Service) InplaceRestart(ctx context.Context) (RestartID, error) {
 	if _, err := candidateMetricsAddress(s.baseline.config.MetricsListen); err != nil {
 		s.mu.Unlock()
 		return "", err
+	}
+	if s.baseline.config.MetricsListen != "" && s.resources.Metrics == nil {
+		s.mu.Unlock()
+		return "", fmt.Errorf("%w: configured metrics listener is unavailable", ErrIncompatible)
 	}
 	s.preparing = true
 	s.mu.Unlock()
@@ -460,16 +458,20 @@ func (s *Service) Run(ctx context.Context, input ServiceInput, continuation *Con
 		}
 	}
 	if restoreErr == nil && !s.earlyStopAt.IsZero() {
-		s.stopDeadline = s.earlyStopAt.Add(s.timeout)
+		s.stopRequested = true
+		if s.earlyAutomatic || s.timeout > 0 {
+			s.stopDeadline = s.earlyStopAt.Add(s.timeout)
+		}
 		if !s.candidate {
 			s.stopDeadline, restoreErr = s.stopRecord.request(s.stopDeadline)
 		}
 	}
 	if restoreErr == nil && !s.candidate {
-		s.ownershipRestored = true
 		var deadline time.Time
-		deadline, restoreErr = s.stopRecord.read()
-		if !deadline.IsZero() {
+		var requested bool
+		deadline, requested, restoreErr = s.stopRecord.read()
+		if requested {
+			s.stopRequested = true
 			s.stopDeadline = deadline
 			s.stopOnce.Do(func() { close(s.stop) })
 		}
@@ -487,14 +489,13 @@ func (s *Service) Run(ctx context.Context, input ServiceInput, continuation *Con
 		s.mu.Unlock()
 	}()
 	defer s.releaseService()
-	defer func() { returnErr = errors.Join(returnErr, s.finishServiceRegistration()) }()
 	if continuation != nil {
 		defer continuation.Close()
 	}
 	if restoreErr != nil {
 		// A malformed inherited contract is fatal, unlike retryable application
 		// preparation. Finish any restored child without abandoning supervision.
-		return errors.Join(restoreErr, s.reapChild(s.child, time.Now().Add(s.timeout), false))
+		return errors.Join(restoreErr, s.reapChild(s.child, time.Now().Add(s.timeout)))
 	}
 	if s.candidate {
 		return s.runCandidate(ctx)
@@ -508,7 +509,7 @@ func (s *Service) Run(ctx context.Context, input ServiceInput, continuation *Con
 	go func() {
 		select {
 		case <-ctx.Done():
-			_ = s.requestShutdown()
+			_ = s.requestAutomaticShutdown()
 		case <-watchDone:
 		}
 	}()
@@ -540,7 +541,7 @@ func (s *Service) Run(ctx context.Context, input ServiceInput, continuation *Con
 			s.mu.Lock()
 			s.localEnded, s.localResult = true, err
 			s.mu.Unlock()
-			return errors.Join(err, s.finishLocalRegistration())
+			return err
 		}
 	}
 }
@@ -553,7 +554,7 @@ func (s *Service) startLocal(ctx context.Context, boot, id string, resources *re
 	}
 	if s.localDone != nil {
 		s.mu.Unlock()
-		return fmt.Errorf("previous local instance has not completed retirement")
+		return fmt.Errorf("previous local instance has not ended")
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	s.prepareCancel = cancel
@@ -610,9 +611,9 @@ func (s *Service) startLocal(ctx context.Context, boot, id string, resources *re
 	}
 	if s.baseline == nil {
 		s.baseline = startup.Effective
-	} else if !bytes.Equal(s.baseline.raw, startup.Effective.raw) {
+	} else if !compatibleTakeover(s.baseline.config, startup.Effective.config) {
 		s.mu.Unlock()
-		return fmt.Errorf("%w: Configure changed the accepted declarative configuration", ErrIncompatible)
+		return fmt.Errorf("%w: Configure changed a required takeover setting", ErrIncompatible)
 	}
 	config := startup.Effective.Config()
 	if s.candidate {
@@ -630,26 +631,13 @@ func (s *Service) startLocal(ctx context.Context, boot, id string, resources *re
 		operation = s.operation.ID
 	}
 	instance := NewInstance(id, boot, operation, config.Workers)
-	identity := routesync.ProxyInstance{ServiceID: s.serviceID, BootID: instance.identity.BootID, Slot: "coordinator", CoordinatorPID: s.coordinatorPID}
-	if s.candidate {
-		identity.Slot, identity.Generation = "candidate", s.childGeneration
-	} else {
-		s.localGeneration++
-		identity.Generation = s.localGeneration
-	}
-	if !s.candidate && s.completion.Path == "" {
-		s.completion, s.completionKey, err = proxycompletion.Create(config.StatsSocket, identity)
-		if err != nil {
-			s.mu.Unlock()
-			return err
-		}
-	}
-	identity.Completion = s.completion
-	s.localIdentity = &identity
 	s.localEnded, s.localResult = false, nil
-	startup.Runtime.statsIdentity = &identity
 	instance.statusProvider = s.Status
 	startup.Runtime.Instance = instance
+	startup.Runtime.inplaceRestart = s.restarting
+	if s.candidate {
+		startup.Runtime.candidateDial = s.dialCandidateConfig
+	}
 	startup.Runtime.inherited = resources
 	startup.Runtime.retain = func(retained *retainedResources) error {
 		s.mu.Lock()
@@ -681,7 +669,7 @@ func (s *Service) startLocal(ctx context.Context, boot, id string, resources *re
 }
 
 // An unstarted candidate has no data/MMDS work to protect. Cancel its
-// preparation, but let an already-running B follow A's shared MMDS barrier.
+// preparation; an already-running B drains its own accepted work.
 func (s *Service) stopUnstartedLocalLocked() {
 	s.stopOnce.Do(func() { close(s.stop) })
 	if s.prepareCancel != nil {
@@ -694,11 +682,11 @@ func (s *Service) checkLocalStartLocked() error {
 		return ErrStopped
 	}
 	if s.candidate {
-		deadline, err := s.stopRecord.read()
+		_, requested, err := s.stopRecord.read()
 		if err != nil {
 			return err
 		}
-		if !s.stopDeadline.IsZero() || !deadline.IsZero() {
+		if s.stopRequested || requested {
 			s.stopUnstartedLocalLocked()
 			return ErrStopped
 		}
@@ -801,4 +789,12 @@ func (s *Service) operationLogLocked() func() {
 			"next_attempt", op.NextAttempt, "result", op.Result,
 			"forced_close_count", op.ForcedCloseCount)
 	}
+}
+
+// B is always transitional. A and A-prime expose the accepted operation until
+// its cleanup has finished; this does not promise complete cross-instance stats.
+func (s *Service) restarting() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.candidate || (s.operation != nil && s.operation.Result == "")
 }

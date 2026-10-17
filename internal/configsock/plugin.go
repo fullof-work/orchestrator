@@ -35,13 +35,10 @@ type Plugin struct {
 // register and Removes on disconnect. It also coordinates the trusted Proxy
 // route barrier and exposes that registration's traffic-stats socket.
 type Registry struct {
-	mu          sync.Mutex
-	m           map[string]*Plugin
-	nextEpoch   uint64
-	barriers    map[string]*proxyRouteBarrier
-	obligations map[string]routesync.ProxyStatsRecord
-	storage     ProxyStatsStore
-	kernelBoot  string
+	mu        sync.Mutex
+	m         map[string]*Plugin
+	nextEpoch uint64
+	barriers  map[string]*proxyRouteBarrier
 }
 
 var (
@@ -51,18 +48,14 @@ var (
 )
 
 func NewRegistry() *Registry {
-	return &Registry{m: map[string]*Plugin{}, barriers: map[string]*proxyRouteBarrier{}, obligations: map[string]routesync.ProxyStatsRecord{}}
+	return &Registry{m: map[string]*Plugin{}, barriers: map[string]*proxyRouteBarrier{}}
 }
 
 // Add registers p, evicting (and closing the stream of) any existing registration
 // with the same id — a re-register deregisters the prior. The lock serializes this
 // against the evicted plugin's Remove, so the successor is never dropped.
-func (r *Registry) Add(p *Plugin) error {
+func (r *Registry) Add(p *Plugin) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if err := r.admitObligationLocked(p); err != nil {
-		return err
-	}
 	if old := r.m[p.ID]; old != nil && old != p {
 		r.failBarriersLocked(old, ErrProxyRouteLeaseChanged)
 		if old.revoke != nil {
@@ -80,7 +73,7 @@ func (r *Registry) Add(p *Plugin) error {
 	}
 	p.lease, p.revoke = context.WithCancel(p.lease)
 	r.m[p.ID] = p
-	return nil
+	r.mu.Unlock()
 }
 
 // Remove deregisters p only if it is still the current registration for its id, so
@@ -284,70 +277,31 @@ func (b *proxyRouteBarrier) failLocked(err error) {
 	b.signalLocked()
 }
 
-// ProxyStatsTarget returns the master-only stats endpoint from the current
-// trusted proxy registration. The registration connection remains its lease.
+// ProxyStatsTarget returns one live admitted Proxy's statistics. Prefer the
+// ordinary registration while it exists; B can answer during the exec gap.
+// The returned snapshot is instance-local, with its InplaceRestart flag telling
+// consumers when it cannot be treated as complete service traffic.
 func (r *Registry) ProxyStatsTarget() (string, bool) {
-	targets, ok := r.ProxyStatsTargets()
-	if !ok || len(targets) != 1 {
-		return "", false
-	}
-	return targets[0].Socket, true
-}
-
-// ProxyStatsRegistration captures an endpoint and its exact registration epoch.
-// Reading all captured endpoints and rechecking this set prevents mixed leases.
-type ProxyStatsRegistration struct {
-	InstanceID string
-	Epoch      uint64
-	Socket     string
-	BootID     string
-}
-
-func (r *Registry) ProxyStatsTargets() ([]ProxyStatsRegistration, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.consumeCompletionsLocked()
-	var targets []ProxyStatsRegistration
-	seen := map[string]bool{}
-	// A lost registration or conductor restart does not prove that its workers
-	// stopped. Every durable obligation must have the exact live incarnation.
-	for _, record := range r.obligations {
-		if record.Retired {
-			continue
-		}
-		current := r.m[record.InstanceID]
-		if current == nil || current.Caps.Proxy == nil || current.Caps.Proxy.Instance == nil || *current.Caps.Proxy.Instance != record.Identity || current.peerPID != record.PeerPID {
-			return nil, false
-		}
-	}
+	var selected *Plugin
 	for _, p := range r.m {
 		if p.Caps.Proxy == nil {
 			continue
 		}
-		boot := ""
-		if identity := p.Caps.Proxy.Instance; identity != nil {
-			if r.obligations[identity.Key()].Retired {
-				continue
-			}
-			boot = identity.BootID
-		}
 		endpoint := p.Caps.Proxy.StatsSocket
-		if endpoint == nil || endpoint.Path == "" || seen[endpoint.Path] {
-			return nil, false
+		if endpoint == nil || !validLocalSocket(endpoint.Path) {
+			continue
 		}
-		seen[endpoint.Path] = true
-		targets = append(targets, ProxyStatsRegistration{InstanceID: p.ID, Epoch: p.epoch, Socket: endpoint.Path, BootID: boot})
+		if selected == nil || p.ID == routesync.ProxyPluginID ||
+			(selected.ID != routesync.ProxyPluginID && p.epoch > selected.epoch) {
+			selected = p
+		}
 	}
-	slices.SortFunc(targets, func(a, b ProxyStatsRegistration) int {
-		if a.InstanceID < b.InstanceID {
-			return -1
-		}
-		if a.InstanceID > b.InstanceID {
-			return 1
-		}
-		return 0
-	})
-	return targets, len(targets) != 0
+	if selected == nil {
+		return "", false
+	}
+	return selected.Caps.Proxy.StatsSocket.Path, true
 }
 
 // handlePluginRegister authenticates the subscriber (plugin_pidfile / socket perms),
@@ -383,21 +337,13 @@ func (s *Server) handlePluginRegister(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	p := &Plugin{ID: id, Caps: reg, peerPID: peer, cancel: cancel, lease: ctx}
-	if err := s.deps.Plugins.Add(p); err != nil {
-		http.Error(w, "proxy registration identity unavailable", http.StatusConflict)
-		return
-	}
+	s.deps.Plugins.Add(p)
 	defer s.deps.Plugins.Remove(p)
 	s.log.Info("plugin registered", "id", id, "subscribe", reg.SubscribeKind(), "proxy", reg.Proxy != nil, "mmds", reg.Mmds)
 	hooks := &routesync.StreamHooks{
-		ProxyCapabilities: []string{routesync.ProxyCompletionV1},
+		ProxyCapabilities: []string{routesync.InplaceRestartV1},
 		RouteStreamReady:  func() { s.deps.Plugins.markRouteStreamReady(p) },
 		RouteBarrierAck:   func(barrierID string) { s.deps.Plugins.routeBarrierAck(p, barrierID) },
-	}
-	// A static PID allowlist cannot authorize the not-yet-created candidate.
-	// Preserve that gate and reject restart during preflight, before launching B.
-	if s.deps.PluginPidfile == "" {
-		hooks.ProxyCapabilities = append(hooks.ProxyCapabilities, routesync.InplaceRestartV1)
 	}
 	routesync.ServeStream(ctx, w, r.Body, s.deps.RouteSource, reg, hooks, s.log)
 	s.log.Info("plugin deregistered", "id", id)

@@ -192,7 +192,7 @@ func (worker *PreparedWorker) Run(ctx context.Context, runtime *Runtime) (return
 		endOnce.Do(func() {
 			cancelWorker()
 			if extensionStarted {
-				work, cancel := context.WithDeadline(context.Background(), deadline)
+				work, cancel := drainContext(deadline)
 				defer cancel()
 				endErr = shutdownExtension(work, runtime.WorkerExtension)
 			}
@@ -411,7 +411,7 @@ func (worker *PreparedWorker) serveControlled(ctx context.Context, endExtension 
 		go func() {
 			var err error
 			if server != nil {
-				work, stop := context.WithDeadline(context.Background(), deadline)
+				work, stop := drainContext(deadline)
 				_ = server.Drain(work)
 				err = server.Drain(context.Background()) // Await the actual forced-close result.
 				stop()
@@ -429,7 +429,7 @@ func (worker *PreparedWorker) serveControlled(ctx context.Context, endExtension 
 			if result.err != nil {
 				return result.err
 			}
-			if !dataDraining {
+			if (result.endpoint == "data" && !dataDraining) || (result.endpoint == "mmds" && !mmdsDraining) {
 				return fmt.Errorf("proxy ingress exited before drain")
 			}
 			if result.endpoint == "data" {
@@ -479,28 +479,17 @@ func (worker *PreparedWorker) serveControlled(ctx context.Context, endExtension 
 				if metadata != nil {
 					go func() { errorsFromServe <- serveResult{"mmds", metadata.Serve(worker.mmds)} }()
 				}
-			case "drain_data":
+			case "drain":
 				if dataDraining {
 					continue
 				}
-				if e.message.Deadline.IsZero() {
-					return fmt.Errorf("proxy worker drain requires deadline")
-				}
 				deadline = e.message.Deadline
-				dataDraining = true
+				dataDraining, mmdsDraining = true, true
 				startDrain(data, "data_drained")
-			case "drain_mmds":
-				if mmdsDraining {
-					continue
-				}
-				if !dataDone {
-					return fmt.Errorf("proxy worker MMDS drain before data completed")
-				}
-				mmdsDraining = true
 				startDrain(metadata, "mmds_drained")
 			case "stop":
-				if !mmdsDone {
-					return fmt.Errorf("proxy worker stop before MMDS completed")
+				if !dataDone || !mmdsDone {
+					return fmt.Errorf("proxy worker stop before endpoints completed")
 				}
 				drainErr = errors.Join(drainErr, endExtension(deadline))
 				message := controlMessage{Kind: "stopped", Forced: errors.Is(drainErr, ErrForcedClose)}
@@ -525,12 +514,11 @@ func shutdownExtension(ctx context.Context, extension any) error {
 	go func() { result <- ending.Shutdown(ctx) }()
 	select {
 	case err := <-result:
-		if err != nil {
-			return errors.Join(ErrForcedClose, err)
-		}
-		return nil
+		return err
 	case <-ctx.Done():
-		return errors.Join(ErrForcedClose, ctx.Err())
+		// Ending this wait cannot forcibly terminate an extension goroutine.
+		// Connection/process owners report actual forced closure separately.
+		return ctx.Err()
 	}
 }
 

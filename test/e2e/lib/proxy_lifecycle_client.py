@@ -77,6 +77,11 @@ class Probe:
     def main_pid(self):
         return int(subprocess.check_output(['systemctl', 'show', '--value', '-p', 'MainPID', self.config['unit']], text=True))
 
+    def check_pid_admission(self):
+        admitted = Path(self.config['plugin_pidfile']).read_text().split()
+        assert admitted == [str(self.pid)], admitted
+        self.log(kind='pid_admission', main_pid=self.pid, admitted=admitted)
+
     def management(self, path='/status', method='GET', endpoint=None):
         connection = UnixHTTP(endpoint or self.stats, timeout=2)
         try:
@@ -161,93 +166,22 @@ class Probe:
             self.log(kind='resources', pids=pids, rss_kib=rss, fds=fds)
             self.stop.wait(.02)
 
-    def connection_inodes(self, local_port, remote_port=None, namespace=None):
-        command = ['cat', '/proc/net/tcp', '/proc/net/tcp6']
-        if namespace:
-            command = ['ip', 'netns', 'exec', namespace] + command
-        inodes = set()
-        for row in subprocess.check_output(command, text=True).splitlines():
-            fields = row.split()
-            if len(fields) > 9 and fields[0].rstrip(':').isdigit() and \
-                    (fields[3] == '01' if remote_port is not None else fields[3] != '0A') and \
-                    int(fields[1].rsplit(':', 1)[1], 16) == int(local_port) and \
-                    (remote_port is None or int(fields[2].rsplit(':', 1)[1], 16) == int(remote_port)):
-                inodes.add('socket:[' + fields[9] + ']')
-        return inodes
-
-    def socket_worker(self, local_port, remote_port, namespace=None):
-        """Resolve this established TCP connection, never the shared listener."""
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline:
-            inodes = self.connection_inodes(local_port, remote_port, namespace)
-            owners = set()
-            for pid in (self.cgroup / 'cgroup.procs').read_text().split():
-                for fd in Path('/proc', pid, 'fd').glob('*'):
-                    try:
-                        if os.readlink(fd) in inodes:
-                            owners.add(int(pid))
-                    except FileNotFoundError:
-                        pass
-            if len(owners) == 1:
-                return owners.pop()
-            time.sleep(.01)
-        raise AssertionError(f'cannot resolve connection owner: {local_port=} {remote_port=} {namespace=} {owners=}')
-
-    def wait_no_data(self, worker):
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline:
-            assert Path('/proc', str(worker)).exists(), 'MMDS worker ended before the data barrier'
-            inodes = self.connection_inodes(self.config['port'])
-            active = []
-            for fd in Path('/proc', str(worker), 'fd').glob('*'):
-                try:
-                    if os.readlink(fd) in inodes:
-                        active.append(str(fd))
-                except FileNotFoundError:
-                    pass
-            if not active:
-                # Socket ownership is observable here; do not label it as an
-                # internal worker data_drained control acknowledgment.
-                self.log(kind='worker_no_open_data_socket_before_mmds', worker=worker)
-                return
-            time.sleep(.01)
-        raise AssertionError(f'MMDS worker still owns data connections: {active}')
-
-    def finite_once(self, key):
+    def finite(self, key):
         # One Guest serves every entry/source combination. Never reuse a released
         # request key from a previous mode or accepted operation.
         key = f'{self.initial_pid}-{time.monotonic_ns()}-{key}'
         connection, headers = self.connection()
         connection.request('GET', '/finite?id=' + key, headers=headers)
-        data_port = connection.sock.getsockname()[1]
         response = connection.getresponse()
         assert response.status == 200 and response.read(6) == b'begin\n'
-        data_worker = self.socket_worker(self.config['port'], data_port)
-        mmds_worker = self.socket_worker(self.config['mmds_port'], response.getheader('X-MMDS-Source-Port'), self.config['proxy_netns'])
-        def parent(pid):
-            return int(next(line.split()[1] for line in Path('/proc', str(pid), 'status').read_text().splitlines()
-                            if line.startswith('PPid:')))
-        data_parent, mmds_parent = parent(data_worker), parent(mmds_worker)
         # An existing CONNECT remains usable after complete service shutdown
         # has stopped new data admission. It releases the Guest barrier without
         # depending on a new request through a replacement instance.
         control = http.client.HTTPConnection('guest', timeout=10)
-        for attempt in range(32):
-            control.sock = self.open_tunnel()
-            control_worker = self.socket_worker(self.config['port'], control.sock.getsockname()[1])
-            self.log(kind='release_tunnel_setup', attempt=attempt, worker=control_worker)
-            if control_worker == data_worker:
-                break
-            control.close()
-        else:
-            raise AssertionError('could not place release tunnel on the data worker')
-        self.log(kind='finite_workers', request=key, data_worker=data_worker, mmds_worker=mmds_worker,
-                 data_parent=data_parent, mmds_parent=mmds_parent)
+        control.sock = self.open_tunnel()
 
-        def complete(verify_drained=False):
+        def complete():
             try:
-                if verify_drained:
-                    self.wait_no_data(mmds_worker)
                 control.request('GET', '/release?id=' + key, headers={'Connection': 'close'})
                 released = control.getresponse()
                 assert released.status == 204
@@ -256,22 +190,14 @@ class Probe:
             finally:
                 control.close()
                 connection.close()
-            assert body == b'mmds-ok\ncomplete\n', body
-            self.log(kind='finite_complete', request=key, mmds=True, sid=self.config['sid'],
-                     data_worker=data_worker, mmds_worker=mmds_worker)
-        # An idle MMDS connection in A may legitimately close once all A data
-        # has ended. Select two workers of the same instance for this barrier.
-        return complete, data_worker != mmds_worker and data_parent == mmds_parent
+            assert body == b'complete\n', body
+            self.log(kind='finite_complete', request=key, sid=self.config['sid'])
+        return complete
 
-    def finite(self, key):
-        # This is setup distribution across shared listeners, not a request
-        # retry: every setup request must complete successfully and is logged.
-        for attempt in range(32):
-            complete, cross_worker = self.finite_once(f'{key}-{attempt}')
-            if cross_worker:
-                return lambda: complete(verify_drained=True)
-            complete()
-        raise AssertionError('could not establish a cross-worker data-to-MMDS request')
+    def metadata(self):
+        code, body = self.get('/metadata')
+        assert code == 200 and body == b'healthy\n', (code, body)
+        self.log(kind='guest_mmds_complete', sid=self.config['sid'])
 
     def websocket(self):
         connection = socket.create_connection(('127.0.0.1', self.config['port']), timeout=15)
@@ -328,7 +254,7 @@ class Probe:
         else:
             os.kill(self.pid, signal.SIGUSR1 if self.config['entry'] == 'app' else signal.SIGUSR2)
 
-    def check_aggregate(self):
+    def check_restart_flag(self, expected):
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             connection = http.client.HTTPConnection('127.0.0.1', int(self.config['api_port']), timeout=2)
@@ -337,14 +263,13 @@ class Probe:
                                    headers={'Host': 'api.' + self.config['domain'], 'X-API-KEY': self.config['api_key']})
                 response = connection.getresponse()
                 body = json.loads(response.read())
-                if response.status == 200 and body['inflight']['connected'] >= 6:
-                    assert 'idleSince' not in body
-                    self.log(kind='both_instances_busy', traffic=body)
+                self.log(kind='restart_flag_observation', status=response.status, traffic=body)
+                if response.status == 200 and body.get('inplaceRestart', False) == expected:
                     return
             finally:
                 connection.close()
             time.sleep(.02)
-        raise AssertionError('conductor did not count both instances with three held requests each')
+        raise AssertionError(f'conductor did not report inplaceRestart={expected}')
 
     def stable_resources(self):
         # Stop only between completed operations. Each takeover retains the
@@ -400,10 +325,12 @@ class Probe:
         operation = prepared['inplace_restart']['id']
         candidate = prepared['instances'][1]
         assert candidate['ready'] and candidate['pid'] != self.pid
+        self.check_pid_admission()
         assert digest(f"/proc/{candidate['pid']}/exe") == target_digest
         assert self.management('/readyz')[0] == 503
         completions_b = [self.finite(f'{index}-b'), self.websocket(), self.tunnel()]
-        self.check_aggregate()
+        self.check_restart_flag(True)
+        self.metadata()
         if index == 0:
             # An accepted target/input must survive later deployment changes.
             self.deploy(self.config['initial'])
@@ -430,6 +357,7 @@ class Probe:
             s['inplace_restart']['phase'] == 'draining_b')
         assert successor['pid'] == self.initial_pid == self.main_pid()
         assert digest(f'/proc/{self.pid}/exe') == target_digest
+        self.metadata()
         for complete in reversed(completions_b):
             complete()
         result = self.wait_status(lambda s: s['inplace_restart']['id'] == operation and s['inplace_restart'].get('result'))
@@ -442,6 +370,7 @@ class Probe:
         config_path.write_bytes(original_config)
         self.deploy(self.config['target'])
         self.check_ready()
+        self.check_restart_flag(False)
         self.stable_resources()
         self.log(kind='operation_complete', id=operation, target_sha256=target_digest,
                  main_pid=self.pid, result=result['inplace_restart'], stable_fds=self.stable_fds[-1])
@@ -482,6 +411,7 @@ class Probe:
 
     def run(self):
         self.wait_status(lambda s: s['ready'])
+        self.check_pid_admission()
         self.check_ready()
         self.log(kind='start', entry=self.config['entry'], source=self.config['source'],
                  initial_sha256=digest(f'/proc/{self.pid}/exe'), target_sha256=digest(self.config['target']))
@@ -497,6 +427,7 @@ class Probe:
                 self.pid = self.main_pid()
                 assert self.pid != previous
                 self.wait_status(lambda s: s['ready'])
+                self.check_pid_admission()
                 self.check_ready()
                 self.log(kind='ordinary_service_restart', previous=previous, current=self.pid)
             assert self.stable_fds[-1] <= self.stable_fds[0], self.stable_fds

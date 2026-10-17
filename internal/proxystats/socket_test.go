@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -100,6 +101,8 @@ func TestStatsServerRequiresReadySyncedExactRouteIdentity(t *testing.T) {
 
 func TestQuerySocketRoundTrip(t *testing.T) {
 	master := NewMasterStats(metrics.New(), []string{"w0"})
+	var restarting atomic.Bool
+	master.InplaceRestart = restarting.Load
 	readyWorker(t, master, "w0", 1)
 	socket := filepath.Join(t.TempDir(), "stats.sock")
 	listener, err := net.Listen("unix", socket)
@@ -112,7 +115,6 @@ func TestQuerySocketRoundTrip(t *testing.T) {
 		return RouteIdentity{RunID: "run-1", Profile: types.ProfileE2B, State: types.StateRunning}, sandboxID == "s1"
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	done := make(chan error, 1)
-	server.BootID = "actual-instance"
 	go func() { done <- server.Serve(ctx, listener) }()
 
 	results, err := QuerySocket(context.Background(), socket, []TrafficQuery{{
@@ -124,12 +126,15 @@ func TestQuerySocketRoundTrip(t *testing.T) {
 	if len(results) != 1 || results[0].Stats == nil || len(results[0].Stats.Services) != 4 {
 		t.Fatalf("query results = %+v", results)
 	}
-	query := []TrafficQuery{{SandboxID: "s1", RunID: "run-1", Profile: types.ProfileE2B, State: types.StateRunning}}
-	if _, err := QueryInstanceSocket(ctx, socket, "actual-instance", query); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := QueryInstanceSocket(ctx, socket, "different-instance", query); !errors.Is(err, api.ErrStatsUnavailable) {
-		t.Fatalf("accepted another BootID: %v", err)
+	for _, active := range []bool{true, false} {
+		restarting.Store(active)
+		results, err := QuerySocket(ctx, socket, []TrafficQuery{{SandboxID: "s1", RunID: "run-1", Profile: types.ProfileE2B, State: types.StateRunning}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if results[0].Stats.InplaceRestart != active {
+			t.Fatalf("restart flag=%v want=%v", results[0].Stats.InplaceRestart, active)
+		}
 	}
 	cancel()
 	select {

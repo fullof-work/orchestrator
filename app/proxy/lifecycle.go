@@ -39,7 +39,8 @@ func (a *App) Status() Status {
 }
 
 // Shutdown stops the whole service, including its temporary replacement. The
-// first call fixes the configured budget; later calls do not extend it. A caller
+// first call fixes the configured budget; zero leaves this explicit graceful
+// drain without a deadline. Later calls do not extend it. A caller
 // timeout ends only that wait. ErrForcedClose distinguishes forced completion.
 // A business handler must not wait indefinitely for its own drain to finish.
 func (a *App) Shutdown(ctx context.Context) error {
@@ -51,7 +52,8 @@ func (a *App) Shutdown(ctx context.Context) error {
 
 // InplaceRestart accepts an original-PID replacement operation independently of
 // the inplace_restart signal setting. Cancellation before acceptance aborts the
-// request; afterwards the engine continues. Observe Status for completion: the
+// request. A positive shutdown_timeout is required for either trigger. After
+// acceptance the engine continues. Observe Status for completion: the
 // original Go caller stack does not survive exec. Concurrent operations return
 // ErrRestartInProgress; candidates and workers cannot start nested operations.
 func (a *App) InplaceRestart(ctx context.Context) (RestartID, error) {

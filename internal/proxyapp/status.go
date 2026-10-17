@@ -98,7 +98,6 @@ type Instance struct {
 	capabilitiesKnown bool
 	statusProvider    func() Status
 	// A full-service stop may hold MMDS until every instance has drained data.
-	mmdsGate <-chan struct{}
 }
 
 func newBootID() string {
@@ -153,6 +152,17 @@ func (i *Instance) recalculateLocked() {
 	i.status.Ready = i.initialized && len(i.status.Reasons) == 0
 	if i.stopping {
 		i.status.Phase = "draining"
+		dataDone, mmdsDone := true, true
+		for _, w := range i.workers {
+			dataDone = dataDone && (!w.alive || w.dataDone)
+			mmdsDone = mmdsDone && (!w.alive || w.mmdsDone)
+		}
+		if dataDone {
+			i.status.Data = "stopped"
+		}
+		if mmdsDone && i.status.MMDS != "disabled" {
+			i.status.MMDS = "stopped"
+		}
 		return
 	}
 	if i.initialized && prepared && i.status.Phase == "starting" {
@@ -219,6 +229,9 @@ func (i *Instance) requestStop(deadline time.Time) {
 	i.stopping = true
 	i.deadline = deadline
 	i.status.Data = "draining"
+	if i.status.MMDS != "disabled" {
+		i.status.MMDS = "draining"
+	}
 	i.recalculateLocked()
 	close(i.stop)
 	i.notifyLocked()

@@ -11,12 +11,13 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	proxyextension "github.com/kuasar-sandbox/orchestrator/app/proxy/extension"
-	"github.com/kuasar-sandbox/orchestrator/internal/proxycompletion"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
@@ -109,7 +110,7 @@ func (*lifecycleFixtureExtension) WrapIngress(next http.Handler) http.Handler {
 	})
 }
 
-func TestMasterRealWorkersReadyAndOrderedDrain(t *testing.T) {
+func TestMasterRealWorkersReadyAndIndependentDrain(t *testing.T) {
 	for _, scenario := range []struct{ metadata, force, endingError bool }{{false, false, false}, {true, false, false}, {true, true, false}, {true, false, true}} {
 		metadata, force := scenario.metadata, scenario.force
 		t.Run(fmt.Sprintf("mmds-%v-forced-%v-extension-error-%v", metadata, force, scenario.endingError), func(t *testing.T) {
@@ -281,6 +282,17 @@ func TestMasterRealWorkersReadyAndOrderedDrain(t *testing.T) {
 			if force {
 				budget = 200 * time.Millisecond
 			}
+			if metadata {
+				request, _ := http.NewRequest("PUT", "http://"+metadataListener.Addr().String()+"/latest/api/token", nil)
+				response, err := client.Do(request)
+				if err != nil {
+					t.Fatalf("MMDS unavailable before drain: %v", err)
+				}
+				response.Body.Close()
+				if response.StatusCode != 400 {
+					t.Fatalf("MMDS protocol response=%d", response.StatusCode)
+				}
+			}
 			shutdownDeadline = time.Now().Add(budget)
 			instance.requestStop(shutdownDeadline)
 			probe, _ := http.NewRequest("GET", "http://proxy/readyz", nil)
@@ -289,17 +301,7 @@ func TestMasterRealWorkersReadyAndOrderedDrain(t *testing.T) {
 			if unready.StatusCode != 503 {
 				t.Fatalf("draining ready=%d", unready.StatusCode)
 			}
-			if metadata {
-				request, _ := http.NewRequest("PUT", "http://"+metadataListener.Addr().String()+"/latest/api/token", nil)
-				response, err := client.Do(request)
-				if err != nil {
-					t.Fatalf("MMDS lost during data drain: %v", err)
-				}
-				response.Body.Close()
-				if response.StatusCode != 400 {
-					t.Fatalf("MMDS protocol response=%d", response.StatusCode)
-				}
-			}
+
 			select {
 			case err := <-done:
 				t.Fatalf("master ended with business inflight: %v", err)
@@ -314,6 +316,24 @@ func TestMasterRealWorkersReadyAndOrderedDrain(t *testing.T) {
 			case <-shutdownEntered:
 				t.Fatal("master extension Shutdown started while data was inflight")
 			default:
+			}
+			if metadata && !force {
+				for {
+					instance.mu.Lock()
+					status, changed := instance.status, instance.changed
+					instance.mu.Unlock()
+					if status.MMDS == "stopped" {
+						if status.Data != "draining" {
+							t.Fatalf("data ended before release: %+v", status)
+						}
+						break
+					}
+					select {
+					case <-changed:
+					case <-wait.Done():
+						t.Fatal("MMDS drain waited for another endpoint's work")
+					}
+				}
 			}
 			if !force {
 				close(release)
@@ -341,7 +361,7 @@ func TestMasterRealWorkersReadyAndOrderedDrain(t *testing.T) {
 			}
 			select {
 			case err := <-done:
-				if (!force && !scenario.endingError && err != nil) || ((force || scenario.endingError) && !errors.Is(err, ErrForcedClose)) || (scenario.endingError && !errors.Is(err, shutdownErr)) {
+				if (!force && !scenario.endingError && err != nil) || (errors.Is(err, ErrForcedClose) != force) || (scenario.endingError && !errors.Is(err, shutdownErr)) {
 					instance.mu.Lock()
 					for index, worker := range instance.workers {
 						t.Logf("worker %d pid=%d epoch=%d alive=%v prepared=%v ready=%v dataDone=%v mmdsDone=%v", index, worker.pid, worker.epoch, worker.alive, worker.prepared, worker.ready, worker.dataDone, worker.mmdsDone)
@@ -386,18 +406,18 @@ func TestMasterRealWorkersReadyAndOrderedDrain(t *testing.T) {
 }
 
 type routeFixtureOptions struct {
-	legacy         bool
-	completionOnly bool
-	retirement     *fixtureRetirementFailure
+	legacy          bool
+	pidfile         string
+	metadataService string
+	route           *routesync.RouteEntry
 }
 
-func serveFixtureRoutes(t *testing.T, socket string, metadata bool, options ...routeFixtureOptions) func() {
+func serveFixtureRoutes(t *testing.T, socket string, metadata bool, options ...routeFixtureOptions) func(string) <-chan struct{} {
 	t.Helper()
 	capabilities := []string{routesync.InplaceRestartV1}
 	if len(options) != 0 && options[0].legacy {
 		capabilities = nil
-	} else if len(options) != 0 && options[0].completionOnly {
-		capabilities = []string{routesync.ProxyCompletionV1}
+
 	}
 	if err := os.MkdirAll(filepath.Dir(socket), 0700); err != nil {
 		t.Fatal(err)
@@ -406,65 +426,71 @@ func serveFixtureRoutes(t *testing.T, socket string, metadata bool, options ...r
 	if err != nil {
 		t.Fatal(err)
 	}
-	var registrationsMu sync.Mutex
-	registrations := map[string]routesync.ProxyInstance{}
-	consume := func() {
-		registrationsMu.Lock()
-		defer registrationsMu.Unlock()
-		for _, identity := range registrations {
-			if complete, err := proxycompletion.Verify(identity); err == nil && complete {
-				if err := proxycompletion.Remove(identity); err != nil {
-					t.Error(err)
-				}
-			}
-		}
-	}
+	type connectionKey struct{}
+	var sessionsMu sync.Mutex
+	sessions := map[string]net.Conn{}
+	reconnects := map[string]chan struct{}{}
 	server := &http.Server{Handler: h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == routesync.ProxyRetirePath {
-			if len(options) != 0 && options[0].legacy {
-				http.NotFound(w, r)
+		conn := r.Context().Value(connectionKey{}).(*net.UnixConn)
+		if len(options) != 0 && options[0].pidfile != "" {
+			allowed, err := os.ReadFile(options[0].pidfile)
+			pid, parseErr := strconv.Atoi(strings.TrimSpace(string(allowed)))
+			var peer *unix.Ucred
+			raw, rawErr := conn.SyscallConn()
+			if rawErr == nil {
+				rawErr = raw.Control(func(fd uintptr) { peer, _ = unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED) })
+			}
+			if err != nil || parseErr != nil || rawErr != nil || peer == nil || int(peer.Pid) != pid {
+				http.Error(w, "PID not admitted", http.StatusForbidden)
 				return
 			}
-			var identity routesync.ProxyInstance
-			if json.NewDecoder(r.Body).Decode(&identity) != nil {
-				w.WriteHeader(http.StatusBadRequest)
-				return
-			}
-			if len(options) != 0 && options[0].retirement != nil && identity.Slot == "candidate" && options[0].retirement.reject() {
-				w.WriteHeader(http.StatusServiceUnavailable)
-				return
-			}
-			if complete, err := proxycompletion.Verify(identity); err == nil && complete {
-				if err := proxycompletion.Remove(identity); err != nil {
-					w.WriteHeader(http.StatusConflict)
-					return
-				}
-			}
-			w.WriteHeader(http.StatusNoContent)
-			return
 		}
-		registration, err := routesync.ReadRegister(r.Body)
+		_, err := routesync.ReadRegister(r.Body)
 		if err != nil {
 			return
 		}
-		if registration.Proxy != nil && registration.Proxy.Instance != nil {
-			registrationsMu.Lock()
-			registrations[registration.Proxy.Instance.ServiceID] = *registration.Proxy.Instance
-			registrationsMu.Unlock()
+		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/internal/plugin/"), "/register")
+		sessionsMu.Lock()
+		sessions[id] = conn
+		if next := reconnects[id]; next != nil {
+			close(next)
+			delete(reconnects, id)
 		}
+		sessionsMu.Unlock()
 		policy := routesync.Policy{AuthMode: "enforce", ParkTimeoutMS: 30000, MMDS: &routesync.MMDSProxyPolicy{Enabled: metadata, Listen: "fd=mmds"}}
+		if len(options) != 0 && options[0].metadataService != "" {
+			policy.MMDS.Services = map[string]string{"local": "unix://" + options[0].metadataService}
+		}
 		if err := routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{Version: routesync.Version, Policy: policy, ProxyCapabilities: capabilities}}); err != nil {
 			return
+		}
+		if len(options) != 0 && options[0].route != nil {
+			if err := routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeUpsert, Route: options[0].route}); err != nil {
+				return
+			}
 		}
 		if err := routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeBookmark}); err != nil {
 			return
 		}
 		w.(http.Flusher).Flush()
 		_, _ = io.Copy(io.Discard, r.Body)
-	}), &http2.Server{})}
+	}), &http2.Server{}), ConnContext: func(ctx context.Context, conn net.Conn) context.Context {
+		return context.WithValue(ctx, connectionKey{}, conn)
+	}}
 	go server.Serve(listener)
 	t.Cleanup(func() { server.Close(); listener.Close() })
-	return consume
+	return func(id string) <-chan struct{} {
+		sessionsMu.Lock()
+		conn := sessions[id]
+		next := make(chan struct{})
+		reconnects[id] = next
+		sessionsMu.Unlock()
+		if conn == nil {
+			t.Fatalf("no registered connection for %s", id)
+		}
+		conn.Close()
+		return next
+	}
 }
 
 func TestMasterReportsWorkerCompletionFailure(t *testing.T) {
@@ -516,8 +542,8 @@ func TestMasterReportsWorkerCompletionFailure(t *testing.T) {
 			instance.requestStop(time.Now().Add(time.Second))
 			select {
 			case err := <-done:
-				if !errors.Is(err, ErrForcedClose) {
-					t.Fatalf("lost completion failure: %v", err)
+				if err == nil || errors.Is(err, ErrForcedClose) != (mode != "error") {
+					t.Fatalf("incorrect completion failure: %v", err)
 				}
 			case <-ctx.Done():
 				t.Fatal("worker completion did not finish")

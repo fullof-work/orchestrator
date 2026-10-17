@@ -23,8 +23,6 @@ import (
 
 	proxyextension "github.com/kuasar-sandbox/orchestrator/app/proxy/extension"
 	publicconfig "github.com/kuasar-sandbox/orchestrator/config"
-	"github.com/kuasar-sandbox/orchestrator/internal/proxycompletion"
-	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"golang.org/x/sys/unix"
 )
 
@@ -60,27 +58,6 @@ func fixtureTargetBinary(t *testing.T) string {
 		t.Fatal(fixtureTargetError)
 	}
 	return filepath.Join(fixtureTargetDirectory, "target-proxy")
-}
-
-// The conductor fixture records actual retirement requests. The product has
-// no fault switch, shortened clock, or alternate retry implementation.
-type fixtureRetirementFailure struct {
-	mu       sync.Mutex
-	blocked  bool
-	requests []time.Time
-}
-
-func (f *fixtureRetirementFailure) reject() bool {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.requests = append(f.requests, time.Now())
-	return f.blocked
-}
-
-func (f *fixtureRetirementFailure) release() {
-	f.mu.Lock()
-	f.blocked = false
-	f.mu.Unlock()
 }
 
 type serviceFixtureExtension struct{ s *Service }
@@ -414,12 +391,12 @@ func TestServiceRealLegacyConductor(t *testing.T) {
 	testServiceRealImageReplacement(t, serviceScenario{legacy: true})
 }
 
-func TestServiceRealCompletionOnlyConductor(t *testing.T) {
-	testServiceRealImageReplacement(t, serviceScenario{completionOnly: true})
+func TestServiceRealPIDAdmissionAndCandidateReconnect(t *testing.T) {
+	testServiceRealImageReplacement(t, serviceScenario{pidAdmission: true})
 }
 
-func TestServiceRealRetirementFailureRecovery(t *testing.T) {
-	testServiceRealImageReplacement(t, serviceScenario{retirementFailure: true})
+func TestServiceRealCandidateCleanupRecovery(t *testing.T) {
+	testServiceRealImageReplacement(t, serviceScenario{cleanupFailure: true})
 }
 
 func TestServiceRealCandidatePreparationRollback(t *testing.T) {
@@ -447,11 +424,12 @@ func TestServiceRealSuccessorFailureDuringCandidateDrain(t *testing.T) {
 }
 
 type serviceScenario struct {
+	cleanupFailure                                                                                              bool
+	pidAdmission                                                                                                bool
 	preparationFault                                                                                            string
-	retirementFailure                                                                                           bool
 	concurrent                                                                                                  bool
 	signals, recovery, stopRecovery, execFailure, candidateFailure, stopDrain, forceStopDrain, successorFailure bool
-	legacy, completionOnly                                                                                      bool
+	legacy                                                                                                      bool
 	metrics                                                                                                     string
 }
 
@@ -491,28 +469,11 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 	}
 	cfg.DataListen = listener.Addr().String()
 	listener.Close()
-	var retirement *fixtureRetirementFailure
-	if scenario.retirementFailure {
-		retirement = &fixtureRetirementFailure{blocked: true}
-		defer retirement.release()
+	pidfile := ""
+	if scenario.pidAdmission {
+		pidfile = filepath.Join(shortRoot, "admitted.pid")
 	}
-	consumeCompletions := serveFixtureRoutes(t, cfg.ConfigSocket, false, routeFixtureOptions{legacy: scenario.legacy, completionOnly: scenario.completionOnly, retirement: retirement})
-	var priorCompletion string
-	if scenario.completionOnly {
-		// A completed service that never received a registration ACK is absent
-		// from the authority's map. Only the next master's outbox relay can
-		// remove this signed receipt, including without restart support.
-		identity := routesync.ProxyInstance{ServiceID: newBootID(), BootID: newBootID(), Slot: "coordinator", Generation: 1, CoordinatorPID: os.Getpid()}
-		binding, private, err := proxycompletion.Create(cfg.StatsSocket, identity)
-		if err != nil {
-			t.Fatal(err)
-		}
-		identity.Completion = binding
-		if err := proxycompletion.Complete(identity, private); err != nil {
-			t.Fatal(err)
-		}
-		priorCompletion = binding.Path
-	}
+	disconnectCandidate := serveFixtureRoutes(t, cfg.ConfigSocket, false, routeFixtureOptions{legacy: scenario.legacy, pidfile: pidfile})
 	dir := filepath.Dir(cfg.StatsSocket)
 	initial, err := os.Executable()
 	if err != nil {
@@ -554,6 +515,11 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 		}
 	})
 	pid := command.Process.Pid
+	if pidfile != "" {
+		if err := os.WriteFile(pidfile, []byte(fmt.Sprint(pid)), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}, Timeout: 5 * time.Second}
 	management := &http.Client{Transport: &http.Transport{DisableKeepAlives: true, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", cfg.StatsSocket)
@@ -632,15 +598,14 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 	stopFromCandidate := false
 	var stoppedCandidate int
 	var cancelledAttempt time.Time
-	rejectRestart := scenario.legacy || scenario.completionOnly || scenario.metrics == "boundary"
+	rejectRestart := scenario.legacy || scenario.metrics == "boundary"
 	iterations := 2
 	if scenario.preparationFault != "" {
 		iterations++ // One rejected candidate, then two complete operations.
 	}
 	for iteration := 0; iteration < iterations; iteration++ {
-		var finalRetirementRetry time.Time
 		var releaseHeld func()
-		if (scenario.execFailure || scenario.candidateFailure || scenario.stopDrain || scenario.successorFailure) && iteration == 0 || scenario.concurrent || scenario.metrics != "" && !rejectRestart && !(scenario.metrics == "occupied" && iteration == 0) {
+		if (scenario.execFailure || scenario.candidateFailure || scenario.stopDrain || scenario.successorFailure || scenario.cleanupFailure) && iteration == 0 || scenario.concurrent || scenario.pidAdmission || scenario.metrics != "" && !rejectRestart && !(scenario.metrics == "occupied" && iteration == 0) {
 			release := make(chan struct{})
 			var once sync.Once
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -756,7 +721,7 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 			}
 			expectedError := map[string]string{
 				"initialization": "fixture candidate initialization failed",
-				"configuration":  "Configure changed the accepted declarative configuration",
+				"configuration":  "Configure changed a required takeover setting",
 				"control":        "EOF",
 				"worker":         "context deadline exceeded",
 			}[scenario.preparationFault]
@@ -870,6 +835,65 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 				releaseHeld()
 			}
 		}
+		if scenario.pidAdmission {
+			draining := waitServiceStatus(t, management, func(status Status) bool {
+				return status.InplaceRestart != nil && status.InplaceRestart.Phase == "draining_a" && len(status.Instances) == 2
+			})
+			candidate := draining.Instances[1]
+			// The authority checks actual SO_PEERCRED, and only the original
+			// main PID appears in its file. B must reconnect through that PID.
+			reconnected := disconnectCandidate(candidate.InstanceID)
+			select {
+			case <-reconnected:
+			case <-time.After(2 * time.Second):
+				t.Fatal("candidate failed to reconnect under original PID admission")
+			}
+			waitServiceStatus(t, fixtureManagement(candidate.StatsSocket), func(status Status) bool { return status.Ready })
+			releaseHeld()
+		}
+		if scenario.cleanupFailure && iteration == 0 {
+			draining := waitServiceStatus(t, management, func(status Status) bool {
+				return status.InplaceRestart != nil && status.InplaceRestart.Phase == "draining_a" && len(status.Instances) == 2
+			})
+			candidate := draining.Instances[1]
+			// Replace only this test-owned directory entry, preserving the real
+			// mapping for restoration. The product must refuse to unlink a file
+			// with a different identity and keep retrying the same B's cleanup.
+			path := filepath.Join(filepath.Dir(cfg.ShmPath), ".proxy-"+candidate.BootID+".shm")
+			backup := path + ".held"
+			if err := os.Rename(path, backup); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte("not the candidate mapping"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			releaseHeld()
+			var prior time.Time
+			for _, minimumAttempts := range []int{2, 3, 4} {
+				recovering := waitServiceStatus(t, management, func(status Status) bool {
+					return status.Ready && status.InplaceRestart != nil && status.InplaceRestart.ID == id && status.InplaceRestart.Attempts >= minimumAttempts && status.InplaceRestart.NextAttempt != nil && status.InplaceRestart.NextAttempt.After(prior)
+				})
+				if recovering.InplaceRestart.Result != "" || len(recovering.Instances) != 2 || recovering.Instances[1].PID != candidate.PID || !strings.Contains(recovering.InplaceRestart.LastError, "ownership changed") {
+					t.Fatalf("cleanup responsibility lost: %+v", recovering)
+				}
+				if err := unix.Kill(candidate.PID, 0); err != unix.ESRCH {
+					t.Fatalf("candidate process was not joined before path retry: %v", err)
+				}
+				body, err := os.ReadFile(path)
+				if err != nil || string(body) != "not the candidate mapping" {
+					t.Fatalf("foreign path removed: %q %v", body, err)
+				}
+				prior = *recovering.InplaceRestart.NextAttempt
+				t.Logf("cleanup recovery: operation=%s main_pid=%d candidate_pid=%d attempts=%d next=%s error=%s", id, pid, candidate.PID, recovering.InplaceRestart.Attempts, prior, recovering.InplaceRestart.LastError)
+			}
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(backup, path); err != nil {
+				t.Fatal(err)
+			}
+			// No second trigger: the accepted operation must finish itself.
+		}
 		if scenario.successorFailure && iteration == 0 {
 			originalDraining := waitServiceStatus(t, management, func(status Status) bool {
 				return status.InplaceRestart != nil && status.InplaceRestart.Phase == "draining_a" && status.Workers.Ready == 0
@@ -899,9 +923,6 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 				return status.InplaceRestart != nil && status.InplaceRestart.Phase == "draining_a" && len(status.Instances) == 2
 			})
 			candidate := draining.Instances[1]
-			candidateClient := &http.Client{Transport: &http.Transport{DisableKeepAlives: true, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return (&net.Dialer{}).DialContext(ctx, "unix", candidate.StatsSocket)
-			}}, Timeout: time.Second}
 			stopLoad()
 			<-loadDone
 			response, err := management.Post("http://proxy/fixture/stop", "", nil)
@@ -909,11 +930,16 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 				t.Fatal(err)
 			}
 			response.Body.Close()
-			// B must stop data while A still holds its finite response. Waiting
-			// for A's complete drain before telling B would deadlock this check.
-			stopping := waitServiceStatus(t, candidateClient, func(status Status) bool { return status.Data == "stopped" })
+			// B has no held work and can exit while A still drains. Its management
+			// socket need not remain alive; the coordinator retains its exit status.
+			stopping := waitServiceStatus(t, management, func(status Status) bool {
+				return len(status.Instances) == 2 && status.Instances[1].Phase == "stopped"
+			})
 			if stopping.ServiceReady || stopping.Ready {
 				t.Fatalf("stopping service advertised readiness: %+v", stopping)
+			}
+			if err := unix.Kill(candidate.PID, 0); err != unix.ESRCH {
+				t.Fatalf("idle candidate did not end independently: %v", err)
 			}
 			releaseHeld()
 			stopFromCandidate, stoppedCandidate = true, candidate.PID
@@ -1005,46 +1031,6 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 				}
 			}
 		}
-		if scenario.retirementFailure && iteration == 0 {
-			var previousNext time.Time
-			var firstAttempts int
-			var candidateBoot string
-			for retry, delay := range []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 10 * time.Second, 10 * time.Second} {
-				retrying := waitServiceStatus(t, management, func(status Status) bool {
-					return status.InplaceRestart != nil && status.InplaceRestart.NextAttempt != nil && status.InplaceRestart.NextAttempt.After(previousNext)
-				})
-				if !retrying.Ready || !retrying.ServiceReady || retrying.InplaceRestart.ID != id || retrying.InplaceRestart.Result != "" || !strings.Contains(retrying.InplaceRestart.LastError, "HTTP 503") || len(retrying.Instances) != 2 {
-					t.Fatalf("retirement failure lost service or ownership: %+v", retrying)
-				}
-				candidate := retrying.Instances[1]
-				if retry == 0 {
-					firstAttempts, candidateBoot = retrying.InplaceRestart.Attempts, candidate.BootID
-					checkFixtureRestartRejected(t, management, ErrRestartInProgress.Error())
-				} else if candidate.BootID != candidateBoot {
-					t.Fatalf("reclamation started another candidate: %+v", retrying)
-				}
-				if err := unix.Kill(candidate.PID, 0); err != unix.ESRCH {
-					t.Fatalf("candidate process not reaped before retirement: %d %v", candidate.PID, err)
-				}
-				retirement.mu.Lock()
-				requests := append([]time.Time(nil), retirement.requests...)
-				retirement.mu.Unlock()
-				if len(requests) != retry+1 {
-					t.Fatalf("retirement attempts=%d want=%d", len(requests), retry+1)
-				}
-				at, next := requests[retry], *retrying.InplaceRestart.NextAttempt
-				if (!previousNext.IsZero() && at.Before(previousNext)) || next.Sub(at) < delay || next.Sub(at) > delay+time.Second {
-					t.Fatalf("retirement backoff: request=%s previous_next=%s next=%s want_delay=%s", at, previousNext, next, delay)
-				}
-				if retrying.InplaceRestart.Attempts != firstAttempts+retry {
-					t.Errorf("retirement retry absent from status counter: retry=%d first=%d attempts=%d", retry, firstAttempts, retrying.InplaceRestart.Attempts)
-				}
-				t.Logf("retirement recovery: retry=%d attempts=%d request=%s next=%s main_pid=%d candidate_boot=%s", retry, retrying.InplaceRestart.Attempts, at.Format(time.RFC3339Nano), next.Format(time.RFC3339Nano), pid, candidateBoot)
-				previousNext = next
-			}
-			retirement.release()
-			finalRetirementRetry = previousNext
-		}
 		status = waitServiceStatus(t, management, func(status Status) bool {
 			return status.InplaceRestart != nil && status.InplaceRestart.ID == id && status.InplaceRestart.Result != ""
 		})
@@ -1054,15 +1040,6 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 		}
 		if status.InplaceRestart.Result != wantResult || !status.Ready || len(status.Instances) != 1 || status.PID != pid {
 			t.Fatalf("completion: %+v", status)
-		}
-		if !finalRetirementRetry.IsZero() {
-			retirement.mu.Lock()
-			requests := append([]time.Time(nil), retirement.requests...)
-			retirement.mu.Unlock()
-			if len(requests) != 7 || requests[6].Before(finalRetirementRetry) {
-				t.Fatalf("successful retirement did not respect final capped backoff: requests=%v next=%v", requests, finalRetirementRetry)
-			}
-			t.Logf("retirement recovery completed: request=%s previous_next=%s", requests[6].Format(time.RFC3339Nano), finalRetirementRetry.Format(time.RFC3339Nano))
 		}
 		t.Logf("complete: iteration=%d main_pid=%d operation=%s target=%s attempts=%d result=%s forced=%d", iteration, pid, id, status.InplaceRestart.Target, status.InplaceRestart.Attempts, status.InplaceRestart.Result, status.InplaceRestart.ForcedCloseCount)
 		if scenario.metrics != "" {
@@ -1103,19 +1080,6 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 	}
 	t.Logf("business results: builds=%v unexpected_failures=%d expected_injected_connection_losses=%v", builds, len(businessErrors), expectedLosses)
 	if !stopFromCandidate {
-		if priorCompletion != "" {
-			deadline := time.Now().Add(3 * time.Second)
-			for {
-				_, err := os.Stat(priorCompletion)
-				if os.IsNotExist(err) {
-					break
-				}
-				if time.Now().After(deadline) {
-					t.Fatalf("completion-only master did not relay prior receipt: %v", err)
-				}
-				time.Sleep(10 * time.Millisecond)
-			}
-		}
 		response, err := management.Post("http://proxy/fixture/stop", "", nil)
 		if err != nil {
 			t.Fatal(err)
@@ -1157,9 +1121,6 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 			t.Fatalf("resource remains: %s: %v", path, err)
 		}
 	}
-	// A forced stop can exhaust the service's one deadline before an RPC ACK.
-	// The authority consumes its admitted, signed completion on its next read.
-	consumeCompletions()
 	paths, _ := filepath.Glob(filepath.Join(dir, ".proxy-*"))
 	if len(paths) != 0 {
 		t.Fatalf("candidate resources remain: %v", paths)

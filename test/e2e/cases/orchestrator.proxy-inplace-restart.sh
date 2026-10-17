@@ -28,8 +28,8 @@ start_orchestrator "$WORK/orch.log"
 build_image_template
 create_guest "{\"templateID\":\"$TEMPLATE\",\"timeout\":1800}"
 wait_sandbox_state "$SID" running 1200 || fail "lifecycle Guest did not reach running"
-# These fixture programs execute in the real Guest. A finite data request reads
-# MMDS after its original Proxy instance has stopped accepting data.
+# These fixture programs execute in the real Guest. Finite data responses drain
+# completely; separate Guest requests verify MMDS on each ready replacement.
 for fixture in proxy_lifecycle_guest websocket_probe; do
     options=(--sid "$SID")
     [ "$fixture" != websocket_probe ] || options=(--idle-timeout 45)
@@ -43,6 +43,11 @@ for mode in builtin:address builtin:datafd builtin:mmdsfd builtin:bothfd custom:
     entry=${mode%:*}; source=${mode#*:}; label=${mode/:/-}
     echo "==> real lifecycle: $label"
     write_orchestrator_config unset static
+    # Exercise the existing PID admission rule with only the fixed main PID.
+    # The launcher updates it on ordinary service restart, then exec preserves it.
+    plugin_pidfile="$WORK/proxy-main.pid"
+    sed -i "/^paths:$/a\\  plugin_pidfile: $plugin_pidfile" "$WORK/config.yaml"
+    grep -q "plugin_pidfile: $plugin_pidfile" "$WORK/config.yaml" || fail "missing paths for PID admission"
     case "$source" in
         mmdsfd|bothfd) sed -i "s/listen: \"$PROXY_NS_IP:$MMDS_PORT\"/listen: fd=proxy-mmds/" "$WORK/config.yaml";;
     esac
@@ -55,6 +60,16 @@ for mode in builtin:address builtin:datafd builtin:mmdsfd builtin:bothfd custom:
         app) initial="$PROXY_LIFECYCLE_BIN"; target="$PROXY_LIFECYCLE_TARGET_BIN"; launcher="$BIN/node-ctl"; proxy_executable="$deployment";;
     esac
     install -m 0700 "$initial" "$deployment"
+    cat >"$WORK/start-proxy" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+pidfile=$1
+shift
+umask 077
+printf '%s\n' "$$" >"$pidfile"
+exec "$@"
+EOF
+    chmod 0700 "$WORK/start-proxy"
     data_listen="127.0.0.1:$PROXY_PORT"
     case "$source" in datafd|bothfd) data_listen=fd=proxy-data;; esac
     write_proxy_config "$WORK/proxy.yaml" "$WORK/node-ctl.socket" "$EXECUTE_RUN_ROOT" "$data_listen" \
@@ -94,7 +109,7 @@ Requires=$sockets
 After=$sockets
 [Service]
 Type=simple
-ExecStart=$launcher proxy serve --config $WORK/proxy.yaml
+ExecStart=$WORK/start-proxy $plugin_pidfile $launcher proxy serve --config $WORK/proxy.yaml
 ExecStopPost=/usr/bin/python3 -B $SCRIPT_DIR/proxy_lifecycle_client.py record-stop $WORK/service-exit-$label.log
 Sockets=$sockets
 KillMode=mixed
@@ -105,9 +120,9 @@ EOF
     systemctl daemon-reload
     systemctl start "$service"
     (umask 077; python3 - "$WORK/client-$label.json" "$WORK/proxy-stats.sock" "$service" "$WORK/client-$label.log" \
-        "$PROXY_PORT" "$SID" "$DOMAIN" "$FORWARD_TOKEN" "$entry" "$source" "$deployment" "$initial" "$target" "$WORK/proxy.yaml" "$PORT" "$AK" "$PROXY_NETNS" "$MMDS_PORT" "$sockets" "$WORK/service-exit-$label.log" <<'PY'
+        "$PROXY_PORT" "$SID" "$DOMAIN" "$FORWARD_TOKEN" "$entry" "$source" "$deployment" "$initial" "$target" "$WORK/proxy.yaml" "$PORT" "$AK" "$PROXY_NETNS" "$MMDS_PORT" "$sockets" "$WORK/service-exit-$label.log" "$plugin_pidfile" <<'PY'
 import json, sys
-names = ('stats', 'unit', 'output', 'port', 'sid', 'domain', 'token', 'entry', 'source', 'deployment', 'initial', 'target', 'proxy_config', 'api_port', 'api_key', 'proxy_netns', 'mmds_port', 'socket_units', 'exit_record')
+names = ('stats', 'unit', 'output', 'port', 'sid', 'domain', 'token', 'entry', 'source', 'deployment', 'initial', 'target', 'proxy_config', 'api_port', 'api_key', 'proxy_netns', 'mmds_port', 'socket_units', 'exit_record', 'plugin_pidfile')
 config = dict(zip(names, sys.argv[2:], strict=True))
 config['port'] = int(config['port'])
 with open(sys.argv[1], 'x') as stream:

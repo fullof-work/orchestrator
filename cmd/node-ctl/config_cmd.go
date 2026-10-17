@@ -318,8 +318,8 @@ paths:
   run_root: /run/sandbox                        # node RunRoot containing sandboxes/<sid>/ctl.sock (required)
 data_listen: ":3443"                             # required plaintext sandbox ingress; distinct from conductor :3000
 # data_listen: "fd=proxy-data"                    # named activated TCP listener instead of binding an address
-shutdown_timeout: 30s                            # positive data/MMDS drain budget
-inplace_restart: false                           # true: main SIGUSR2 trigger; direct App calls work either way
+shutdown_timeout: 0s                             # no automatic drain wait; set positive for InplaceRestart
+inplace_restart: false                           # true requires positive shutdown_timeout and registers main SIGUSR2
 # proxy_netns: sw0_mgmt                          # forwarding netns for floatingip dials + MMDS listener; "" = current netns
 stats_socket: /run/sandbox/proxy-stats.sock      # master-only traffic stats UDS registered for conductor queries
 shm_path: /run/sandbox/proxy-routes.shm           # shared route table path

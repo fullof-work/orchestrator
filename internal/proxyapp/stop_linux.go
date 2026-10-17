@@ -23,7 +23,7 @@ type stopRecord struct {
 // allocation or continuation restore. Preserve its first deadline rather than
 // starting another budget when the descriptor becomes available.
 func (s *Service) installStopRecordLocked(record *stopRecord) error {
-	if !s.stopDeadline.IsZero() {
+	if s.stopRequested {
 		deadline, err := record.request(s.stopDeadline)
 		if err != nil {
 			return err
@@ -51,30 +51,38 @@ func newStopRecord() (*stopRecord, error) {
 	return &stopRecord{file: file}, nil
 }
 
-func (r *stopRecord) read() (time.Time, error) {
+// read distinguishes no request from an explicit stop without a deadline.
+func (r *stopRecord) read() (time.Time, bool, error) {
 	var value [8]byte
 	if _, err := r.file.ReadAt(value[:], 0); err != nil {
-		return time.Time{}, err
+		return time.Time{}, false, err
 	}
 	stamp := int64(binary.LittleEndian.Uint64(value[:]))
 	if stamp == 0 {
-		return time.Time{}, nil
+		return time.Time{}, false, nil
+	}
+	if stamp == -1 {
+		return time.Time{}, true, nil
 	}
 	if stamp < 0 {
-		return time.Time{}, fmt.Errorf("proxy stop deadline is invalid")
+		return time.Time{}, false, fmt.Errorf("proxy stop deadline is invalid")
 	}
-	return time.Unix(0, stamp), nil
+	return time.Unix(0, stamp), true, nil
 }
 
 func (r *stopRecord) request(deadline time.Time) (time.Time, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	prior, err := r.read()
-	if err != nil || !prior.IsZero() {
+	prior, requested, err := r.read()
+	if err != nil || requested {
 		return prior, err
 	}
 	var value [8]byte
-	binary.LittleEndian.PutUint64(value[:], uint64(deadline.UnixNano()))
+	stamp := int64(-1)
+	if !deadline.IsZero() {
+		stamp = deadline.UnixNano()
+	}
+	binary.LittleEndian.PutUint64(value[:], uint64(stamp))
 	if _, err := r.file.WriteAt(value[:], 0); err != nil {
 		return time.Time{}, err
 	}
@@ -95,7 +103,7 @@ func receiveStopRecord(file *os.File) (*stopRecord, error) {
 		return nil, fmt.Errorf("proxy stop record has invalid seals")
 	}
 	record := &stopRecord{file: file}
-	if _, err := record.read(); err != nil {
+	if _, _, err := record.read(); err != nil {
 		return nil, err
 	}
 	return record, nil

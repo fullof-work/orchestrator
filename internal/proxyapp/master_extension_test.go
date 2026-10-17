@@ -34,6 +34,9 @@ func (e *endingMasterExtension) Shutdown(ctx context.Context) error { return e.s
 
 func TestRunMasterStartupFailureJoinsExtensionShutdown(t *testing.T) {
 	effective, paths := testMasterEffective(t)
+	cfg := effective.Config()
+	cfg.ShutdownTimeout = "1s"
+	effective, _ = FreezeConfig(cfg)
 	startErr := errors.New("master extension start failed")
 	endErr := errors.New("master extension shutdown failed")
 	var started context.Context
@@ -58,7 +61,7 @@ func TestRunMasterStartupFailureJoinsExtensionShutdown(t *testing.T) {
 		},
 	}
 	err := RunMaster(context.Background(), effective, &Runtime{Logger: testMasterLogger(), MasterExtension: extension})
-	if !errors.Is(err, startErr) || !errors.Is(err, endErr) || !errors.Is(err, ErrForcedClose) || calls.Load() != 1 {
+	if !errors.Is(err, startErr) || !errors.Is(err, endErr) || errors.Is(err, ErrForcedClose) || calls.Load() != 1 {
 		t.Fatalf("lost startup/completion failure: err=%v shutdown_calls=%d", err, calls.Load())
 	}
 	for _, path := range paths {
@@ -111,8 +114,8 @@ func TestRunMasterExtensionShutdownDeadline(t *testing.T) {
 	}
 	select {
 	case err := <-done:
-		if !errors.Is(err, startErr) || !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, ErrForcedClose) {
-			t.Fatalf("lost forced completion error: %v", err)
+		if !errors.Is(err, startErr) || !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrForcedClose) {
+			t.Fatalf("lost or misclassified extension wait timeout: %v", err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("uncooperative extension prevented bounded master return")
@@ -127,7 +130,7 @@ func TestRunMasterExtensionShutdownDeadline(t *testing.T) {
 	}
 	for _, path := range paths {
 		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("resource survived forced master completion: %s: %v", path, err)
+			t.Fatalf("resource survived master completion: %s: %v", path, err)
 		}
 	}
 }

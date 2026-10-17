@@ -1310,10 +1310,13 @@ func (c *Conductor) validateProxy() error {
 // conductor pushes the authoritative auth/park policy over the registration stream;
 // local values are bootstrap fallbacks until that handshake completes.
 type Proxy struct {
-	// ShutdownTimeout is one bounded data/MMDS drain budget. Empty is the default 30s.
+	// ShutdownTimeout bounds automatic termination and InplaceRestart drains.
+	// Empty or zero disables restart and makes automatic termination immediate.
+	// Explicit App.Shutdown still drains gracefully without a configured deadline.
 	ShutdownTimeout string `yaml:"shutdown_timeout" json:"shutdown_timeout"`
 	// InplaceRestart controls only the native master's SIGUSR2 registration.
-	// Programmatic App.InplaceRestart remains available when false.
+	// Programmatic App.InplaceRestart requires a positive ShutdownTimeout,
+	// independently of this signal setting.
 	InplaceRestart bool               `yaml:"inplace_restart" json:"inplace_restart"`
 	ConfigSocket   string             `yaml:"config_socket" json:"config_socket"`   // serve control socket to register + sync on (= serve paths.config_socket)
 	Paths          ProxyPathsConfig   `yaml:"paths" json:"paths"`                   // node-local paths used directly by proxy workers
@@ -1388,9 +1391,6 @@ func DecodeProxy(r io.Reader) (*Proxy, error) {
 }
 
 func (p *Proxy) applyDefaults() {
-	if p.ShutdownTimeout == "" {
-		p.ShutdownTimeout = "30s"
-	}
 	if p.ConfigSocket == "" {
 		p.ConfigSocket = "/run/sandbox/node-ctl.socket"
 	}
@@ -1441,12 +1441,15 @@ func (p *Proxy) validateDeclarative() error {
 	}
 	if p.ShutdownTimeout != "" {
 		duration, err := time.ParseDuration(p.ShutdownTimeout)
-		if err != nil || duration <= 0 {
-			return fmt.Errorf("proxy config: shutdown_timeout must be a positive duration")
+		if err != nil || duration < 0 {
+			return fmt.Errorf("proxy config: shutdown_timeout must be a non-negative duration")
 		}
 	}
 	if p.Paths.ProxyExecutable != "" && !filepath.IsAbs(p.Paths.ProxyExecutable) {
 		return fmt.Errorf("proxy config: paths.proxy_executable must be absolute")
+	}
+	if p.InplaceRestart && p.ShutdownTimeoutDur() <= 0 {
+		return fmt.Errorf("proxy config: inplace_restart requires a positive shutdown_timeout")
 	}
 	switch p.Auth {
 	case AuthOff, AuthLog, AuthEnforce:
@@ -1485,12 +1488,8 @@ func (p *Proxy) ParkTimeoutDur() time.Duration {
 	return d
 }
 
-// ShutdownTimeoutDur returns the validated drain budget. An omitted field in a
-// programmatically constructed Config retains the same 30s default as YAML.
+// ShutdownTimeoutDur returns the validated budget. An omitted value is zero.
 func (p *Proxy) ShutdownTimeoutDur() time.Duration {
-	if p.ShutdownTimeout == "" {
-		return 30 * time.Second
-	}
 	duration, _ := time.ParseDuration(p.ShutdownTimeout)
 	return duration
 }

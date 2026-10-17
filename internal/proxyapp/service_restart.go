@@ -24,6 +24,9 @@ func (s *Service) drainLocal(deadline time.Time) error {
 	}
 	s.mu.Lock()
 	s.localEnded, s.localResult = true, err
+	if s.localDone == done {
+		s.localDone = nil
+	}
 	if s.stopping() {
 		s.stopErr = errors.Join(s.stopErr, err)
 	}
@@ -31,7 +34,7 @@ func (s *Service) drainLocal(deadline time.Time) error {
 	if !ended && errors.Is(err, ErrForcedClose) {
 		s.recordForced()
 	}
-	return errors.Join(err, s.finishLocalRegistration())
+	return err
 }
 
 func (s *Service) recordForced() {
@@ -102,7 +105,7 @@ func (s *Service) restart() error {
 // the operation: another restart must not create B2 while B1 retains resources.
 func (s *Service) rollback(child *serviceChild, cause error) error {
 	for attempt := 1; !s.stopping(); attempt++ {
-		cleanup := s.reapChild(child, s.drainDeadline(), false)
+		cleanup := s.reapChild(child, s.drainDeadline())
 		s.mu.Lock()
 		remaining := s.child != nil
 		s.mu.Unlock()
@@ -137,7 +140,7 @@ func (s *Service) drainOriginal() error {
 		}
 		if failure != nil {
 			s.phase("recovering_b", failure)
-			cleanup := s.reapChild(child, s.drainDeadline(), false)
+			cleanup := s.reapChild(child, s.drainDeadline())
 			if s.stopping() {
 				return <-drained
 			}
@@ -160,7 +163,7 @@ func (s *Service) drainOriginal() error {
 				s.mu.Lock()
 				failed := s.child
 				s.mu.Unlock()
-				cleanup := s.reapChild(failed, s.drainDeadline(), false)
+				cleanup := s.reapChild(failed, s.drainDeadline())
 				if !s.backoff(attempt, errors.Join(err, cleanup)) {
 					return <-drained
 				}
@@ -191,7 +194,7 @@ func (s *Service) drainDeadline() time.Time {
 	record, timeout := s.stopRecord, s.timeout
 	s.mu.Unlock()
 	if record != nil {
-		if deadline, err := record.read(); err == nil && !deadline.IsZero() {
+		if deadline, requested, err := record.read(); err == nil && requested {
 			return deadline
 		}
 	}
@@ -214,7 +217,7 @@ func (s *Service) ensureChild() error {
 		if err == nil {
 			return nil
 		}
-		if err := s.reapChild(child, s.drainDeadline(), false); err != nil {
+		if err := s.reapChild(child, s.drainDeadline()); err != nil {
 			s.phase("recovering", err)
 			s.mu.Lock()
 			remaining := s.child != nil
@@ -229,7 +232,7 @@ func (s *Service) ensureChild() error {
 	}
 	child, err := s.prepareChild()
 	if err != nil {
-		cleanup := s.reapChild(child, s.drainDeadline(), false)
+		cleanup := s.reapChild(child, s.drainDeadline())
 		return errors.Join(err, cleanup)
 	}
 	return nil
@@ -303,7 +306,7 @@ func (s *Service) resumeOperation() error {
 		child, instance := s.child, s.local
 		s.mu.Unlock()
 		reaped := make(chan error, 1)
-		go func() { reaped <- s.reapChild(child, s.drainDeadline(), false) }()
+		go func() { reaped <- s.reapChild(child, s.drainDeadline()) }()
 		failed := false
 		for !failed {
 			instance.mu.Lock()
@@ -334,7 +337,7 @@ func (s *Service) resumeOperation() error {
 			case <-changed:
 			case <-s.stop:
 				// A single public stop budget replaces the remaining service work.
-				deadline, _ := s.stopRecord.read()
+				deadline, _, _ := s.stopRecord.read()
 				instance.requestStop(deadline)
 			case err = <-reaped:
 				s.mu.Lock()
@@ -348,7 +351,7 @@ func (s *Service) resumeOperation() error {
 					if forced != 0 {
 						result = "completed_with_forced_close"
 					}
-					s.operationComplete(result, nil)
+					s.operationComplete(result, err)
 					return nil
 				}
 				if instance.Snapshot().Ready && !s.stopping() {
@@ -360,7 +363,7 @@ func (s *Service) resumeOperation() error {
 						continue
 					}
 					attempt++
-					go func() { reaped <- s.reapChild(child, s.drainDeadline(), false) }()
+					go func() { reaped <- s.reapChild(child, s.drainDeadline()) }()
 					continue
 				}
 				// Observe a concurrent A-prime fault before completing. Repair A'
@@ -410,24 +413,23 @@ func (s *Service) recoverSuccessor(cause error) error {
 }
 
 func (s *Service) shutdownAll() error {
-	deadline, err := s.stopRecord.read()
+	deadline, requested, err := s.stopRecord.read()
 	if err != nil {
 		return err
 	}
-	if deadline.IsZero() {
+	if !requested {
 		deadline, err = s.stopRecord.request(time.Now().Add(s.timeout))
 		if err != nil {
 			return err
 		}
 	}
-	gate := s.beginShutdown(deadline)
-	<-gate
+	s.beginShutdown(deadline)
 	s.mu.Lock()
 	child := s.child
 	s.mu.Unlock()
 	results := make(chan error, 2)
 	go func() { results <- s.drainLocal(deadline) }()
-	go func() { results <- s.reapChild(child, deadline, false) }()
+	go func() { results <- s.reapChild(child, deadline) }()
 	err = errors.Join(<-results, <-results)
 	s.mu.Lock()
 	err = errors.Join(err, s.stopErr)
@@ -437,42 +439,4 @@ func (s *Service) shutdownAll() error {
 		s.operationComplete("stopped", err)
 	}
 	return err
-}
-
-// The barrier runs independently of the coordinator, which may already be
-// awaiting an instance drain. Waiting for that drain before releasing MMDS
-// would deadlock the complete service stop.
-func (s *Service) releaseShutdownMMDS(deadline time.Time, instance *Instance, localDone <-chan error, child *serviceChild, gate chan struct{}) {
-	timer := time.NewTimer(max(time.Until(deadline), 0))
-	defer timer.Stop()
-	for {
-		dataDone := true
-		var localChanged, childChanged <-chan struct{}
-		if instance != nil && localDone != nil {
-			instance.mu.Lock()
-			localChanged = instance.changed
-			dataDone = instance.status.Data == "stopped"
-			instance.mu.Unlock()
-		}
-		if child != nil {
-			child.mu.Lock()
-			childChanged = child.changed
-			dataDone = dataDone && child.status.Data == "stopped"
-			child.mu.Unlock()
-		}
-		if dataDone {
-			break
-		}
-		select {
-		case <-localChanged:
-		case <-childChanged:
-		case <-timer.C:
-			goto release
-		}
-	}
-release:
-	s.stopReleased.Do(func() { close(gate) })
-	if child != nil {
-		_ = child.wire.send(serviceMessage{Kind: "release_mmds", Deadline: deadline})
-	}
 }

@@ -11,7 +11,6 @@ import (
 	"strconv"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/componentexec"
-	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
 	"golang.org/x/sys/unix"
 )
@@ -50,11 +49,6 @@ type continuationEnvelope struct {
 	Baseline                   json.RawMessage                  `json:"baseline"`
 	BootID                     string                           `json:"boot_id"`
 	InstanceID                 string                           `json:"instance_id"`
-	ServiceID                  string                           `json:"service_id"`
-	Completion                 routesync.ProxyCompletion        `json:"completion"`
-	CompletionKey              []byte                           `json:"completion_key,omitempty"`
-	LocalGeneration            uint64                           `json:"local_generation"`
-	ChildGeneration            uint64                           `json:"child_generation"`
 	Operation                  RestartStatus                    `json:"operation"`
 	TargetIdentity             componentexec.ExecutableIdentity `json:"target_identity"`
 	TargetDigest               string                           `json:"target_digest"`

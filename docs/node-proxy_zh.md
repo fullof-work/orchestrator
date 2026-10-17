@@ -80,7 +80,7 @@ node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
 | `paths.proxy_executable` | 空 | 静态定制 Proxy master 的绝对 executable;空使用内置实现.静态 config 诊断检查 regular/executable,非 group/world-writable 和 same-file,不按诊断 EUID 判断 owner;实际 root dispatch 只接受 root-owned,非 root dispatch 接受 root-owned 或本 EUID-owned.用于 node-ctl → master 分派及 InplaceRestart 受理时打开目标;worker 使用自己 master 的程序映像 |
 | `paths.run_root` | (必填) | 节点 RunRoot;worker 本地构造 `<run_root>/sandboxes/<NodeSandboxID>/ctl.sock`,该路径不经 routesync `Policy` 或共享路由记录传递 |
 | `data_listen` | (必填) | Sandbox 数据入口：TCP `host:port`，或显式交付的命名 TCP listener `fd=<name>` |
-| `shutdown_timeout` | `30s` | 正时长，data/MMDS 排空共用；完整停机跨全部实例使用一个期限 |
+| `shutdown_timeout` | `0` | 非负时长；0 时 InplaceRestart 不可用、自动终止立即收尾，显式 App.Shutdown 仍优雅排空。正值由 data/MMDS 共用，完整停机跨全部实例共用 |
 | `inplace_restart` | `false` | true 时原生主入口注册 SIGUSR2；两种取值都允许直接调用 App.InplaceRestart |
 | `proxy_netns` | 空 | 转发平面 netns;空 = 当前 netns.非空时 worker 在该 netns 内运行,conductor 下发的 MMDS listen 也在该 netns 绑定;`data_listen` 仍在 master 当前 netns |
 | `stats_socket` | `<dir(config_socket)>/proxy-stats.sock` | master 独占监听并注册给 conductor 的 traffic stats UDS;必须是绝对路径且不得与 config/SHM 路径冲突,权限 0600 |
@@ -187,10 +187,7 @@ Sandbox schema 或日志字段。
 `inplace_restart_v1` 声明这些多实例配套能力；缺失时兼容的单实例仍可运行，
 InplaceRestart 在排空 A 前拒绝。
 
-配置 conductor `paths.plugin_pidfile` 时仍严格执行 PID 白名单。由于无法预先授权
-尚未创建的候选 PID，conductor 不声明 `inplace_restart_v1`；两种重启触发方式均在
-受理前拒绝，当前实例继续服务。仍声明 `proxy_completion_v1`，使普通停机保留持久
-统计与签名完成凭据，并支持 conductor 离线后的恢复清理。该能力不授权其他进程。
+配置 conductor `paths.plugin_pidfile` 时仍严格执行 PID 白名单。原主进程连接固定的 conductor socket，通过私有控制连接把 B 专用连接交给它，重连也走此路径；SO_PEERCRED 保持已获授权的原主 PID。B 独立注册并接收路由，不增加其他进程的准入规则。
 
 MMDS 扩展不写固定表。master 对每个 active sandbox 在一个锁内替换 routes + values;
 heap entry 总数受 `route_capacity` 限制。`BeginSync` 与 routesync 断开
@@ -736,7 +733,7 @@ worker;只有 `Wait` 确认进程退出、内核已关闭其 backend FD 后才�
 replacement 以新 epoch 发 hello+ready,在 ready 前不开放 stats,并且 worker 也是在 stats ready
 后才开始 Serve 数据 listener。
 
-worker 经 socketpair 把绝对状态交给各自 master；conductor 查询所有仍可能持有业务的当前 Proxy 注册，包含正在排空的实例。身份缺失、冲突或读取失败使汇总不可用，不能计为零。
+worker 经 socketpair 把绝对状态交给各自 master；conductor 查询一个已准入的当前 Proxy。InplaceRestart 期间通过 `inplaceRestart` 标记实例本地统计不代表完整服务；读取失败仍不可用，不能计为零。
 route SHM 仍是 master 单写,worker 只读,没有 stats 区或 worker 写入;worker 的 mutable admission
 column 只存在于独立 arena,不进入会因 backshift 移动的 route record。
 
@@ -808,8 +805,9 @@ curl --silent --show-error --max-time 2 \
 
 ### 9.3 有界停机
 
-停止 data 接纳后，等待全部相关 worker 的已接纳业务，再停止并排空 MMDS，
-结束依赖与扩展，最后回收进程。data 排空期间保留 MMDS、路由、唤醒/RPC 和统计。
+data 与 MMDS 独立停止接纳、等待各自已接纳的工作；worker 在两者都结束后退出。
+仍被业务使用的依赖保留到业务结束。不保证 data 内调用 MMDS、连续 data 或 MMDS
+请求等组合流程一定成功。
 普通响应、流式正文、HTTP/1 WebSocket、CONNECT 隧道及已有 HTTP/2/h2c 路径均参与。
 排空开始后已有 keep-alive/H2 连接不能开始新业务；已建立隧道可继续完成。
 监听 Serve 返回、HTTP Shutdown 完成与 hijack 隧道结束分别等待，不增加新协议。
@@ -820,9 +818,11 @@ HTTP/1 排空会半关闭响应方向，并继续读取已到达的输入，直�
 关闭该连接会报告强制收尾，即使响应正文已完整送达；该结果描述连接收尾，并不代表
 已经完整送达的响应失败。
 
-单实例 data/MMDS 共用一次正时长 `shutdown_timeout`，默认 30s。InplaceRestart 的
-两轮排空分别计时；完整 `App.Shutdown` 对 A/A′ 与 B 使用一个共同期限，重复调用
-不延长。调用 context 取消只结束等待。超时关闭剩余工作并回收实际进程，
+`shutdown_timeout` 默认 0。此时自动终止（Run 的 SIGINT/SIGTERM、RunContext 的
+context 取消）立即收尾；显式 `App.Shutdown(ctx)` 仍优雅排空已接纳业务，不设置隐含
+期限。InplaceRestart 要求正时长。正值下单实例 data/MMDS 共用预算，两轮重启排空
+各有一次预算；完整 Shutdown 对 A/A′ 与 B 共用一个期限，重复调用不延长。
+调用 context 取消只结束等待。超时关闭剩余工作并回收实际进程，
 `ErrForcedClose` 与 `completed_with_forced_close` 区分强制结果。
 核心在业务排空后取消扩展 Start 的 context，再调用可选
 `Shutdown(context.Context) error` 等待其结束，见[扩展生命周期](extensions_zh.md#proxy-lifecycle)。
@@ -840,13 +840,14 @@ B 与 worker 不发起嵌套操作。
 能力时先按普通方式启动。Conductor 必须声明 `inplace_restart_v1`，已配置扩展必须提供
 Shutdown；程序化调用执行相同预检。
 
-`inplace_restart: true` 时向原主进程发送：
+配置正值 `shutdown_timeout` 和 `inplace_restart: true` 后，向原主进程发送：
 
 ```sh
 systemctl kill --kill-who=main --signal=SIGUSR2 kuasar-proxy.service
 ```
 
-默认 false 不注册 SIGUSR2，也不禁止 `App.InplaceRestart(ctx)`。`App.Run()` 保留
+默认 false 不注册 SIGUSR2；只要 timeout 为正，仍可直接调用 `App.InplaceRestart(ctx)`。
+timeout 为 0 时启用信号属于配置错误。`App.Run()` 保留
 SIGINT/SIGTERM 行为；自定义入口使用 `RunContext()` 自行调用动作，见
 [公共生命周期 API](extensions_zh.md#proxy-lifecycle)。方法返回受理结果与操作 ID，
 最终完成通过状态观察；原 Go 调用栈不会跨 exec 保留。原 master 管理端点短暂不可用时，
@@ -865,21 +866,16 @@ A/A′ 保持显式 `shm_path` 与 `stats_socket`；B 在相同父目录派生�
 metrics 为空则均关闭；固定 `host:p` 的 A/A′ 用 p、B 用 p+1；端口 0 各自动态分配；
 65535 拒绝操作。B 必须实际 bind 并持有端口后才排空 A，冲突时本次准备失败，
 不扫描其他端口；IPv6 同样处理。每代计数可重置，抓取可短暂空窗。
-业务统计汇总仍参与的全部实例；未知、身份冲突、读取失败返回不可用，空闲时间取保守结果。
+普通启动时 metrics 绑定失败仍告警并继续服务；重启则在排空 A 前确认所需资源可用。
+
+业务统计保留实例本地读数。现有 traffic 返回中的 `inplaceRestart: true` 从受理持续到
+操作清理结束，exec 间隙由 B 返回时也保持。idle 消费方须理解此时统计不完整，不能据此
+证明整个服务空闲；操作完成后重新读取正常单实例统计。读取失败仍不可用，不填零，
+也不据此推断重启结束。不增加持久统计记录、完成凭据或跨实例计数汇总。
 各代保留既有额度和单代并发余量，部署预留双实例 CPU、内存、FD、两份额度和相邻 metrics
 端口，不进行跨代额度转移。
 
-conductor 持久保存两个实例的归属槽位，注册断连或 conductor 自身重启不会遗忘仍可能
-持有业务的实例。只有实际回收 worker/进程后才确认退役；统计查询同时核对注册 epoch
-与实例 BootID。服务在配置的 stats 目录保留一个 0600 私有文件
-`.proxy-service-completion-<service-id>`，跨程序映像替换沿用；只有协调者在整个服务
-结束后才签署完成凭据。停机时 conductor 不可达，签名文件保存完成证据，不延长服务
-停机期限。conductor 恢复或查询统计时消费凭据；后续已准入协调者也会重试转交同目录
-的完成文件。先持久确认退役，再删除文件和归属记录。不要通过删除未完成文件让统计
-看似空闲：证据缺失、损坏或无法验证仍返回不可用。stats 目录需允许 conductor 访问，
-并保持 Proxy 服务可写。
-
-### 9.5 命名监听与 systemd 部署
+### 9.5 命名监听### 9.5 命名监听与 systemd 部署
 
 `data_listen: "fd=proxy-data"` 与 conductor `mmds.listen: "fd=proxy-mmds"`
 精确选择名称；两者可分别继续使用 TCP 地址，四种组合均支持。名称区分大小写、非空，

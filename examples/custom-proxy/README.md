@@ -72,8 +72,12 @@ Deploy `xproxy` and `node-ctl` from compatible orchestrator versions.
 
 The example uses `App.Run()`: SIGINT/SIGTERM request complete service shutdown;
 `inplace_restart: true` additionally registers SIGUSR2 only in the main
-coordinator. The default false leaves SIGUSR2 unregistered. In both cases,
-embedding code can call `app.InplaceRestart(ctx)` directly after `WaitReady`.
+coordinator and requires a positive `shutdown_timeout`. The default false leaves
+SIGUSR2 unregistered. With a positive timeout, embedding code can call
+`app.InplaceRestart(ctx)` directly after `WaitReady` in either case. An omitted
+or zero timeout makes InplaceRestart unavailable and automatic termination
+immediate. Explicit `app.Shutdown(ctx)` still drains gracefully at zero, without
+an implicit deadline; canceling its context ends only the caller's wait.
 The call returns an accepted operation ID; inspect `app.Status()` or
 `GET /status` for completion, since the Go caller stack cannot survive exec.
 For custom signal assembly use `RunContext`, keeping triggers in the main

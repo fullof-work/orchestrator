@@ -17,7 +17,6 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/netns"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyadmission"
-	"github.com/kuasar-sandbox/orchestrator/internal/proxycompletion"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyext"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyshm"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxystats"
@@ -115,12 +114,12 @@ func RunMaster(ctx context.Context, effective *EffectiveConfig, runtime *Runtime
 		masterGroup.Wait()
 		if extensionStarted {
 			instance.mu.Lock()
-			deadline := instance.deadline
+			deadline, stopping := instance.deadline, instance.stopping
 			instance.mu.Unlock()
-			if deadline.IsZero() {
+			if !stopping {
 				deadline = time.Now().Add(cfg.ShutdownTimeoutDur())
 			}
-			ending, cancel := context.WithDeadline(context.Background(), deadline)
+			ending, cancel := drainContext(deadline)
 			defer cancel()
 			returnErr = errors.Join(returnErr, shutdownExtension(ending, runtime.MasterExtension))
 		}
@@ -145,6 +144,7 @@ func RunMaster(ctx context.Context, effective *EffectiveConfig, runtime *Runtime
 	}
 	metricSet := metrics.New()
 	masterStats := proxystats.NewMasterStats(metricSet, workerIDs)
+	masterStats.InplaceRestart = runtime.inplaceRestart
 
 	var routeSink routesync.Sink = view
 	var managementWrapper proxyextension.ManagementWrapper
@@ -214,7 +214,6 @@ func RunMaster(ctx context.Context, effective *EffectiveConfig, runtime *Runtime
 			TrafficPolicyInvalid: route.TrafficPolicyInvalid,
 		}, true
 	}, logger)
-	statsServer.BootID = instance.identity.BootID
 	managementHandler := statsServer.Handler()
 	if managementWrapper != nil {
 		managementHandler = managementWrapper.WrapManagement(managementHandler)
@@ -239,41 +238,18 @@ func RunMaster(ctx context.Context, effective *EffectiveConfig, runtime *Runtime
 		Subscribe: &routesync.Subscribe{Kind: routesync.KindRouteWake},
 		Proxy: &routesync.Proxy{
 			StatsSocket: &routesync.Socket{Path: cfg.StatsSocket},
-			Instance:    runtime.statsIdentity,
 		},
 		Mmds: true,
 	}
 	dial := func(ctx context.Context) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", cfg.ConfigSocket)
 	}
+	if runtime.candidateDial != nil {
+		dial = runtime.candidateDial
+	}
 	startMasterTask(func() {
 		routesync.NewSubscriber(dial, instance.status.InstanceID, registration, routeSink, view, logger).Run(masterCtx)
 	})
-	if runtime.statsIdentity != nil && runtime.statsIdentity.Slot == "coordinator" {
-		startMasterTask(func() {
-			retry := time.NewTicker(10 * time.Second)
-			defer retry.Stop()
-			for {
-				instance.mu.Lock()
-				changed := instance.changed
-				supported := completionContractSupported(instance.capabilities)
-				instance.mu.Unlock()
-				if supported {
-					for _, receipt := range proxycompletion.Pending(cfg.StatsSocket) {
-						if err := retireProxyInstanceContext(masterCtx, cfg.ConfigSocket, receipt, true); err != nil && masterCtx.Err() == nil {
-							logger.Warn("proxy completion delivery", "err", err)
-						}
-					}
-				}
-				select {
-				case <-changed:
-				case <-retry.C:
-				case <-masterCtx.Done():
-					return
-				}
-			}
-		})
-	}
 
 	var mmdsListener net.Listener
 	mmdsPolicy, ready := view.WaitPolicy(startupCtx)
@@ -318,12 +294,16 @@ func RunMaster(ctx context.Context, effective *EffectiveConfig, runtime *Runtime
 			metricsListener, err = net.Listen("tcp", cfg.MetricsListen)
 		}
 		if err != nil {
-			return fmt.Errorf("proxy listen metrics: %w", err)
+			if runtime.inherited != nil {
+				return fmt.Errorf("proxy inherited metrics listener: %w", err)
+			}
+			logger.Warn("proxy metrics listener", "err", err)
+		} else {
+			defer metricsListener.Close()
+			instance.mu.Lock()
+			instance.status.MetricsAddress = metricsListener.Addr().String()
+			instance.mu.Unlock()
 		}
-		defer metricsListener.Close()
-		instance.mu.Lock()
-		instance.status.MetricsAddress = metricsListener.Addr().String()
-		instance.mu.Unlock()
 	}
 	if runtime.retain != nil {
 		retained, err := retainResources(dataListener, mmdsListener, statsListener, metricsListener, cfg.DataListen, mmdsListen, cfg.StatsSocket, cfg.MetricsListen, cfg.ShmPath)

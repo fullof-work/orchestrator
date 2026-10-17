@@ -244,33 +244,21 @@ func TestTrustedMMDSProxyRegistrationShape(t *testing.T) {
 	}
 }
 
-func TestRegistryStatsSetIncludesDrainingAndDetectsLeaseChanges(t *testing.T) {
+func TestRegistryStatsTargetDuringRestart(t *testing.T) {
 	r := NewRegistry()
-	first := addReadyPlugin(r, "proxy-a")
+	first := addReadyPlugin(r, routesync.ProxyPluginID)
 	second := addReadyPlugin(r, "proxy-b")
 	first.Caps.Proxy.StatsSocket = &routesync.Socket{Path: "/run/a.sock"}
 	second.Caps.Proxy.StatsSocket = &routesync.Socket{Path: "/run/b.sock"}
-	targets, ok := r.ProxyStatsTargets()
-	if !ok || len(targets) != 2 {
-		t.Fatalf("targets=%+v ok=%v", targets, ok)
+	if socket, ok := r.ProxyStatsTarget(); !ok || socket != "/run/a.sock" {
+		t.Fatalf("ordinary instance target: %s %v", socket, ok)
 	}
-	second.ready = false // Not being ready cannot imply that its inflight work is zero.
-	current, ok := r.ProxyStatsTargets()
-	if !ok || len(current) != 2 {
-		t.Fatalf("lost nonready live instance: %+v", current)
+	r.Remove(first)
+	if socket, ok := r.ProxyStatsTarget(); !ok || socket != "/run/b.sock" {
+		t.Fatalf("candidate during exec gap: %s %v", socket, ok)
 	}
-	replacement := &Plugin{ID: first.ID, Caps: first.Caps, cancel: func() {}}
-	r.Add(replacement)
-	current, ok = r.ProxyStatsTargets()
-	if !ok || current[0].Epoch == targets[0].Epoch {
-		t.Fatal("replacement did not change captured identity")
-	}
-	second.Caps.Proxy.StatsSocket = &routesync.Socket{Path: "/run/a.sock"}
-	if _, ok := r.ProxyStatsTargets(); ok {
-		t.Fatal("aliased stats endpoints accepted")
-	}
-	second.Caps.Proxy.StatsSocket = nil
-	if _, ok := r.ProxyStatsTargets(); ok {
-		t.Fatal("unreadable live instance omitted")
+	r.Remove(second)
+	if _, ok := r.ProxyStatsTarget(); ok {
+		t.Fatal("disconnected target remained")
 	}
 }

@@ -156,7 +156,9 @@ func (a *App) InplaceRestart(context.Context) (RestartID, error)
 WaitReady observes this instance's business readiness, including initial
 Bookmark and all configured workers. Status owns its snapshot and separates
 local readiness, whole-service availability and operation progress. Shutdown
-includes B, fixes the first deadline and returns `ErrForcedClose` when required;
+includes B and fixes the first configured deadline. With a zero timeout, this
+explicit call still drains gracefully without a deadline. It returns
+`ErrForcedClose` when required;
 canceling a wait does not cancel cleanup. A stop requested before Run prevents
 startup. From a handler, arrange shutdown asynchronously so it cannot wait for
 its own request to drain.
@@ -170,7 +172,9 @@ extension without completion support reject the operation before draining A.
 B and workers cannot start nested operations.
 
 `inplace_restart` defaults to false and controls only native main-entry SIGUSR2
-registration. Direct App calls work with either value. Run retains SIGINT/TERM
+registration. Both signal and direct App calls require positive
+`shutdown_timeout`; enabling the signal with a zero timeout fails configuration
+validation. Run retains SIGINT/TERM
 handling; RunContext leaves trigger/signal assembly to the embedding entry.
 Keep custom triggers on the main coordinator (`Status.CoordinatorPID` equals
 the current master PID) and preserve their configuration
@@ -189,7 +193,10 @@ with the remaining budget. Join background work and release only owned runtime
 handles; handle partially failed Start as well. No-background-work extensions
 can return immediately. Ordinary startup retains compatibility without this
 interface; InplaceRestart requires it regardless of the signal setting.
-Errors and deadline expiry remain observable. The
+Callback errors retain their meaning; a returned error alone is not reported as
+forced closure. Deadline expiry and actual forced cleanup remain observable.
+`Traffic().Get` exposes `InplaceRestart` while service observations may be incomplete;
+idle consumers must wait for normal single-instance observations. The
 [custom-proxy example](../examples/custom-proxy/README.md) joins its route Watch.
 Lifecycle, listener and control resources remain core-owned; extensions should
 not close service-shared listeners or retain Hosts after Shutdown completion.

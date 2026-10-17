@@ -59,7 +59,7 @@ Static customization interfaces, configuration hooks, runtime binding, private r
 | `paths.proxy_executable` | Empty | Absolute executable for a statically customized Proxy master; empty uses the built-in implementation. Static diagnostics check regular/executable status, absence of group/world writability, and same-file identity, without inferring ownership from the diagnostic command's EUID. Actual root dispatch requires root ownership; non-root dispatch accepts root or its own EUID. It selects node-ctl → master dispatch and the target opened when InplaceRestart is accepted; workers use their own master's image |
 | `paths.run_root` | Required | Node RunRoot; workers construct `<run_root>/sandboxes/<NodeSandboxID>/ctl.sock` locally. This path is not transmitted in routesync `Policy` or shared route records |
 | `data_listen` | Required | The node's sandbox data ingress: TCP `host:port`, or `fd=<name>` for an explicitly supplied named TCP listener |
-| `shutdown_timeout` | `30s` | Positive duration shared by data/MMDS drain; a complete service stop shares one deadline across all instances |
+| `shutdown_timeout` | `0` | Non-negative duration; zero disables InplaceRestart and makes automatic termination immediate. Explicit App.Shutdown still drains gracefully. A positive budget is shared by data/MMDS and, for full stop, all instances |
 | `inplace_restart` | `false` | Register SIGUSR2 in the original master entry when true; direct `App.InplaceRestart` works with either value |
 | `proxy_netns` | Empty | Forwarding namespace; empty uses the current namespace. Otherwise workers run there and the conductor-projected MMDS address is bound there; `data_listen` stays in the master's current namespace |
 | `stats_socket` | `<dir(config_socket)>/proxy-stats.sock` | Traffic-stats UDS owned and registered with the conductor by the master. Must be absolute, cannot conflict with config/SHM paths, and has mode 0600 |
@@ -137,7 +137,7 @@ master:    traffic patch validate/merge → admission apply → route SHM Upsert
 
 The barrier includes all valid Proxy participants, including A and B during replacement. After ACK, Create rechecks registration epochs and the participant set. Disconnect, same-ID replacement, and late or old-session ACKs cannot complete the barrier. All members must ACK before 201 can return. `Hello.proxy_capabilities` includes `inplace_restart_v1` when conductor supports these multi-instance semantics; its absence permits compatible single-instance service but rejects InplaceRestart before draining A.
 
-With conductor `paths.plugin_pidfile` configured, the PID allowlist remains enforced. Conductor omits `inplace_restart_v1` because a new candidate PID cannot be authorized in advance; both restart triggers reject before acceptance and the current instance continues serving. It still declares `proxy_completion_v1`, so ordinary shutdown retains durable statistics and signed completion, including recovery after conductor downtime. This capability does not authorize additional processes.
+With conductor `paths.plugin_pidfile` configured, the PID allowlist remains enforced. The original coordinator opens B's dedicated conductor connection and passes its descriptor over private control, including on reconnect. The connection retains the authorized coordinator PID. B still registers separately and receives its own route stream; other processes gain no new admission rule.
 
 The MMDS extension is not stored in fixed records. For each active sandbox, the master replaces routes and values under one lock; `route_capacity` bounds the heap-entry count. `BeginSync` and routesync disconnection immediately clear the heap and mark it unavailable. A new master starts with an empty view; a full `Bookmark` is required before queries reopen. A worker-only restart does not clear the surviving master's heap; its replacement reconnects through inherited RPC and waits for the shared view to be synchronized before serving. Each `Hello{Policy}` atomically replaces the whole service registry. Running/starting Upsert updates the heap before publishing the SHM route; paused/Delete revokes the heap before updating SHM. Thus workers that sampled an old active row also fail closed, preventing a new lifecycle from being combined with old secrets. `RunID` enters fixed records to bind MMDSv2 tokens to an incarnation. MMDS route declarations and secret-value plaintext never enter fixed records, metrics, or logs.
 
@@ -477,7 +477,7 @@ The hot path never writes the socket. One sender may coalesce arbitrary intermed
 
 Master queries read a continuously maintained aggregate cache, without GET-time fan-out to workers. It compares `idleSince` using Linux boottime and emits only UTC wall time. The effective timestamp is the maximum of worker idle time, the trust start of the current master/worker set, and the first observation of current RunID as running. A disconnected worker stats stream immediately starts a 503 window and terminates that worker. Only after `Wait` confirms exit and kernel closure of backend FDs does the master remove all of its contributions. A replacement sends hello+ready with a new epoch. Stats remains unavailable until ready, and the worker starts serving data listeners only after stats readiness.
 
-Workers send absolute state to their master over socketpairs; the conductor queries every current Proxy registration that may still hold business, including a draining instance. Missing or conflicting identities and failed reads make the aggregate unavailable; they do not count as zero. Route SHM remains master-write/worker-read-only, without a stats area or worker writes. Mutable worker admission columns exist only in the separate arena, never in route records that can move during backshift.
+Workers send absolute state to their master over socketpairs; the conductor queries one live admitted Proxy. During InplaceRestart, `inplaceRestart` marks its instance-local statistics as incomplete service traffic. Failed reads remain unavailable and do not count as zero. Route SHM remains master-write/worker-read-only, without a stats area or worker writes. Mutable worker admission columns exist only in the separate arena, never in route records that can move during backshift.
 
 ## 9. Reliability
 
@@ -549,9 +549,10 @@ The shared data port is never used to confirm a particular candidate's readiness
 
 ### 9.3 Bounded shutdown
 
-Shutdown stops data acceptance, waits for all relevant workers' admitted work,
-then stops and drains MMDS, ends dependencies and extensions, and reaps workers.
-During data drain, MMDS, routes, wake/RPC and statistics remain available.
+Shutdown independently stops data and MMDS acceptance and waits for each
+endpoint's accepted work. A worker exits after both have ended; dependencies
+remain available while its work still uses them. This does not guarantee request
+sequences such as data calling MMDS or consecutive data/MMDS requests.
 Ordinary responses, streaming bodies, HTTP/1 WebSocket and CONNECT tunnels, and
 the supported HTTP/2/h2c paths participate. Existing keep-alive/H2 connections
 cannot begin new business after drain starts; established tunnels can finish.
@@ -567,10 +568,14 @@ connection at the deadline is reported as forced even when the response body
 was delivered in full. That result describes connection cleanup and does not
 mean that an already completed response failed.
 
-One instance shares one positive `shutdown_timeout` across data and MMDS. The
-two InplaceRestart drains each get a budget; full `App.Shutdown` shares one
-deadline across A/A′ and B. Repeated calls never extend it. Caller cancellation
-ends only the wait. Deadline expiry closes remaining work and reaps processes;
+`shutdown_timeout` defaults to zero. Automatic termination (SIGINT/SIGTERM in
+Run, or RunContext cancellation) then cleans up immediately; explicit
+`App.Shutdown(ctx)` still drains accepted work without a configured deadline.
+InplaceRestart requires a positive timeout. With a positive value, one instance
+shares the budget across data and MMDS. Each of the two restart drains gets one
+budget; full Shutdown shares one deadline across A/A′ and B. Repeated calls never
+extend it, and caller cancellation ends only the wait. Deadline expiry closes
+remaining work and reaps processes;
 `ErrForcedClose` and `completed_with_forced_close` distinguish this outcome.
 An extension's optional `Shutdown(context.Context) error` joins its work after
 the core cancels its Start context. See [extension lifecycle](extensions.md#proxy-lifecycle).
@@ -592,14 +597,15 @@ compatibility. For initial adoption from an older version, use ordinary service
 startup first. Conductor must advertise `inplace_restart_v1`, and configured
 extensions must provide Shutdown; these checks also apply to programmatic calls.
 
-With `inplace_restart: true`, trigger the original master:
+With a positive `shutdown_timeout` and `inplace_restart: true`, trigger the original master:
 
 ```sh
 systemctl kill --kill-who=main --signal=SIGUSR2 kuasar-proxy.service
 ```
 
 The default false leaves SIGUSR2 unregistered; it does not disable
-`App.InplaceRestart(ctx)`. `App.Run()` retains SIGINT/SIGTERM handling. A custom
+`App.InplaceRestart(ctx)` when the timeout is positive. Enabling the signal with
+a zero timeout is a configuration error. `App.Run()` retains SIGINT/SIGTERM handling. A custom
 entry uses `RunContext()` and calls App actions itself; see the
 [public lifecycle API](extensions.md#proxy-lifecycle). Acceptance returns an
 operation ID, not final completion; the original Go stack cannot survive exec.
@@ -626,26 +632,19 @@ For metrics, empty disables all instances; fixed `host:p` uses p for A/A′ and
 p+1 for B; port 0 remains dynamically assigned. Port 65535 rejects the operation.
 B binds and retains its metrics listener before A drains; a conflict fails that
 preparation without scanning further ports. IPv6 follows the same rule. Counters
-may reset per instance and scraping may have a short gap. Traffic statistics
-sum every still-participating instance; unknown, mismatched or unreadable
-contributions return unavailable, and idle time is conservative. Each generation
-keeps existing admission limits and single-generation concurrency slack. Reserve
-capacity for two instances, two quota sets, FD/memory peaks and the adjacent
-metrics port; there is no cross-generation quota transfer.
+may reset per instance and scraping may have a short gap. Ordinary startup logs
+a metrics bind failure and continues serving; restart requires the configured
+metrics resources to be available before A drains.
 
-Conductor persists the two instance ownership slots across registration loss and
-its own restart. Retirement follows actual worker/process completion; losing a
-connection does not imply zero traffic. Stats queries bind both the registration
-epoch and instance BootID. A private 0600 `.proxy-service-completion-<service-id>`
-file in the configured stats directory is retained across image replacement.
-Only the coordinator signs it, after the entire service has ended. If conductor
-is unavailable at shutdown, the signed file preserves completion without
-extending the service's stop deadline. Conductor consumes it on recovery or a
-stats query; a later admitted coordinator also retries delivery of completed
-files in that directory. Durable retirement precedes removal of the file and
-ownership records. Do not remove incomplete files to make statistics appear
-idle: missing, corrupt or unverifiable evidence remains unavailable. Keep the
-stats directory accessible to conductor and writable by the Proxy service.
+Traffic statistics remain instance-local. The existing traffic response exposes
+`inplaceRestart: true` from acceptance through operation cleanup, including when
+B answers during the exec gap. Idle consumers must treat these observations as
+incomplete and read normal single-instance statistics again after completion.
+An unavailable read is still an error, never zero or evidence that restart ended.
+There are no persistent statistics records, completion files or cross-instance
+counter aggregation. Each generation keeps existing admission limits and
+single-generation concurrency slack. Reserve capacity for two instances, two
+quota sets, FD/memory peaks and the adjacent metrics port.
 
 ### 9.5 Named listeners and systemd deployment
 

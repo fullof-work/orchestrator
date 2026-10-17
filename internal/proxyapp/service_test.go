@@ -1,7 +1,6 @@
 package proxyapp
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -11,8 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kuasar-sandbox/orchestrator/internal/proxycompletion"
-	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"golang.org/x/sys/unix"
 )
 
@@ -38,56 +35,17 @@ func TestReapedCandidateWithExpiredDeadlineIsNotForced(t *testing.T) {
 	wire.conn.Close()
 	ended := make(chan struct{})
 	close(ended)
-	// Model an already joined process with an unavailable retirement ACK.
+	// Model an already joined process, even when cleanup is repeated.
 	// This impossible Linux PID cannot name any real process group if the
 	// regression incorrectly takes its force-close branch.
-	child := &serviceChild{pid: 1 << 30, boot: "ended", generation: 1,
+	child := &serviceChild{pid: 1 << 30, boot: "ended",
 		wire: wire, done: ended, readerDone: ended}
 	service.child = child
 	for retry := 0; retry < 100; retry++ {
-		err := service.reapChild(child, time.Now().Add(-time.Second), false)
-		if err == nil || errors.Is(err, ErrForcedClose) || service.operation.ForcedCloseCount != 0 {
+		err := service.reapChild(child, time.Now().Add(-time.Second))
+		if err != nil || errors.Is(err, ErrForcedClose) || service.operation.ForcedCloseCount != 0 {
 			t.Fatalf("completed candidate falsely forced at retry %d: %v, forced=%d", retry, err, service.operation.ForcedCloseCount)
 		}
-	}
-}
-
-func TestCompletionBeforeSuccessorInitialization(t *testing.T) {
-	s := NewService()
-	cfg := testProxyConfig(t)
-	cfg.StatsSocket = filepath.Join(t.TempDir(), "stats.sock")
-	cfg.ConfigSocket = filepath.Join(t.TempDir(), "offline.sock")
-	var err error
-	s.baseline, err = FreezeConfig(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s.ownershipRestored = true
-	identity := routesync.ProxyInstance{ServiceID: s.serviceID, BootID: s.serviceID, Slot: "coordinator", Generation: 1, CoordinatorPID: os.Getpid()}
-	s.completion, s.completionKey, err = proxycompletion.Create(cfg.StatsSocket, identity)
-	if err != nil {
-		t.Fatal(err)
-	}
-	identity.Completion = s.completion
-	s.child = &serviceChild{done: make(chan struct{})}
-	if err := s.finishServiceRegistration(); err == nil {
-		t.Fatal("signed completion before candidate reaping")
-	}
-	if done, _ := proxycompletion.Verify(identity); done {
-		t.Fatal("live candidate was signed complete")
-	}
-	close(s.child.done)
-	if err := s.finishServiceRegistration(); err != nil {
-		t.Fatal(err)
-	}
-	if done, err := proxycompletion.Verify(identity); err != nil || !done {
-		t.Fatalf("uninitialized A-prime lost completed B responsibility: %v %v", done, err)
-	}
-	s.operation, s.target = &RestartStatus{ID: "test"}, &restartTarget{}
-	candidate := s.envelope("candidate", newBootID(), "proxy-b", &retainedResources{})
-	successor := s.envelope("resume", newBootID(), "proxy", &retainedResources{})
-	if len(candidate.CompletionKey) != 0 || !bytes.Equal(successor.CompletionKey, s.completionKey) {
-		t.Fatal("completion signing authority crossed the wrong process boundary")
 	}
 }
 
@@ -249,13 +207,14 @@ func TestStopRecordKeepsFirstDeadlineAndSurvivesDuplicate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, err := continued.read(); err != nil || !got.Equal(first) {
+	if got, _, err := continued.read(); err != nil || !got.Equal(first) {
 		t.Fatalf("lost stop=%v %v", got, err)
 	}
 }
 
 func TestShutdownPersistsBeforeExecAndCancelsOnlyCallerWait(t *testing.T) {
 	service := NewService()
+	service.timeout = time.Second
 	service.started = true
 	var err error
 	service.stopRecord, err = newStopRecord()
@@ -281,7 +240,7 @@ func TestShutdownPersistsBeforeExecAndCancelsOnlyCallerWait(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Error("stop was not published while exec held the action mutex")
 	}
-	first, err := service.stopRecord.read()
+	first, _, err := service.stopRecord.read()
 	if err != nil || first.IsZero() {
 		t.Errorf("stop intent was not durable before exec: %v %v", first, err)
 	}
@@ -308,7 +267,7 @@ func TestShutdownPersistsBeforeExecAndCancelsOnlyCallerWait(t *testing.T) {
 	if err := service.shutdownAll(); err != nil {
 		t.Fatal(err)
 	}
-	second, err := service.stopRecord.read()
+	second, _, err := service.stopRecord.read()
 	if err != nil || (!first.IsZero() && !first.Equal(second)) {
 		t.Fatalf("stop deadline changed after caller cancellation: %v %v", second, err)
 	}
@@ -316,6 +275,7 @@ func TestShutdownPersistsBeforeExecAndCancelsOnlyCallerWait(t *testing.T) {
 
 func TestShutdownBeforeStopRecordPublicationKeepsDeadline(t *testing.T) {
 	service := NewService()
+	service.timeout = time.Second
 	service.started = true
 	if err := service.requestShutdown(); err != nil {
 		t.Fatal(err)
@@ -338,7 +298,7 @@ func TestShutdownBeforeStopRecordPublicationKeepsDeadline(t *testing.T) {
 	if err := service.requestShutdown(); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := record.read(); err != nil || !got.Equal(first) {
+	if got, _, err := record.read(); err != nil || !got.Equal(first) {
 		t.Fatalf("record publication reset the stop budget: %v, %v", got, err)
 	}
 }

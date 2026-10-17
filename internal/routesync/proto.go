@@ -261,12 +261,8 @@ type Hello struct {
 }
 
 // InplaceRestartV1 promises capability-based Proxy registration, all-participant
-// route barriers, conservative multi-instance traffic statistics, and completion.
+// route barriers, and instance-local statistics marked during InplaceRestart.
 const InplaceRestartV1 = "inplace_restart_v1"
-
-// ProxyCompletionV1 promises durable statistics obligations and signed service
-// completion for admitted instances. It does not authorize a new process PID.
-const ProxyCompletionV1 = "proxy_completion_v1"
 
 // ValidateHello enforces the single supported protocol version before a client
 // processes route or command frames from the session.
@@ -304,8 +300,7 @@ type Subscribe struct {
 // Proxy marks the trusted independent proxy registration and optionally exposes
 // its master-only traffic stats socket.
 type Proxy struct {
-	StatsSocket *Socket        `json:"stats_socket,omitempty"`
-	Instance    *ProxyInstance `json:"instance,omitempty"`
+	StatsSocket *Socket `json:"stats_socket,omitempty"`
 }
 
 // Telemetry advertises an optional local HTTP API. Queries never use route frames.

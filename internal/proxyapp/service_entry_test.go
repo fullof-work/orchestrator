@@ -156,6 +156,7 @@ func TestCandidateControlDuringPreparation(t *testing.T) {
 			right.Close()
 			service := NewService()
 			service.started, service.candidate, service.parent = true, true, child
+			service.timeout = time.Second
 			service.stopRecord, _ = newStopRecord()
 			defer service.stopRecord.file.Close()
 			service.baseline, _ = FreezeConfig(testProxyConfig(t))
@@ -179,6 +180,7 @@ func TestCandidateControlDuringPreparation(t *testing.T) {
 				service.local = NewInstance("proxy-b", "boot", "operation", 0)
 				service.local.finish(failure)
 				service.stopDeadline = time.Now().Add(time.Second)
+				service.stopRequested = true
 			}
 			done := make(chan error, 1)
 			go func() { done <- service.runCandidate(context.Background()) }()
@@ -196,7 +198,7 @@ func TestCandidateControlDuringPreparation(t *testing.T) {
 				if mode == "error_and_drain_no_ack" {
 					deadline = time.Now().Add(20 * time.Millisecond)
 				}
-				if err := parent.send(serviceMessage{Kind: "drain", Deadline: deadline, HoldMMDS: true}); err != nil {
+				if err := parent.send(serviceMessage{Kind: "drain", Deadline: deadline}); err != nil {
 					t.Fatal(err)
 				}
 				if mode == "error_and_drain" {
@@ -258,7 +260,7 @@ func TestServiceRealShutdownBeforeContinuationRun(t *testing.T) {
 				}
 				cfg.DataListen = listener.Addr().String()
 				listener.Close()
-				consume := serveFixtureRoutes(t, cfg.ConfigSocket, false)
+				serveFixtureRoutes(t, cfg.ConfigSocket, false)
 				input, _ := json.Marshal(cfg)
 				configPath := filepath.Join(dir, "config.json")
 				if err := os.WriteFile(configPath, input, 0600); err != nil {
@@ -377,7 +379,6 @@ func TestServiceRealShutdownBeforeContinuationRun(t *testing.T) {
 						t.Fatalf("owned process %d remains: %v", pid, err)
 					}
 				}
-				consume()
 				paths, _ := filepath.Glob(filepath.Join(dir, ".proxy-*"))
 				if len(paths) != 0 {
 					t.Fatalf("candidate resources remain: %v", paths)

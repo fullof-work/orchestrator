@@ -282,7 +282,8 @@ func (a *App) InplaceRestart(context.Context) (RestartID, error)
 
 WaitReady 等待本实例业务就绪，包括初始 Bookmark 和全部配置 worker。
 Status 返回独立快照，区分本地、整个服务和操作状态。Shutdown 包含 B，以第一次调用固定
-期限，强制收尾返回可识别的 `ErrForcedClose`；取消等待不取消实际清理。Run 前已请求停止
+期限；timeout 为 0 时显式调用仍优雅排空，不设置隐含期限。强制收尾返回可识别的
+`ErrForcedClose`；取消等待不取消实际清理。Run 前已请求停止
 就不再启动。在 handler 内应异步安排停机，避免等待自己的请求排空。
 
 InplaceRestart 返回受理结果与 ID。受理前 context 取消会中止请求，受理后引擎独立推进。
@@ -291,7 +292,8 @@ InplaceRestart 返回受理结果与 ID。受理前 context 取消会中止请�
 `errors.Is` 识别。Conductor、目标或资源不兼容，以及扩展缺少结束能力，会在排空 A 前
 拒绝操作。B 与 worker 不能发起嵌套操作。
 
-`inplace_restart` 默认 false，仅控制原生主入口注册 SIGUSR2；两种取值均可直接调用 App。
+`inplace_restart` 默认 false，仅控制原生主入口注册 SIGUSR2；两种取值下直接调用 App
+都要求正值 `shutdown_timeout`。timeout 为 0 时启用信号会在配置校验时拒绝。
 Run 保留 SIGINT/TERM；RunContext 由嵌入入口自行组装信号和触发器。自定义触发器应只安装
 在 `Status.CoordinatorPID` 等于当前 master PID 的主协调实例，并在程序入口重新运行时
 保持原配置。核心动作不选择信号。
@@ -307,7 +309,8 @@ type Shutdown interface {
 业务排空后，核心先取消 Start context，再用剩余预算调用 Shutdown。扩展等待后台工作
 结束，只释放自有材料，也应处理部分失败的 Start。无后台工作的扩展可立即返回。
 普通启动兼容没有此接口的扩展，InplaceRestart 则始终要求该接口，与信号开关无关。
-回调错误和超时可观察。[custom-proxy 示例](../examples/custom-proxy/README_zh.md)
+回调错误保留原有含义，不仅因返回错误就标记强制关闭；超时和实际强制清理分别可观察。
+`Traffic().Get` 的 `InplaceRestart` 标记服务观测可能不完整，idle 消费方应等待正常单实例读数。[custom-proxy 示例](../examples/custom-proxy/README_zh.md)
 等待路由 Watch 退出。生命周期、listener 与控制资源仍由核心拥有；扩展不得关闭服务共享
 listener，也不得在 Shutdown 完成后继续使用 Host。
 

@@ -23,8 +23,6 @@ func (s *Service) restoreLocked(c *Continuation) error {
 	e := c.envelope
 	s.input = e.Input
 	s.operation = &e.Operation
-	s.serviceID, s.localGeneration, s.childGeneration = e.ServiceID, e.LocalGeneration, e.ChildGeneration
-	s.completion, s.completionKey = e.Completion, e.CompletionKey
 	baseline, err := effectiveConfigFromRaw(e.Baseline, sha256.Sum256(e.Baseline))
 	if err != nil {
 		return err
@@ -56,7 +54,6 @@ func (s *Service) restoreLocked(c *Continuation) error {
 			return fmt.Errorf("proxy continuation child identity invalid")
 		}
 		child := &serviceChild{pid: e.CandidatePID, boot: boot, wire: wire, resources: &retainedResources{StatsPath: e.CandidateStatsPath, ShmPath: e.CandidateShmPath, StatsIdentity: e.CandidateStatsIdentity, ShmIdentity: e.CandidateShmIdentity, Metrics: c.take(e.Files.CandidateMetrics), MetricsExpression: e.CandidateMetricsExpression}, status: InstanceStatus{PID: e.CandidatePID, BootID: boot, Phase: "starting"}, done: make(chan struct{}), changed: make(chan struct{}), detached: make(chan struct{})}
-		child.generation = e.ChildGeneration
 		s.child = child
 		// Restore supervision before validating or preparing business resources.
 		s.watchChild(child)
@@ -112,12 +109,13 @@ func (s *Service) restoreLocked(c *Continuation) error {
 
 func (s *Service) runCandidate(ctx context.Context) error {
 	defer s.parent.conn.Close()
-	deadline, err := s.stopRecord.read()
+	deadline, requested, err := s.stopRecord.read()
 	if err != nil {
 		return err
 	}
-	if !deadline.IsZero() {
+	if requested {
 		s.mu.Lock()
+		s.stopRequested = true
 		s.stopDeadline = deadline
 		s.mu.Unlock()
 	}
@@ -125,8 +123,23 @@ func (s *Service) runCandidate(ctx context.Context) error {
 	messages := make(chan serviceMessage, 1)
 	connectionError := make(chan error, 1)
 	readerCtx, cancelReader := context.WithCancel(context.Background())
-	defer cancelReader()
+	s.configReplies = make(chan serviceMessage, 1)
+	readerDone := make(chan struct{})
+	defer func() {
+		cancelReader()
+		s.parent.conn.Close()
+		<-readerDone
+		for {
+			select {
+			case reply := <-s.configReplies:
+				closeFile(reply.file)
+			default:
+				return
+			}
+		}
+	}()
 	go func() {
+		defer close(readerDone)
 		for {
 			message, err := s.parent.read()
 			if err != nil {
@@ -138,6 +151,14 @@ func (s *Service) runCandidate(ctx context.Context) error {
 				connectionError <- err
 				return
 			}
+			if message.Kind == "config_connected" {
+				select {
+				case s.configReplies <- message:
+				default:
+					closeFile(message.file)
+				}
+				continue
+			}
 			// Read-only service snapshots need no business-loop action. Consume
 			// them here so they cannot delay a stop while Configure is running.
 			if message.Kind == "service" && message.Service != nil {
@@ -146,7 +167,7 @@ func (s *Service) runCandidate(ctx context.Context) error {
 				s.mu.Unlock()
 				continue
 			}
-			if message.Kind == "drain" && !message.Deadline.IsZero() {
+			if message.Kind == "drain" {
 				s.mu.Lock()
 				if s.candidateDeadline.IsZero() || message.Deadline.Before(s.candidateDeadline) {
 					s.candidateDeadline = message.Deadline
@@ -164,7 +185,7 @@ func (s *Service) runCandidate(ctx context.Context) error {
 		}
 	}()
 	s.mu.Lock()
-	earlyStop := !s.stopDeadline.IsZero()
+	earlyStop := s.stopRequested
 	s.mu.Unlock()
 	var preparationErr error
 	if earlyStop {
@@ -189,7 +210,6 @@ func (s *Service) runCandidate(ctx context.Context) error {
 	// local may contain a failed snapshot with no runner. Only a published
 	// completion channel denotes business which must actually be joined.
 	hasBusiness := s.localDone != nil
-	var gate chan struct{}
 	paused := false
 	sendSnapshot := func() error {
 		if !hasBusiness {
@@ -233,38 +253,17 @@ func (s *Service) runCandidate(ctx context.Context) error {
 				return errors.Join(preparationErr, err)
 			}
 			s.local.requestStop(time.Now().Add(s.timeout))
-			if gate != nil {
-				close(gate)
-				gate = nil
-			}
 			return errors.Join(err, <-s.localDone)
 		case <-ctxDone:
 			ctxDone = nil
-			_ = s.requestShutdown()
+			_ = s.requestAutomaticShutdown()
 		case message := <-messages:
 			switch message.Kind {
 			case "drain":
-				if message.Deadline.IsZero() {
-					return fmt.Errorf("candidate drain deadline missing")
-				}
 				if !hasBusiness {
 					return preparationErr
 				}
-				if message.HoldMMDS {
-					s.stopOnce.Do(func() { close(s.stop) })
-				}
-				if message.HoldMMDS && gate == nil {
-					gate = make(chan struct{})
-					s.local.mu.Lock()
-					s.local.mmdsGate = gate
-					s.local.mu.Unlock()
-				}
 				s.local.requestStop(message.Deadline)
-			case "release_mmds":
-				if gate != nil {
-					close(gate)
-					gate = nil
-				}
 			case "detach":
 				paused = true
 				if err := s.parent.send(serviceMessage{Kind: "detached"}); err != nil {
@@ -304,7 +303,7 @@ func (s *Service) runCandidate(ctx context.Context) error {
 // This shares one bounded control budget and never extends an existing drain.
 func (s *Service) finishCandidateError(cause error, messages <-chan serviceMessage, connectionError <-chan error) error {
 	deadline := time.Now().Add(2 * time.Second)
-	if drain := s.drainDeadline(); drain.Before(deadline) {
+	if drain := s.drainDeadline(); !drain.IsZero() && drain.Before(deadline) {
 		deadline = drain
 	}
 	s.mu.Lock()
@@ -320,7 +319,7 @@ func (s *Service) finishCandidateError(cause error, messages <-chan serviceMessa
 		}
 		local.mu.Unlock()
 	}
-	if err := s.parent.send(serviceMessage{Kind: "error", Error: cause.Error(), Deadline: deadline}); err != nil {
+	if err := s.parent.send(serviceMessage{Kind: "error", Error: cause.Error(), Forced: errors.Is(cause, ErrForcedClose), Deadline: deadline}); err != nil {
 		return errors.Join(cause, err)
 	}
 	timer := time.NewTimer(max(time.Until(deadline), 0))
@@ -335,7 +334,7 @@ func (s *Service) finishCandidateError(cause error, messages <-chan serviceMessa
 				deadline = message.Deadline
 				timer.Reset(max(time.Until(deadline), 0))
 			}
-			// Drain/release/detach cannot restart ended business. Consuming
+			// Drain/detach cannot restart ended business. Consuming
 			// them also prevents the single reader from blocking ahead of ACK.
 		case err := <-connectionError:
 			return errors.Join(cause, err)
@@ -346,9 +345,6 @@ func (s *Service) finishCandidateError(cause error, messages <-chan serviceMessa
 }
 
 func (s *Service) execTarget() error {
-	if err := s.finishLocalRegistration(); err != nil {
-		return err
-	}
 	s.mu.Lock()
 	child, r, target, record := s.child, s.resources, s.target, s.stopRecord
 	s.mu.Unlock()
@@ -422,11 +418,11 @@ func (s *Service) execTarget() error {
 	}
 	s.actionMu.Lock()
 	defer s.actionMu.Unlock()
-	deadline, err := record.read()
+	_, requested, err := record.read()
 	if err != nil {
 		return err
 	}
-	if !deadline.IsZero() {
+	if requested {
 		return ErrStopped
 	}
 	releaseSignal, err := holdRestartSignal(s.input.Signals && s.baseline.config.InplaceRestart)

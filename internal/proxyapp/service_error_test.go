@@ -37,6 +37,7 @@ func TestCandidateTerminalErrorSurvivesQueuedControl(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			parent, peer := terminalErrorWires(t)
 			candidate := NewService()
+			candidate.timeout = time.Second
 			candidate.parent = peer
 			if drained {
 				candidate.local = NewInstance("candidate", "boot", "operation", 0)
@@ -45,7 +46,7 @@ func TestCandidateTerminalErrorSurvivesQueuedControl(t *testing.T) {
 				// would deadlock just as in the real localDone failure path.
 				candidate.localDone = make(chan error)
 			}
-			for _, kind := range []string{"error_ack", "drain", "release_mmds", "detach", "resume"} {
+			for _, kind := range []string{"error_ack", "drain", "detach", "resume"} {
 				if err := parent.send(serviceMessage{Kind: kind, Error: "stale error", Deadline: time.Now().Add(time.Second)}); err != nil {
 					t.Fatal(err)
 				}
@@ -94,6 +95,7 @@ func TestCandidateTerminalErrorKeepsDeadlineAndCause(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			parent, peer := terminalErrorWires(t)
 			candidate := NewService()
+			candidate.timeout = time.Second
 			candidate.parent = peer
 			candidate.local = NewInstance("candidate", "boot", "operation", 0)
 			candidate.local.deadline = time.Now().Add(20 * time.Millisecond)

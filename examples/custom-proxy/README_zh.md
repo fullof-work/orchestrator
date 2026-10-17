@@ -51,8 +51,11 @@ client-auth 策略由核心拥有。Cluster ingress 没有 Extension，需在外
 xproxy 与 node-ctl 应来自兼容 orchestrator 版本。
 
 示例使用 App.Run：SIGINT/SIGTERM 请求整个服务停机；`inplace_restart: true` 时仅主协调
-入口注册 SIGUSR2，默认 false 不接管该信号。两种配置都可在 WaitReady 后直接调用
-`app.InplaceRestart(ctx)`。方法返回受理 ID，随后通过 `app.Status()` 或 `GET /status`
+入口注册 SIGUSR2，且必须设置正值 `shutdown_timeout`。默认 false 不接管该信号。
+timeout 为正时，两种配置都可在 WaitReady 后直接调用 `app.InplaceRestart(ctx)`。
+timeout 省略或为零时，InplaceRestart 不可用，自动停机立即收尾；显式
+`app.Shutdown(ctx)` 仍可优雅排空，不补隐含期限，取消 context 只结束调用者等待。
+方法返回受理 ID，随后通过 `app.Status()` 或 `GET /status`
 观察完成；原 Go 调用栈不能跨 exec 保留。自定义信号使用 RunContext，由入口只在主协调
 实例安装触发器；B 与 worker 拒绝嵌套动作。
 

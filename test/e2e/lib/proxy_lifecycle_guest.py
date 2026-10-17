@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Finite streaming Guest requests that need MMDS after their release barrier."""
+"""Finite streaming Guest requests and separate MMDS checks during takeover."""
 import argparse
 import base64
 import http.client
@@ -52,7 +52,9 @@ class Guest(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         route = urlsplit(self.path)
-        if route.path == '/health':
+        if route.path in ('/health', '/metadata'):
+            if route.path == '/metadata':
+                metadata(*metadata_connection())
             self.send_response(200)
             self.send_header('Content-Length', '8')
             self.end_headers()
@@ -67,25 +69,17 @@ class Guest(http.server.BaseHTTPRequestHandler):
             self.send_response(204)
             self.end_headers()
             return
-        # Keep one accepted MMDS connection so the host can prove which worker
-        # owns it. The identity request itself runs after data draining starts.
-        mmds, token = metadata_connection()
-        expected = b'begin\nmmds-ok\ncomplete\n'
+        expected = b'begin\ncomplete\n'
         self.send_response(200)
         self.send_header('Content-Length', str(len(expected)))
-        self.send_header('X-MMDS-Source-Port', str(mmds.sock.getsockname()[1]))
         self.end_headers()
         self.wfile.write(b'begin\n')
         self.wfile.flush()
         if not event(key).wait(45):
-            mmds.close()
             self.close_connection = True
             return
         try:
-            metadata(mmds, token)
-            # Also require a new MMDS request while data is draining.
-            metadata(*metadata_connection())
-            self.wfile.write(b'mmds-ok\ncomplete\n')
+            self.wfile.write(b'complete\n')
         except Exception:
             self.close_connection = True
 

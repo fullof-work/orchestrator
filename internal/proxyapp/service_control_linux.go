@@ -24,8 +24,10 @@ type serviceMessage struct {
 	Service     *Status         `json:"service,omitempty"`
 	CanShutdown bool            `json:"can_shutdown,omitempty"`
 	Deadline    time.Time       `json:"deadline,omitempty"`
-	HoldMMDS    bool            `json:"hold_mmds,omitempty"`
+	Forced      bool            `json:"forced,omitempty"`
 	Error       string          `json:"error,omitempty"`
+	Request     uint64          `json:"request,omitempty"`
+	file        *os.File
 }
 
 // Packet framing leaves no userspace read-ahead to lose across exec. The
@@ -98,17 +100,44 @@ func (w *serviceWire) send(message serviceMessage) error {
 		deadline = message.Deadline
 	}
 	_ = w.conn.SetWriteDeadline(deadline)
-	_, err = w.conn.Write(payload)
+	var rights []byte
+	if message.file != nil {
+		rights = unix.UnixRights(int(message.file.Fd()))
+	}
+	_, _, err = w.conn.WriteMsgUnix(payload, rights, nil)
 	return err
 }
 
 func (w *serviceWire) read() (serviceMessage, error) {
 	buffer := make([]byte, maxServiceMessage)
-	n, _, flags, _, err := w.conn.ReadMsgUnix(buffer, nil)
+	oob := make([]byte, unix.CmsgSpace(4))
+	n, oobn, flags, _, err := w.conn.ReadMsgUnix(buffer, oob)
 	if err != nil {
 		return serviceMessage{}, err
 	}
-	if flags&unix.MSG_TRUNC != 0 {
+	var files []*os.File
+	messages, parseErr := unix.ParseSocketControlMessage(oob[:oobn])
+	for _, control := range messages {
+		fds, e := unix.ParseUnixRights(&control)
+		if e != nil {
+			parseErr = e
+			continue
+		}
+		for _, fd := range fds {
+			unix.CloseOnExec(fd)
+			files = append(files, os.NewFile(uintptr(fd), "proxy-candidate-config"))
+		}
+	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			closeFiles(files)
+		}
+	}()
+	if parseErr != nil {
+		return serviceMessage{}, parseErr
+	}
+	if flags&(unix.MSG_TRUNC|unix.MSG_CTRUNC) != 0 {
 		return serviceMessage{}, fmt.Errorf("proxy service message truncated")
 	}
 	var message serviceMessage
@@ -117,6 +146,13 @@ func (w *serviceWire) read() (serviceMessage, error) {
 	}
 	if message.Version != continuationVersion || message.BootID != w.boot || message.Operation != w.operation {
 		return message, fmt.Errorf("%w: service control identity", ErrIncompatible)
+	}
+	if len(files) != 0 {
+		if len(files) != 1 || message.Kind != "config_connected" || message.Error != "" {
+			return serviceMessage{}, fmt.Errorf("unexpected descriptor in service control")
+		}
+		message.file = files[0]
+		transferred = true
 	}
 	return message, nil
 }

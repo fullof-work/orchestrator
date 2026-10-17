@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/listenresource"
-	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"golang.org/x/sys/unix"
 )
 
@@ -21,7 +20,6 @@ type serviceChild struct {
 	mu             sync.Mutex
 	pid            int
 	boot           string
-	generation     uint64
 	wire           *serviceWire
 	resources      *retainedResources
 	status         InstanceStatus
@@ -136,6 +134,8 @@ func (s *Service) readChild(c *serviceChild) {
 				return
 			}
 			switch message.Kind {
+			case "connect_config":
+				go s.connectCandidateConfig(c, message.Request)
 			case "snapshot":
 				if message.Status == nil || message.Status.BootID != c.boot || message.Status.PID != c.pid {
 					c.mu.Lock()
@@ -153,6 +153,9 @@ func (s *Service) readChild(c *serviceChild) {
 			case "error":
 				c.mu.Lock()
 				c.err = errors.New(message.Error)
+				if message.Forced {
+					c.err = errors.Join(c.err, ErrForcedClose)
+				}
 				c.status.Ready = false
 				c.notifyLocked()
 				c.mu.Unlock()
@@ -284,10 +287,7 @@ func cleanContinuationEnvironment() []string {
 func (s *Service) envelope(mode, boot, id string, r *retainedResources) continuationEnvelope {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	e := continuationEnvelope{ServiceID: s.serviceID, Completion: s.completion, LocalGeneration: s.localGeneration, ChildGeneration: s.childGeneration, Mode: mode, Input: s.input, Baseline: append([]byte(nil), s.baseline.raw...), BootID: boot, InstanceID: id, Operation: *s.operation, TargetIdentity: s.target.identity, TargetDigest: s.target.digest, DataExpression: r.DataExpression, MMDSExpression: r.MMDSExpression, StatsPath: r.StatsPath, ShmPath: r.ShmPath, StatsIdentity: r.StatsIdentity, ShmIdentity: r.ShmIdentity, MetricsExpression: r.MetricsExpression}
-	if mode == "resume" {
-		e.CompletionKey = append([]byte(nil), s.completionKey...)
-	}
+	e := continuationEnvelope{Mode: mode, Input: s.input, Baseline: append([]byte(nil), s.baseline.raw...), BootID: boot, InstanceID: id, Operation: *s.operation, TargetIdentity: s.target.identity, TargetDigest: s.target.digest, DataExpression: r.DataExpression, MMDSExpression: r.MMDSExpression, StatsPath: r.StatsPath, ShmPath: r.ShmPath, StatsIdentity: r.StatsIdentity, ShmIdentity: r.ShmIdentity, MetricsExpression: r.MetricsExpression}
 	return e
 }
 
@@ -317,7 +317,6 @@ func (s *Service) startChild() (child *serviceChild, returnErr error) {
 	defer remote.Close()
 	s.mu.Lock()
 	target, record := s.target, s.stopRecord
-	s.childGeneration++
 	s.operation.Attempts++
 	s.operation.Phase = "preparing_b"
 	s.operation.NextAttempt = nil
@@ -367,7 +366,6 @@ func (s *Service) startChild() (child *serviceChild, returnErr error) {
 		return nil, err
 	}
 	child = &serviceChild{pid: process.Pid, boot: boot, wire: wire, resources: r, status: InstanceStatus{InstanceID: envelope.InstanceID, BootID: boot, PID: process.Pid, Phase: "starting"}, done: make(chan struct{}), changed: make(chan struct{}), detached: make(chan struct{})}
-	child.generation = envelope.ChildGeneration
 	_ = process.Release()
 	s.mu.Lock()
 	s.child = child
@@ -377,7 +375,7 @@ func (s *Service) startChild() (child *serviceChild, returnErr error) {
 	return child, nil
 }
 
-func (s *Service) reapChild(c *serviceChild, deadline time.Time, hold bool) (returnErr error) {
+func (s *Service) reapChild(c *serviceChild, deadline time.Time) (returnErr error) {
 	if c == nil {
 		return nil
 	}
@@ -400,13 +398,13 @@ func (s *Service) reapChild(c *serviceChild, deadline time.Time, hold bool) (ret
 		}
 		s.mu.Unlock()
 	}
-	_ = c.wire.send(serviceMessage{Kind: "drain", Deadline: deadline, HoldMMDS: hold})
-	timer := time.NewTimer(max(time.Until(deadline), 0))
-	defer timer.Stop()
+	_ = c.wire.send(serviceMessage{Kind: "drain", Deadline: deadline})
+	ending, cancel := drainContext(deadline)
+	defer cancel()
 	forced := false
 	select {
 	case <-c.done:
-	case <-timer.C:
+	case <-ending.Done():
 		// Both channels may be ready when retrying retirement after the
 		// process group has already been joined. Never signal its old PID or
 		// count a forced business close solely because this deadline expired.
@@ -426,8 +424,7 @@ func (s *Service) reapChild(c *serviceChild, deadline time.Time, hold bool) (ret
 	if forced {
 		err = errors.Join(err, ErrForcedClose)
 	}
-	if err != nil {
-		err = errors.Join(ErrForcedClose, err)
+	if errors.Is(err, ErrForcedClose) {
 		c.mu.Lock()
 		record := !c.forcedRecorded
 		c.forcedRecorded = true
@@ -441,13 +438,6 @@ func (s *Service) reapChild(c *serviceChild, deadline time.Time, hold bool) (ret
 		if cleanup := c.resources.removePaths(); cleanup != nil {
 			return errors.Join(err, cleanup)
 		}
-	}
-	s.mu.Lock()
-	identity := routesync.ProxyInstance{ServiceID: s.serviceID, BootID: c.boot, Slot: "candidate", Generation: c.generation, CoordinatorPID: s.coordinatorPID, Completion: s.completion}
-	configSocket := s.baseline.config.ConfigSocket
-	s.mu.Unlock()
-	if retirement := s.retireInstance(configSocket, identity, true); retirement != nil {
-		return errors.Join(err, retirement)
 	}
 	s.mu.Lock()
 	if s.child == c {

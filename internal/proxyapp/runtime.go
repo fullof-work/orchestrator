@@ -9,11 +9,11 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"net"
 	"os"
 
 	proxyextension "github.com/kuasar-sandbox/orchestrator/app/proxy/extension"
 	publicconfig "github.com/kuasar-sandbox/orchestrator/config"
-	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 // TLSMaterial contains only process-local key and trust material. The proxy
@@ -41,7 +41,8 @@ type Runtime struct {
 	inherited       *retainedResources
 	retain          func(*retainedResources) error
 	privatePaths    bool
-	statsIdentity   *routesync.ProxyInstance
+	inplaceRestart  func() bool
+	candidateDial   func(context.Context) (net.Conn, error)
 	Instance        *Instance
 	ListenerFiles   map[string]*os.File
 	Logger          *slog.Logger

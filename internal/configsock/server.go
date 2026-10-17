@@ -586,7 +586,6 @@ func (s *Server) router() http.Handler {
 	}
 	if s.deps.RouteSource != nil && s.deps.Plugins != nil {
 		mux.HandleFunc(routesync.PluginRegisterPattern, s.handlePluginRegister) // plugin plane: register + route stream
-		mux.HandleFunc("POST "+routesync.ProxyRetirePath, s.handleProxyRetire)
 	}
 	// Everything else is the api plane (e2b control plane + export/import), authed
 	// by X-API-KEY inside the api handler. The "/internal/" routes above are more

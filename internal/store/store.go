@@ -33,14 +33,6 @@ type Store struct {
 }
 
 const schema = `
-CREATE TABLE IF NOT EXISTS proxy_stats_instances (
-  service_id TEXT NOT NULL,
-  slot TEXT NOT NULL,
-  kernel_boot TEXT NOT NULL,
-  retired INTEGER NOT NULL,
-  record_json TEXT NOT NULL,
-  PRIMARY KEY (service_id, slot)
-);
 CREATE TABLE IF NOT EXISTS sandboxes (
   id                   TEXT PRIMARY KEY,
   pause_reason TEXT NOT NULL DEFAULT '',

@@ -66,14 +66,7 @@ func Run(parent context.Context, cfg *publicconfig.Conductor, nodeCtlExecutable 
 	}
 	defer lifecycle.Close()
 
-	kernelBoot, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
-	if err != nil {
-		return fmt.Errorf("proxy stats kernel boot identity: %w", err)
-	}
-	plugins, err := configsock.NewPersistentRegistry(ctx, storage, string(kernelBoot))
-	if err != nil {
-		return fmt.Errorf("restore proxy stats obligations: %w", err)
-	}
+	plugins := configsock.NewRegistry()
 	mx := metrics.New()
 	core := orch.NewResolved(cfg, storage, lifecycle, vswitch.New(
 		executables.ConnectorCtl(),
