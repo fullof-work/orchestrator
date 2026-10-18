@@ -91,11 +91,15 @@ func (i *Instance) workerEvent(index int, epoch uint64, message controlMessage) 
 		i.mu.Unlock()
 		return fmt.Errorf("proxy worker invalid lifecycle event %q", message.Kind)
 	}
-	if message.Forced {
-		i.err = errors.Join(i.err, ErrForcedClose)
-	}
-	if message.Error != "" {
-		i.err = errors.Join(i.err, fmt.Errorf("worker %d: %s", index, message.Error))
+	// A separately signaled worker reports its own result on exit. Only errors
+	// during this instance's drain belong to its eventual shutdown result.
+	if i.stopping {
+		if message.Forced {
+			i.err = errors.Join(i.err, ErrForcedClose)
+		}
+		if message.Error != "" {
+			i.err = errors.Join(i.err, fmt.Errorf("worker %d: %s", index, message.Error))
+		}
 	}
 	peer := w.peer
 	i.recalculateLocked()

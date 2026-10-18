@@ -184,3 +184,24 @@ func TestWorkerOwnStopRetainsEpochAndOrderingChecks(t *testing.T) {
 		}
 	}
 }
+
+func TestWorkerOwnForcedExitDoesNotPoisonLaterServiceShutdown(t *testing.T) {
+	i := NewInstance("proxy", "boot", "", 1)
+	i.workers[0] = workerState{alive: true, prepared: true, ready: true, epoch: 2}
+	for _, kind := range []string{"stop_requested", "data_drained", "mmds_drained", "stopped"} {
+		message := controlMessage{Kind: kind}
+		if kind == "stopped" {
+			message.Forced, message.Error = true, ErrForcedClose.Error()
+		}
+		if err := i.workerEvent(0, 2, message); err != nil {
+			t.Fatal(err)
+		}
+	}
+	i.workerExited(0, 2, ErrForcedClose)
+	// This service stop begins after the separately signaled worker has exited.
+	// No remaining work is forced closed by this later action.
+	i.requestStop(time.Now().Add(time.Second))
+	if err := i.drainWorkers(); err != nil {
+		t.Fatalf("previous worker stop changed later shutdown result: %v", err)
+	}
+}
