@@ -49,10 +49,10 @@ def stop(seconds):
             # Pin the process identity before checking membership and signaling.
             descriptor = os.pidfd_open(main)
             try:
-                if main not in processes(group):
-                    signal.pidfd_send_signal(descriptor, 0)  # Exited while enumerating?
-                    raise ValueError('MAINPID is outside this service cgroup')
-                signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+                if main in processes(group):
+                    signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+                # A main process that just exited may still have a pidfd while
+                # disappearing from cgroup.procs. Continue waiting for B.
             finally:
                 os.close(descriptor)
         except ProcessLookupError:
