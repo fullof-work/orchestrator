@@ -410,6 +410,35 @@ class Probe:
         self.log(kind='full_shutdown', elapsed=time.monotonic() - started, owned_pids=owned,
                  result=result, systemd=values, finite_completed=True, worker_cleanup='application')
 
+    def worker_signal_shutdown(self):
+        # Stop generating new requests while all workers independently stop
+        # admission. Every already accepted response/tunnel must still finish.
+        self.stop_traffic.set()
+        self.load.join()
+        completions = [self.finite('worker-term'), self.websocket(), self.tunnel()]
+        children = Path(f'/proc/{self.pid}/task/{self.pid}/children').read_text().split()
+        assert len(children) == 2, children
+        for child in children:
+            assert digest(f'/proc/{child}/exe') == digest(f'/proc/{self.pid}/exe')
+            os.kill(int(child), signal.SIGTERM)
+        self.wait_status(lambda s: not s['ready'], timeout=5)
+        repeated = 0
+        for child in children:
+            try:
+                os.kill(int(child), signal.SIGTERM)  # The busy worker retains its first deadline.
+                repeated += 1
+            except ProcessLookupError:
+                pass  # An idle worker can already have exited and been replaced.
+        assert repeated, 'no busy worker remained to drain'
+        for complete in reversed(completions):
+            complete()
+        self.wait_status(lambda s: s['ready'], timeout=10)
+        assert self.pid == self.main_pid()
+        assert all(not Path('/proc', child).exists() for child in children), children
+        self.metadata()
+        self.log(kind='worker_term_complete', main_pid=self.pid, old_workers=children,
+                 finite_completed=True, websocket_completed=True, connect_completed=True)
+
     def exec_window_shutdown(self, forced):
         # Main has no Go signal handler at this kernel stop. Only ready B and
         # its real workers can handle the Guest requests established below.
@@ -450,7 +479,7 @@ class Probe:
                          if line.startswith(('SigPnd:', 'ShdPnd:'))]
                 if any(mask & (1 << (signal.SIGTERM - 1)) for mask in masks):
                     break
-                assert time.monotonic() < deadline, 'ExecStop did not queue TERM at exec'
+                assert time.monotonic() < deadline, 'systemd did not queue TERM at exec'
                 time.sleep(.005)
             self.log(kind='exec_stop_term_pending', main_pid=self.pid, candidate=candidate, forced=forced)
             trace.detach()
@@ -464,8 +493,8 @@ class Probe:
             assert not cgroup_processes(self.cgroup), 'B/workers survived their own drain budget'
             assert all(not Path('/proc', pid).exists() for pid in owned), owned
             result = json.loads(exit_record.read_text())
-            assert result == dict(SERVICE_RESULT='signal', EXIT_CODE='killed',
-                                  EXIT_STATUS='15', INVOCATION_ID=invocation), result
+            assert result == dict(SERVICE_RESULT='success', EXIT_CODE='killed',
+                                  EXIT_STATUS='TERM', INVOCATION_ID=invocation), result
             journal = subprocess.check_output(['journalctl', '--no-pager', '-o', 'cat',
                 '_SYSTEMD_INVOCATION_ID=' + invocation], text=True)
             outcome = 'completed_with_forced_close' if forced else 'completed'
@@ -473,7 +502,7 @@ class Probe:
             assert len(lines) == 1 and outcome in lines[0], journal
             if not forced:
                 assert 'completed_with_forced_close' not in lines[0], lines
-            assert '"proxy_stop": "completed"' in journal and '"proxy_stop": "timed_out"' not in journal, journal
+            assert "State 'stop-sigterm' timed out" not in journal, journal
             assert not Path(self.stats).exists()
             assert not Path(self.stats).with_name('proxy-routes.shm').exists()
             assert not list(Path(self.stats).parent.glob('.proxy-*'))
@@ -508,6 +537,8 @@ class Probe:
                 self.check_ready()
                 self.log(kind='ordinary_service_restart', previous=previous, current=self.pid)
             assert self.stable_fds[-1] <= self.stable_fds[0], self.stable_fds
+            if self.config['source'] == 'bothfd' and self.config['entry'] in ('builtin', 'custom'):
+                self.worker_signal_shutdown()
             self.full_shutdown()
             if self.config['source'] == 'bothfd' and self.config['entry'] in ('builtin', 'custom'):
                 self.exec_window_shutdown(False)

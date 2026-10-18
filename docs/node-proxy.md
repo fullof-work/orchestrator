@@ -705,9 +705,8 @@ Type=simple
 RuntimeDirectory=kuasar-proxy
 RuntimeDirectoryMode=0700
 ExecStart=/opt/kuasar/bin/node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
-ExecStop=/usr/bin/python3 -B /opt/kuasar/libexec/proxy_stop.py 40
 Sockets=kuasar-proxy-data.socket kuasar-proxy-mmds.socket
-KillMode=mixed
+KillMode=control-group
 SendSIGKILL=yes
 TimeoutStopSec=45s
 Restart=on-failure
@@ -725,15 +724,18 @@ create that namespace first, and verify its listener with
 not move existing sockets. See
 [systemd namespace semantics](https://github.com/systemd/systemd/blob/v255/man/systemd.exec.xml).
 
-Install the tested [ExecStop example](../test/e2e/lib/proxy_stop.py) at the path
-above with Python 3.9 or later. It signals only the living main process, then
-synchronously waits for this service's cgroup, including B and its workers.
-Choose its wait above `shutdown_timeout` with reaping margin, and
-`TimeoutStopSec` above that wait. `KillMode=mixed` alone can kill B immediately
-when the main process exits; a larger `TimeoutStopSec` alone does not fix this.
-The synchronous command preserves B's drain time, while systemd still forcibly
-cleans up remaining processes on timeout. Do not send TERM to all workers with
-`KillMode=control-group`: their immediate exit interrupts accepted business.
+`KillMode=control-group` sends TERM to the main process, B and their workers.
+Each worker uses its configured drain budget, keeps dependencies until its
+accepted business ends, and reports its stop over the existing control connection.
+The first drain deadline wins when a master command and worker signal overlap.
+Zero still means immediate automatic cleanup. Signaling one worker does not stop
+other instances; its live master retains normal worker supervision. A custom
+`RunContext` entry must translate its chosen termination signals to cancellation.
+Set `TimeoutStopSec` above `shutdown_timeout` with reaping margin. Systemd waits
+for the service's processes and forcibly reclaims any remaining ones at its
+deadline, including when the main process exits first. `KillMode=mixed` can kill
+B immediately after main exit; increasing `TimeoutStopSec` alone does not give B
+its drain time in that mode.
 
 TERM/INT may terminate the main process before Go installs its handlers after
 exec. B detects its control connection closing, starts its own bounded drain,

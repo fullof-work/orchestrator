@@ -57,18 +57,23 @@ func (i *Instance) workerEvent(index int, epoch uint64, message controlMessage) 
 		if !w.prepared {
 			w.prepared = true
 			w.canShutdown = message.CanShutdown
-			start = !i.stopping
+			start = !i.stopping && !w.stopping
 		}
 	case "serving":
 		if !w.prepared {
 			i.mu.Unlock()
 			return fmt.Errorf("proxy worker serving before prepared")
 		}
-		if !i.stopping {
+		if !i.stopping && !w.stopping {
 			w.ready = true
 		}
+	case "stop_requested":
+		// A worker's own termination signal stops only that worker. Preserve
+		// normal supervision and the identity/ordering checks for its drain.
+		w.stopping = true
+		w.ready = false
 	case "data_draining", "data_drained":
-		if !i.stopping {
+		if !i.stopping && !w.stopping {
 			i.mu.Unlock()
 			return fmt.Errorf("proxy worker drained without a stop request")
 		}
@@ -106,7 +111,7 @@ func (i *Instance) workerFinishing(index int, epoch uint64) bool {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	w := i.workers[index]
-	return w.epoch == epoch && i.stopping && w.dataDone && w.mmdsDone
+	return w.epoch == epoch && (i.stopping || w.stopping) && w.dataDone && w.mmdsDone
 }
 
 // drainWorkers stops both endpoints independently, then ends workers only
@@ -119,24 +124,33 @@ func (i *Instance) drainWorkers() error {
 	defer cancel()
 	for _, phase := range []string{"drain", "stop"} {
 		i.mu.Lock()
-		peers := make([]*controlPeer, 0, len(i.workers))
-		for _, w := range i.workers {
-			if w.alive {
-				peers = append(peers, w.peer)
+		type recipient struct {
+			index int
+			epoch uint64
+			peer  *controlPeer
+		}
+		peers := make([]recipient, 0, len(i.workers))
+		for index, w := range i.workers {
+			if w.alive && !w.stopping {
+				peers = append(peers, recipient{index, w.epoch, w.peer})
 			}
 		}
 		i.mu.Unlock()
 		// Send independently: an unresponsive worker cannot delay another worker's
 		// stop-accepting command or consume a fresh per-worker budget.
-		sent := make(chan error, len(peers))
-		for _, peer := range peers {
-			go func() { sent <- peer.send(controlMessage{Kind: phase, Deadline: deadline}) }()
+		type sendResult struct {
+			recipient
+			err error
+		}
+		sent := make(chan sendResult, len(peers))
+		for _, target := range peers {
+			go func() { sent <- sendResult{target, target.peer.send(controlMessage{Kind: phase, Deadline: deadline})} }()
 		}
 		for range peers {
 			select {
-			case err := <-sent:
-				if err != nil {
-					return errors.Join(ErrForcedClose, err)
+			case result := <-sent:
+				if result.err != nil && !i.joinSignaledWorker(ctx, result.index, result.epoch) {
+					return errors.Join(ErrForcedClose, result.err)
 				}
 			case <-ctx.Done():
 				return fmt.Errorf("proxy %s: %w", phase, errors.Join(ErrForcedClose, ctx.Err()))
@@ -165,6 +179,28 @@ func (i *Instance) drainWorkers() error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	return i.err
+}
+
+// A worker may receive TERM between selection above and delivery of a command.
+// A failed send is harmless only after its own stop announcement, complete
+// endpoint/stopped acknowledgments, and actual process exit are all observed.
+func (i *Instance) joinSignaledWorker(ctx context.Context, index int, epoch uint64) bool {
+	for {
+		i.mu.Lock()
+		w, changed := i.workers[index], i.changed
+		i.mu.Unlock()
+		if w.epoch != epoch {
+			return false
+		}
+		if !w.alive {
+			return w.stopping && w.stopped
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return false
+		}
+	}
 }
 
 func (i *Instance) stopped() bool {

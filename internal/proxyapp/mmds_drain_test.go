@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -17,6 +18,19 @@ import (
 )
 
 func TestRealWorkersDrainAcceptedMMDSIndependently(t *testing.T) {
+	testRealWorkersDrainAcceptedMMDS(t, 0)
+}
+
+func TestRealWorkerSignalDrainsAcceptedMMDS(t *testing.T) {
+	for _, stopSignal := range []syscall.Signal{syscall.SIGTERM, syscall.SIGINT} {
+		t.Run(stopSignal.String(), func(t *testing.T) {
+			testRealWorkersDrainAcceptedMMDS(t, stopSignal)
+		})
+	}
+}
+
+func testRealWorkersDrainAcceptedMMDS(t *testing.T, stopSignal syscall.Signal) {
+	signalWorker := stopSignal != 0
 	effective, _ := testMasterEffective(t)
 	cfg := effective.Config()
 	dir, err := os.MkdirTemp("", "proxy-mmds-drain-")
@@ -26,6 +40,9 @@ func TestRealWorkersDrainAcceptedMMDSIndependently(t *testing.T) {
 	defer os.RemoveAll(dir)
 	cfg.ConfigSocket, cfg.StatsSocket, cfg.ShmPath = filepath.Join(dir, "config.sock"), filepath.Join(dir, "stats.sock"), filepath.Join(dir, "routes.shm")
 	cfg.DataListen, cfg.Workers, cfg.ShutdownTimeout = "fd=data", 2, "3s"
+	if signalWorker {
+		cfg.Workers = 1
+	}
 	serviceSocket := filepath.Join(dir, "service.sock")
 	listener, err := net.Listen("unix", serviceSocket)
 	if err != nil {
@@ -127,13 +144,23 @@ func TestRealWorkersDrainAcceptedMMDSIndependently(t *testing.T) {
 	case <-wait.Done():
 		t.Fatal("MMDS request did not reach service")
 	}
-	instance.requestStop(time.Now().Add(3 * time.Second))
+	if signalWorker {
+		instance.mu.Lock()
+		pid := instance.workers[0].pid
+		instance.mu.Unlock()
+		if err := syscall.Kill(pid, stopSignal); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		instance.requestStop(time.Now().Add(3 * time.Second))
+	}
 	for {
 		instance.mu.Lock()
 		status, changed := instance.status, instance.changed
+		workerDataDone, workerMMDSDone := instance.workers[0].dataDone, instance.workers[0].mmdsDone
 		instance.mu.Unlock()
-		if status.Data == "stopped" {
-			if status.MMDS != "draining" {
+		if status.Data == "stopped" || (signalWorker && workerDataDone) {
+			if (!signalWorker && status.MMDS != "draining") || (signalWorker && workerMMDSDone) {
 				t.Fatalf("MMDS request was not retained: %+v", status)
 			}
 			break
@@ -156,6 +183,12 @@ func TestRealWorkersDrainAcceptedMMDSIndependently(t *testing.T) {
 	got.response.Body.Close()
 	if err != nil || got.response.StatusCode != http.StatusAccepted || got.response.Header.Get("Content-Type") != "application/json" || string(body) != `{"mmds":"complete"}` {
 		t.Fatalf("MMDS response truncated: status=%d body=%q err=%v", got.response.StatusCode, body, err)
+	}
+	if signalWorker {
+		if err := instance.WaitReady(wait); err != nil {
+			t.Fatal(err)
+		}
+		instance.requestStop(time.Now().Add(3 * time.Second))
 	}
 	select {
 	case err := <-done:

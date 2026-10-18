@@ -142,6 +142,9 @@ func PrepareWorker(bootstrap *WorkerBootstrap) (_ *PreparedWorker, returnErr err
 // Run starts one prepared worker. It is one-shot and requires a fully resolved
 // process-local Runtime. Returning ends the worker subprocess, not every handler:
 // no successful mapping is unmapped while a handler or extension can use it.
+// Once prepared, ctx cancellation drains this worker's endpoints independently
+// within shutdown_timeout (zero forces immediate cleanup). Dependencies remain
+// alive until drain ends. The first master or local stop deadline is preserved.
 func (worker *PreparedWorker) Run(ctx context.Context, runtime *Runtime) (returnErr error) {
 	if worker == nil || worker.effective == nil || worker.table == nil || runtime == nil || runtime.Logger == nil {
 		return fmt.Errorf("proxy worker: unresolved startup state")
@@ -183,8 +186,12 @@ func (worker *PreparedWorker) Run(ctx context.Context, runtime *Runtime) (return
 		return cfg.Auth
 	}
 
-	workerCtx, cancelWorker := context.WithCancel(ctx)
+	// Once serving, entry cancellation requests drain rather than canceling
+	// handlers, MMDS and extension dependencies before accepted work finishes.
+	workerCtx, cancelWorker := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelWorker()
+	cancelStartup := context.AfterFunc(ctx, cancelWorker)
+	defer cancelStartup()
 	extensionStarted := false
 	var endOnce sync.Once
 	var endErr error
@@ -237,11 +244,11 @@ func (worker *PreparedWorker) Run(ctx context.Context, runtime *Runtime) (return
 		_, found := worker.table.Lookup(sandboxID)
 		return found
 	}, 5*time.Minute)
-	err = worker.serveControlled(workerCtx, endExtension, runtime, ingressHandler,
-		mmds.New(view, cfg.ParkTimeoutDur(), logger).HTTPServer(workerCtx), senderDone)
-	if ctx.Err() != nil {
-		return nil
+	if !cancelStartup() || ctx.Err() != nil {
+		return ctx.Err()
 	}
+	err = worker.serveControlled(workerCtx, ctx.Done(), endExtension, runtime, ingressHandler,
+		mmds.New(view, cfg.ParkTimeoutDur(), logger).HTTPServer(workerCtx), senderDone)
 	return err
 }
 
@@ -360,7 +367,7 @@ func closeControl(peer *controlPeer) error {
 	return closeConn(peer.Conn)
 }
 
-func (worker *PreparedWorker) serveControlled(ctx context.Context, endExtension func(time.Time) error, runtime *Runtime, ingress http.Handler, mmdsHTTP *http.Server, senderDone <-chan error) error {
+func (worker *PreparedWorker) serveControlled(ctx context.Context, stopRequested <-chan struct{}, endExtension func(time.Time) error, runtime *Runtime, ingress http.Handler, mmdsHTTP *http.Server, senderDone <-chan error) error {
 	if worker.control == nil {
 		return fmt.Errorf("proxy worker: lifecycle control is required")
 	}
@@ -407,6 +414,7 @@ func (worker *PreparedWorker) serveControlled(ctx context.Context, endExtension 
 	dataDraining, mmdsDraining, dataDone, mmdsDone := false, false, false, false
 	var deadline time.Time
 	var drainErr error
+	automaticStop := false
 	startDrain := func(server *proxydrain.Server, kind string) {
 		go func() {
 			var err error
@@ -419,10 +427,38 @@ func (worker *PreparedWorker) serveControlled(ctx context.Context, endExtension 
 			drained <- event{message: controlMessage{Kind: kind}, err: err}
 		}()
 	}
+	beginDrain := func(firstDeadline time.Time) {
+		if dataDraining {
+			return
+		}
+		deadline = firstDeadline
+		dataDraining, mmdsDraining = true, true
+		startDrain(data, "data_drained")
+		startDrain(metadata, "mmds_drained")
+	}
+	finish := func() error {
+		drainErr = errors.Join(drainErr, endExtension(deadline))
+		message := controlMessage{Kind: "stopped", Forced: errors.Is(drainErr, ErrForcedClose)}
+		if drainErr != nil {
+			message.Error = drainErr.Error()
+		}
+		_ = worker.control.send(message)
+		return drainErr
+	}
 	for {
+		if automaticStop && dataDone && mmdsDone {
+			return finish()
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-stopRequested:
+			stopRequested = nil
+			automaticStop = true
+			beginDrain(time.Now().Add(worker.effective.config.ShutdownTimeoutDur()))
+			if err := worker.control.send(controlMessage{Kind: "stop_requested"}); err != nil {
+				return err
+			}
 		case err := <-senderDone:
 			return fmt.Errorf("proxy worker stats stream ended: %v", err)
 		case result := <-errorsFromServe:
@@ -480,24 +516,12 @@ func (worker *PreparedWorker) serveControlled(ctx context.Context, endExtension 
 					go func() { errorsFromServe <- serveResult{"mmds", metadata.Serve(worker.mmds)} }()
 				}
 			case "drain":
-				if dataDraining {
-					continue
-				}
-				deadline = e.message.Deadline
-				dataDraining, mmdsDraining = true, true
-				startDrain(data, "data_drained")
-				startDrain(metadata, "mmds_drained")
+				beginDrain(e.message.Deadline)
 			case "stop":
 				if !dataDone || !mmdsDone {
 					return fmt.Errorf("proxy worker stop before endpoints completed")
 				}
-				drainErr = errors.Join(drainErr, endExtension(deadline))
-				message := controlMessage{Kind: "stopped", Forced: errors.Is(drainErr, ErrForcedClose)}
-				if drainErr != nil {
-					message.Error = drainErr.Error()
-				}
-				_ = worker.control.send(message)
-				return drainErr
+				return finish()
 			default:
 				return fmt.Errorf("proxy worker: unexpected control command %q", e.message.Kind)
 			}

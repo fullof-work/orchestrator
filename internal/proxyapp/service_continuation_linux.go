@@ -311,8 +311,13 @@ func (s *Service) finishCandidateAfterControlLoss(cause error) error {
 	s.knownService = nil
 	s.stopOnce.Do(func() { close(s.stop) })
 	local, done, logger := s.local, s.localDone, s.logger
+	deadline := s.stopDeadline
+	if !s.stopRequested {
+		deadline = time.Now().Add(s.timeout)
+		s.stopRequested, s.stopDeadline = true, deadline
+	}
 	s.mu.Unlock()
-	local.requestStop(time.Now().Add(s.timeout))
+	local.requestStop(deadline)
 	err := <-done
 	result := "completed"
 	if errors.Is(err, ErrForcedClose) {

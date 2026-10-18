@@ -237,6 +237,13 @@ func TestPreparedWorkerWaitsForSyncThenUsesWrapperForDataIngress(t *testing.T) {
 		return
 	}
 	harness := newPreparedWorkerHarness(t)
+	cfg := harness.worker.effective.Config()
+	cfg.ShutdownTimeout = "2s" // This test expects graceful automatic shutdown.
+	var err error
+	harness.worker.effective, err = FreezeConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
 	started := make(chan proxyextension.WorkerHost, 1)
 	startContext := make(chan context.Context, 1)
 	extension := &wrappingWorkerExtension{}
@@ -341,6 +348,16 @@ func TestPreparedWorkerWaitsForSyncThenUsesWrapperForDataIngress(t *testing.T) {
 		t.Fatalf("Start=%d Wrap=%d data accepts=%d", extension.calls.Load(), extension.wrapCalls.Load(), harness.data.accepts.Load())
 	}
 	extensionCtx := <-startContext
+	// The entry now requests the same drain/stop flow as the master. Consume
+	// its control acknowledgments while waiting for dependency completion.
+	go func() {
+		for {
+			message, err := harness.control.receive()
+			if err != nil || message.Kind == "stopped" {
+				return
+			}
+		}
+	}()
 	cancel()
 	select {
 	case <-extensionCtx.Done():

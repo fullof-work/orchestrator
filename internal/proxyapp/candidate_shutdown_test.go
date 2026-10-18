@@ -106,3 +106,20 @@ func TestCandidateReleasesOnlyOwnedPaths(t *testing.T) {
 		})
 	}
 }
+
+func TestCandidateControlLossRetainsForwardedStopDeadline(t *testing.T) {
+	s := NewService()
+	s.local = NewInstance("candidate", "boot", "restart", 1)
+	s.timeout = time.Hour
+	s.stopRequested = true
+	s.stopDeadline = time.Now().Add(time.Second)
+	done := make(chan error, 1)
+	done <- nil
+	s.localDone = done
+	if err := s.finishCandidateAfterControlLoss(io.EOF); !errors.Is(err, io.EOF) {
+		t.Fatal(err)
+	}
+	if s.local.deadline != s.stopDeadline {
+		t.Fatal("control EOF extended already forwarded shutdown")
+	}
+}

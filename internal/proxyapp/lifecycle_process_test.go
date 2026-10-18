@@ -10,10 +10,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -59,7 +61,9 @@ func TestMain(m *testing.M) {
 			return err
 		}
 		defer worker.Close()
-		return worker.Run(context.Background(), &Runtime{Logger: testMasterLogger(), WorkerExtension: &lifecycleFixtureExtension{shutdownFault: bootstrap.EffectiveConfig().Config().ShmPath + ".shutdown-fault"}})
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer stop()
+		return worker.Run(ctx, &Runtime{Logger: testMasterLogger(), WorkerExtension: &lifecycleFixtureExtension{shutdownFault: bootstrap.EffectiveConfig().Config().ShmPath + ".shutdown-fault"}})
 	}()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
