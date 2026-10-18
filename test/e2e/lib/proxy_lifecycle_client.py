@@ -521,7 +521,6 @@ class Probe:
             trace.detach()
             if tunnel is not None:
                 tunnel.close()
-        subprocess.run(['systemctl', 'reset-failed', self.config['unit']], check=True)
 
     def run(self):
         self.wait_status(lambda s: s['ready'])

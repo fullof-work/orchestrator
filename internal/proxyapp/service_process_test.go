@@ -562,6 +562,7 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 	var expectedLosses []error
 	var faultWindow atomic.Bool
 	var builds = map[string]int{}
+	targetResponse := make(chan struct{})
 	loadCtx, stopLoad := context.WithCancel(context.Background())
 	loadDone := make(chan struct{})
 	go func() {
@@ -577,7 +578,11 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 					err = fmt.Errorf("business %d %q", response.StatusCode, body)
 				} else {
 					mu.Lock()
-					builds[response.Header.Get("X-Fixture-Build")]++
+					build := response.Header.Get("X-Fixture-Build")
+					builds[build]++
+					if build == "target" && builds[build] == 1 {
+						close(targetResponse)
+					}
 					mu.Unlock()
 				}
 			}
@@ -923,6 +928,13 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 				return status.InplaceRestart != nil && status.InplaceRestart.Phase == "draining_a" && len(status.Instances) == 2
 			})
 			candidate := draining.Instances[1]
+			// Observe actual B business before deliberately stopping all traffic.
+			// Ready can arrive before the load goroutine's first target response.
+			select {
+			case <-targetResponse:
+			case <-time.After(time.Second):
+				t.Fatal("ready candidate did not return a complete business response")
+			}
 			stopLoad()
 			<-loadDone
 			response, err := management.Post("http://proxy/fixture/stop", "", nil)
