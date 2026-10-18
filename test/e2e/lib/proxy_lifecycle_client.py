@@ -416,7 +416,15 @@ class Probe:
         self.stop_traffic.set()
         self.load.join()
         completions = [self.finite('worker-term'), self.websocket(), self.tunnel()]
-        children = Path(f'/proc/{self.pid}/task/{self.pid}/children').read_text().split()
+        # Go can create a worker from any OS thread; Linux lists each child's
+        # creating thread in that thread's children file, not only the leader's.
+        children = set()
+        for task in Path(f'/proc/{self.pid}/task').iterdir():
+            try:
+                children.update((task / 'children').read_text().split())
+            except FileNotFoundError:
+                pass  # An unrelated runtime thread can exit during the scan.
+        children = sorted(children, key=int)
         assert len(children) == 2, children
         for child in children:
             assert digest(f'/proc/{child}/exe') == digest(f'/proc/{self.pid}/exe')
