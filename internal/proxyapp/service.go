@@ -79,6 +79,8 @@ type Service struct {
 	timeout           time.Duration
 	logger            *slog.Logger
 	coordinatorPID    int
+	// Only B retains these path identities, to clean up after its parent dies.
+	coordinatorPaths *retainedResources
 }
 
 // NewService performs no I/O. Runtime resources are acquired by Run.
@@ -488,7 +490,7 @@ func (s *Service) Run(ctx context.Context, input ServiceInput, continuation *Con
 		s.finished.Do(func() { close(s.done) })
 		s.mu.Unlock()
 	}()
-	defer s.releaseService()
+	defer func() { returnErr = errors.Join(returnErr, s.releaseService()) }()
 	if continuation != nil {
 		defer continuation.Close()
 	}
@@ -722,18 +724,23 @@ func (s *Service) operationComplete(result string, err error) {
 	}
 }
 
-func (s *Service) releaseService() {
+func (s *Service) releaseService() error {
 	s.actionMu.Lock()
 	defer s.actionMu.Unlock()
 	s.mu.Lock()
 	s.closing = true
 	resources, target, record := s.resources, s.target, s.stopRecord
 	s.mu.Unlock()
+	var cleanupErr error
 	if resources != nil {
 		resources.close()
-		if !s.candidate {
-			_ = resources.removePaths()
-		}
+		cleanupErr = resources.removePaths()
+	}
+	// A live parent remains responsible for its paths. Reparenting proves that
+	// the original parent exited without relying on a reusable PID lookup. B
+	// only unlinks the exact original files, after its own workers have ended.
+	if s.candidate && s.coordinatorPID > 1 && os.Getppid() != s.coordinatorPID {
+		cleanupErr = errors.Join(cleanupErr, s.coordinatorPaths.removePaths())
 	}
 	if target != nil {
 		target.file.Close()
@@ -744,6 +751,7 @@ func (s *Service) releaseService() {
 	if s.parent != nil {
 		s.parent.conn.Close()
 	}
+	return cleanupErr
 }
 
 // The retry delay is independent of preparation and drain budgets.

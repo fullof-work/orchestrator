@@ -925,9 +925,13 @@ After=kuasar-proxy-data.socket kuasar-proxy-mmds.socket
 
 [Service]
 Type=simple
+RuntimeDirectory=kuasar-proxy
+RuntimeDirectoryMode=0700
 ExecStart=/opt/kuasar/bin/node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
+ExecStop=/usr/bin/python3 -B /opt/kuasar/libexec/proxy_stop.py 40
 Sockets=kuasar-proxy-data.socket kuasar-proxy-mmds.socket
 KillMode=mixed
+SendSIGKILL=yes
 TimeoutStopSec=45s
 Restart=on-failure
 ```
@@ -942,8 +946,24 @@ Restart=on-failure
 已经存在的 socket，见
 [systemd 命名空间语义](https://github.com/systemd/systemd/blob/v255/man/systemd.exec.xml)。
 
-`KillMode=mixed` 先让主进程协调停机，再由 systemd 执行最终 cgroup 清理。
-`TimeoutStopSec` 应大于应用期限并保留回收余量。普通
+将已由真实 E2E 验证的 [ExecStop 示例](../test/e2e/lib/proxy_stop.py) 安装到上述位置，
+使用 Python 3.9 或更新版本。它只向仍存活的主进程发 TERM，然后同步等待本服务
+cgroup 中的进程，包括 B 及其 worker。脚本等待时间应大于 `shutdown_timeout` 并留出
+回收余量，`TimeoutStopSec` 再大于脚本等待时间。单独使用 `KillMode=mixed` 时，
+主进程退出可能导致 systemd 立即杀死 B；仅增大 `TimeoutStopSec` 不能解决。
+同步 ExecStop 为 B 保留排空时间，超时后仍由 systemd 强制回收剩余进程。
+不要用 `KillMode=control-group` 向所有 worker 发 TERM，其直接退出会中断已接收业务。
+
+exec 后 Go 尚未安装信号处理器时，TERM/INT 可能直接终止主进程。B 通过控制连接断开
+开始自身的有界排空，不再启动后继。没有 systemd 时，只要 B 仍可运行，该行为同样成立；
+B 自身崩溃或卡死则由外部监督者处理。B 的停机日志区分 `completed`、
+`completed_with_forced_close` 和 `failed`，已退出的主进程不能继续报告重启动作完成。
+worker 结束后，B 清理自己的路径；若父进程已经退出，再清理文件身份仍匹配的原主实例路径。
+
+此示例同时设置 `stats_socket: /run/kuasar-proxy/stats.sock` 和
+`shm_path: /run/kuasar-proxy/routes.shm`。专属 `RuntimeDirectory` 还能在外部强杀阻止
+应用执行清理时回收文件。不要将 conductor 共用目录交给该 unit；其他显式路径需要部署方
+提供等价的致命退出清理。普通
 `systemctl restart kuasar-proxy.service` 保留已启动的 socket unit，排队连接仍受 backlog
 与客户端超时限制。完整停服应同时停止两个 socket unit 和 service，避免新流量重新激活。
 生产 unit 的安装与修改属于部署流程。

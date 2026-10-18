@@ -15,6 +15,7 @@ import threading
 import time
 
 import websocket_probe as ws
+from proxy_exec_boundary import ExecBoundary
 
 
 def digest(path):
@@ -405,9 +406,85 @@ class Probe:
         properties = subprocess.check_output(['systemctl', 'show', self.config['unit'],
             '-p', 'Result', '-p', 'SendSIGKILL'], text=True)
         values = dict(line.split('=', 1) for line in properties.splitlines())
-        assert values == dict(Result='success', SendSIGKILL='no'), values
+        assert values == dict(Result='success', SendSIGKILL='yes'), values
         self.log(kind='full_shutdown', elapsed=time.monotonic() - started, owned_pids=owned,
                  result=result, systemd=values, finite_completed=True, worker_cleanup='application')
+
+    def exec_window_shutdown(self, forced):
+        # Main has no Go signal handler at this kernel stop. Only ready B and
+        # its real workers can handle the Guest requests established below.
+        self.deploy(self.config['initial'])
+        subprocess.run(['systemctl', 'start', self.config['unit']], check=True)
+        self.pid = self.main_pid()
+        self.wait_status(lambda s: s['ready'])
+        self.check_pid_admission()
+        self.deploy(self.config['target'])
+        invocation = subprocess.check_output(['systemctl', 'show', '--value',
+            '-p', 'InvocationID', self.config['unit']], text=True).strip()
+        exit_record = Path(self.config['exit_record'])
+        exit_record.unlink(missing_ok=True)
+        trace = ExecBoundary(self.pid)
+        tunnel = None
+        try:
+            trace.attach()
+            os.kill(self.pid, signal.SIGUSR2)
+            trace.wait()
+            candidates = list(Path(self.stats).parent.glob('.proxy-*.sock'))
+            assert len(candidates) == 1, candidates
+            candidate = self.wait_status(lambda s: s['ready'], str(candidates[0]))
+            assert candidate['pid'] != self.pid
+            assert digest(f'/proc/{self.pid}/exe') == digest(f"/proc/{candidate['pid']}/exe") == digest(self.config['target'])
+            self.metadata()
+            if forced:
+                tunnel = self.open_tunnel()
+                tunnel.settimeout(20)
+            else:
+                complete = self.finite('exec-stop')
+            owned = cgroup_processes(self.cgroup)
+            started = time.monotonic()
+            subprocess.run(['systemctl', 'stop', '--no-block', self.config['unit'],
+                            *self.config['socket_units'].split()], check=True)
+            deadline = time.monotonic() + 5
+            while True:
+                masks = [int(line.split()[1], 16) for line in Path(f'/proc/{self.pid}/status').read_text().splitlines()
+                         if line.startswith(('SigPnd:', 'ShdPnd:'))]
+                if any(mask & (1 << (signal.SIGTERM - 1)) for mask in masks):
+                    break
+                assert time.monotonic() < deadline, 'ExecStop did not queue TERM at exec'
+                time.sleep(.005)
+            self.log(kind='exec_stop_term_pending', main_pid=self.pid, candidate=candidate, forced=forced)
+            trace.detach()
+            self.wait_status(lambda s: not s['ready'] and s['data'] == 'draining', str(candidates[0]), timeout=5)
+            if forced:
+                assert tunnel.recv(1) == b'', 'tunnel survived application deadline'
+            else:
+                complete()
+            while (cgroup_processes(self.cgroup) or not exit_record.exists()) and time.monotonic() - started < 18:
+                time.sleep(.02)
+            assert not cgroup_processes(self.cgroup), 'B/workers survived their own drain budget'
+            assert all(not Path('/proc', pid).exists() for pid in owned), owned
+            result = json.loads(exit_record.read_text())
+            assert result == dict(SERVICE_RESULT='signal', EXIT_CODE='killed',
+                                  EXIT_STATUS='15', INVOCATION_ID=invocation), result
+            journal = subprocess.check_output(['journalctl', '--no-pager', '-o', 'cat',
+                '_SYSTEMD_INVOCATION_ID=' + invocation], text=True)
+            outcome = 'completed_with_forced_close' if forced else 'completed'
+            lines = [line for line in journal.splitlines() if 'proxy candidate shutdown' in line]
+            assert len(lines) == 1 and outcome in lines[0], journal
+            if not forced:
+                assert 'completed_with_forced_close' not in lines[0], lines
+            assert '"proxy_stop": "completed"' in journal and '"proxy_stop": "timed_out"' not in journal, journal
+            assert not Path(self.stats).exists()
+            assert not Path(self.stats).with_name('proxy-routes.shm').exists()
+            assert not list(Path(self.stats).parent.glob('.proxy-*'))
+            self.log(kind='exec_stop_complete', forced=forced, elapsed=time.monotonic()-started,
+                     result=result, candidate_outcome=lines[0], owned_pids=owned,
+                     business='expected_tunnel_deadline' if forced else 'finite_complete', paths_removed=True)
+        finally:
+            trace.detach()
+            if tunnel is not None:
+                tunnel.close()
+        subprocess.run(['systemctl', 'reset-failed', self.config['unit']], check=True)
 
     def run(self):
         self.wait_status(lambda s: s['ready'])
@@ -432,6 +509,9 @@ class Probe:
                 self.log(kind='ordinary_service_restart', previous=previous, current=self.pid)
             assert self.stable_fds[-1] <= self.stable_fds[0], self.stable_fds
             self.full_shutdown()
+            if self.config['source'] == 'bothfd' and self.config['entry'] in ('builtin', 'custom'):
+                self.exec_window_shutdown(False)
+                self.exec_window_shutdown(True)
         finally:
             self.stop_traffic.set()
             self.stop.set()

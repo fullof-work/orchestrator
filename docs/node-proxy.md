@@ -702,9 +702,13 @@ After=kuasar-proxy-data.socket kuasar-proxy-mmds.socket
 
 [Service]
 Type=simple
+RuntimeDirectory=kuasar-proxy
+RuntimeDirectoryMode=0700
 ExecStart=/opt/kuasar/bin/node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
+ExecStop=/usr/bin/python3 -B /opt/kuasar/libexec/proxy_stop.py 40
 Sockets=kuasar-proxy-data.socket kuasar-proxy-mmds.socket
 KillMode=mixed
+SendSIGKILL=yes
 TimeoutStopSec=45s
 Restart=on-failure
 ```
@@ -721,9 +725,31 @@ create that namespace first, and verify its listener with
 not move existing sockets. See
 [systemd namespace semantics](https://github.com/systemd/systemd/blob/v255/man/systemd.exec.xml).
 
-`KillMode=mixed` lets the main process coordinate graceful stop before systemd's
-final cgroup cleanup. Keep `TimeoutStopSec` above the application budget with
-reaping margin. Ordinary `systemctl restart kuasar-proxy.service` retains active
+Install the tested [ExecStop example](../test/e2e/lib/proxy_stop.py) at the path
+above with Python 3.9 or later. It signals only the living main process, then
+synchronously waits for this service's cgroup, including B and its workers.
+Choose its wait above `shutdown_timeout` with reaping margin, and
+`TimeoutStopSec` above that wait. `KillMode=mixed` alone can kill B immediately
+when the main process exits; a larger `TimeoutStopSec` alone does not fix this.
+The synchronous command preserves B's drain time, while systemd still forcibly
+cleans up remaining processes on timeout. Do not send TERM to all workers with
+`KillMode=control-group`: their immediate exit interrupts accepted business.
+
+TERM/INT may terminate the main process before Go installs its handlers after
+exec. B detects its control connection closing, starts its own bounded drain,
+and never starts another instance. This also works without systemd while B can
+run; an external supervisor must handle a crashed or hung B. The B shutdown log
+reports `completed`, `completed_with_forced_close`, or `failed`. The dead main
+process cannot report a completed InplaceRestart operation. After its workers
+finish, B removes its own paths and, if its parent has exited, the original
+main instance paths whose file identities still match.
+
+Set `stats_socket: /run/kuasar-proxy/stats.sock` and
+`shm_path: /run/kuasar-proxy/routes.shm` for this example. The dedicated
+`RuntimeDirectory` also removes files after an external forced kill prevents
+application cleanup. Never assign a shared conductor directory to this unit;
+explicit paths elsewhere need equivalent deployment-owned fatal-exit cleanup.
+Ordinary `systemctl restart kuasar-proxy.service` retains active
 socket units; queued connections still depend on backlog and client timeouts.
 For complete shutdown, stop both socket units and the service together so
 incoming traffic cannot activate it again. Install or alter production units

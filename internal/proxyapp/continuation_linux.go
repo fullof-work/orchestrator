@@ -66,6 +66,9 @@ type continuationEnvelope struct {
 	CandidateMetricsExpression string                           `json:"candidate_metrics_expression"`
 	CandidatePID               int                              `json:"candidate_pid"`
 	CandidateBootID            string                           `json:"candidate_boot_id"`
+	CoordinatorPID             int                              `json:"coordinator_pid"`
+	CoordinatorStatsIdentity   pathIdentity                     `json:"coordinator_stats_identity"`
+	CoordinatorShmIdentity     pathIdentity                     `json:"coordinator_shm_identity"`
 	Files                      continuationFiles                `json:"files"`
 }
 

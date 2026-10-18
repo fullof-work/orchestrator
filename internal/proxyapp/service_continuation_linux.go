@@ -31,7 +31,14 @@ func (s *Service) restoreLocked(c *Continuation) error {
 	s.timeout = baseline.config.ShutdownTimeoutDur()
 	s.candidate = e.Mode == "candidate"
 	if s.candidate {
-		s.coordinatorPID = os.Getppid()
+		if e.CoordinatorPID <= 1 || e.CoordinatorPID == os.Getpid() {
+			return fmt.Errorf("proxy continuation coordinator identity invalid")
+		}
+		s.coordinatorPID = e.CoordinatorPID
+		s.coordinatorPaths = &retainedResources{
+			StatsPath: baseline.config.StatsSocket, ShmPath: baseline.config.ShmPath,
+			StatsIdentity: e.CoordinatorStatsIdentity, ShmIdentity: e.CoordinatorShmIdentity,
+		}
 	}
 	control := c.take(e.Files.Control)
 	if control == nil {
@@ -238,7 +245,7 @@ func (s *Service) runCandidate(ctx context.Context) error {
 			if !hasBusiness {
 				return errors.Join(preparationErr, err)
 			}
-			s.local.requestStop(time.Now().Add(s.timeout))
+			return s.finishCandidateAfterControlLoss(err)
 		}
 		select {
 		case <-changed:
@@ -252,8 +259,7 @@ func (s *Service) runCandidate(ctx context.Context) error {
 			if !hasBusiness {
 				return errors.Join(preparationErr, err)
 			}
-			s.local.requestStop(time.Now().Add(s.timeout))
-			return errors.Join(err, <-s.localDone)
+			return s.finishCandidateAfterControlLoss(err)
 		case <-ctxDone:
 			ctxDone = nil
 			_ = s.requestAutomaticShutdown()
@@ -270,7 +276,7 @@ func (s *Service) runCandidate(ctx context.Context) error {
 					if !hasBusiness {
 						return errors.Join(preparationErr, err)
 					}
-					s.local.requestStop(time.Now().Add(s.timeout))
+					return s.finishCandidateAfterControlLoss(err)
 				}
 			case "resume":
 				paused = false
@@ -278,7 +284,7 @@ func (s *Service) runCandidate(ctx context.Context) error {
 					if !hasBusiness {
 						return errors.Join(preparationErr, err)
 					}
-					s.local.requestStop(time.Now().Add(s.timeout))
+					return s.finishCandidateAfterControlLoss(err)
 				}
 			case "service": // Coordinator updates preserve whole-service /status on B.
 				if message.Service != nil {
@@ -295,6 +301,31 @@ func (s *Service) runCandidate(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+// Losing the coordinator ends B's own business. It never starts a successor.
+// The instance keeps any earlier drain deadline; the connection error is the
+// trigger, not evidence that accepted requests required forced closure.
+func (s *Service) finishCandidateAfterControlLoss(cause error) error {
+	s.mu.Lock()
+	s.knownService = nil
+	s.stopOnce.Do(func() { close(s.stop) })
+	local, done, logger := s.local, s.localDone, s.logger
+	s.mu.Unlock()
+	local.requestStop(time.Now().Add(s.timeout))
+	err := <-done
+	result := "completed"
+	if errors.Is(err, ErrForcedClose) {
+		result = "completed_with_forced_close"
+	} else if err != nil {
+		result = "failed"
+	}
+	if logger != nil {
+		logger.Info("proxy candidate shutdown", "boot_id", s.parent.boot,
+			"operation_id", s.parent.operation, "reason", "coordinator_control_closed",
+			"result", result, "control_error", cause, "error", err)
+	}
+	return errors.Join(cause, err)
 }
 
 // All business has ended or failed to start before this call. Closing a Unix

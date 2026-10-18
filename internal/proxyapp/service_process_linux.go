@@ -288,6 +288,11 @@ func (s *Service) envelope(mode, boot, id string, r *retainedResources) continua
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	e := continuationEnvelope{Mode: mode, Input: s.input, Baseline: append([]byte(nil), s.baseline.raw...), BootID: boot, InstanceID: id, Operation: *s.operation, TargetIdentity: s.target.identity, TargetDigest: s.target.digest, DataExpression: r.DataExpression, MMDSExpression: r.MMDSExpression, StatsPath: r.StatsPath, ShmPath: r.ShmPath, StatsIdentity: r.StatsIdentity, ShmIdentity: r.ShmIdentity, MetricsExpression: r.MetricsExpression}
+	if mode == "candidate" {
+		e.CoordinatorPID = os.Getpid()
+		e.CoordinatorStatsIdentity = s.resources.StatsIdentity
+		e.CoordinatorShmIdentity = s.resources.ShmIdentity
+	}
 	return e
 }
 
