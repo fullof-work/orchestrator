@@ -836,9 +836,13 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 		writeRouteLinkError(w, err, http.StatusServiceUnavailable)
 		return
 	}
-	rt.buildsMu.Lock()
-	rt.builds[buildCacheKey(group, res.BuildID)] = buildEntry{node: res.APIEndpoint, at: time.Now()}
-	rt.buildsMu.Unlock()
+	// Registration is already accepted. An unavailable endpoint must not hide
+	// its IDs or poison the cache: a later request can resolve the same build.
+	if res.APIEndpoint != "" {
+		rt.buildsMu.Lock()
+		rt.builds[buildCacheKey(group, res.BuildID)] = buildEntry{node: res.APIEndpoint, at: time.Now()}
+		rt.buildsMu.Unlock()
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(map[string]any{
@@ -888,7 +892,7 @@ func (rt *Router) handleBuildForward(w http.ResponseWriter, r *http.Request) {
 	e, ok := rt.builds[cacheKey]
 	rt.buildsMu.Unlock()
 	node := e.node
-	if !ok || (r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/cancel")) {
+	if !ok || node == "" || (r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/cancel")) {
 		res, rerr := rt.routeLinkResolveBuild(r.Context(), group, bid)
 		if rerr != nil {
 			writeBuildResolveError(w, rerr)
