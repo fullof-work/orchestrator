@@ -74,7 +74,7 @@ class ProcessLimitEvidenceTest(unittest.TestCase):
 
 
 class ProcessLimitMonitorTest(unittest.TestCase):
-    def test_only_first_violation_is_reported_and_raw_peaks_are_unchanged(self):
+    def test_only_first_raw_overage_is_reported_and_unique_peak_is_retained(self):
         probe = Probe.__new__(Probe)
         probe.cgroup = Path('/fixture/cgroup')
         probe.pid = 12
@@ -115,6 +115,50 @@ class ProcessLimitMonitorTest(unittest.TestCase):
         probe.operation.assert_any_call(2)
         probe.full_shutdown.assert_called_once()
         probe.monitor.join.assert_called_once()
+
+
+class ProcessLimitUniquePIDTest(unittest.TestCase):
+    def sample(self, pids, vanished=()):
+        probe = Probe.__new__(Probe)
+        probe.cgroup = Path('/fixture/cgroup')
+        probe.pid = 150447
+        probe.config = ProcessLimitEvidenceTest.config
+        probe.peaks = dict(processes=0, rss_kib=0, fds=0)
+        probe.process_limit_reported = False
+        probe.stop = Mock()
+        probe.stop.is_set.side_effect = [False, True]
+        probe.log = Mock()
+        def read(path):
+            if path.name == 'cgroup.procs':
+                return ' '.join(pids)
+            if path.parent.name in vanished:
+                raise FileNotFoundError(errno.ENOENT, 'gone')
+            return 'VmRSS: 4 kB\n'
+        with patch.object(Path, 'read_text', autospec=True, side_effect=read):
+            with patch.object(Path, 'iterdir', side_effect=lambda: iter(('a', 'b'))):
+                with patch('proxy_lifecycle_client.report_process_limit') as report:
+                    probe.resources()
+        return probe, report
+
+    def test_real_nonleader_exec_sample_counts_each_pid_once(self):
+        # Captured from a real cgroup containing six fixed TGIDs while threads
+        # exec their own image: cgroup.procs listed 150447 twice in one read.
+        pids = ['150450', '150452', '150451', '150447',
+                '150448', '150449', '150447']
+        probe, report = self.sample(pids)
+        self.assertEqual(probe.peaks, dict(processes=6, rss_kib=24, fds=12))
+        probe.log.assert_called_once_with(kind='resources', pids=pids,
+                                          rss_kib=24, fds=12)
+        report.assert_called_once_with(pids, probe.config, probe.cgroup, probe.pid)
+
+    def test_genuine_seventh_pid_is_counted_even_if_it_exits_during_reads(self):
+        pids = ['1', '2', '3', '4', '5', '6', '7']
+        for vanished in ((), ('7',)):
+            with self.subTest(vanished=vanished):
+                probe, report = self.sample(pids, vanished)
+                self.assertEqual(probe.peaks['processes'], 7)
+                self.assertGreater(probe.peaks['processes'], 6)
+                report.assert_called_once_with(pids, probe.config, probe.cgroup, probe.pid)
 
 
 if __name__ == '__main__':

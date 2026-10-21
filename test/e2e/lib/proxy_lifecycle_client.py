@@ -208,14 +208,18 @@ class Probe:
                 pids = (self.cgroup / 'cgroup.procs').read_text().split()
             except FileNotFoundError:
                 pids = []
+            # cgroup.procs is not a snapshot: a multithreaded exec can list
+            # the same process twice while its leader changes. Keep raw PIDs
+            # in evidence, but charge each observed PID only once.
+            unique_pids = list(dict.fromkeys(pids))
             rss, fds = 0, 0
-            for pid in pids:
+            for pid in unique_pids:
                 try:
                     rss += int(next(line.split()[1] for line in Path('/proc', pid, 'status').read_text().splitlines() if line.startswith('VmRSS:')))
                     fds += len(list(Path('/proc', pid, 'fd').iterdir()))
                 except (FileNotFoundError, ProcessLookupError, StopIteration):
                     pass
-            for name, value in dict(processes=len(pids), rss_kib=rss, fds=fds).items():
+            for name, value in dict(processes=len(unique_pids), rss_kib=rss, fds=fds).items():
                 self.peaks[name] = max(value, self.peaks[name])
             self.log(kind='resources', pids=pids, rss_kib=rss, fds=fds)
             if len(pids) > 6 and not self.process_limit_reported:
