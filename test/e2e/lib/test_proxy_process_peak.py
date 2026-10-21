@@ -4,7 +4,7 @@ import io
 import json
 from pathlib import Path
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from proxy_lifecycle_client import Probe, report_process_limit
 
@@ -74,28 +74,34 @@ class ProcessLimitEvidenceTest(unittest.TestCase):
 
 
 class ProcessLimitMonitorTest(unittest.TestCase):
-    def test_only_first_raw_overage_is_reported_and_unique_peak_is_retained(self):
+    def test_first_raw_and_first_distinct_overages_are_both_reported(self):
         probe = Probe.__new__(Probe)
         probe.cgroup = Path('/fixture/cgroup')
         probe.pid = 12
         probe.config = ProcessLimitEvidenceTest.config
         probe.peaks = dict(processes=0, rss_kib=0, fds=0)
         probe.process_limit_reported = False
+        probe.raw_process_overage_reported = False
         probe.stop = Mock()
-        probe.stop.is_set.side_effect = [False, False, False, False, True]
+        probe.stop.is_set.side_effect = [False, False, False, False, False, True]
         probe.log = Mock()
-        samples = ['1 2 3 4 5 6', '1 2 3 4 5 6 6', '1 2 3 4 5 6 7 8', '1 2 3']
+        samples = ['1 2 3 4 5 6', '1 2 3 4 5 6 6',
+                   '1 2 3 4 5 6 7 8', '1 2 3 4 5 6 7 8', '1 2 3']
         def read(path):
             return samples.pop(0) if path.name == 'cgroup.procs' else 'VmRSS: 4 kB\n'
         with patch.object(Path, 'read_text', autospec=True, side_effect=read):
             with patch.object(Path, 'iterdir', return_value=iter(())):
                 with patch('proxy_lifecycle_client.report_process_limit') as report:
                     probe.resources()
-        report.assert_called_once_with(['1', '2', '3', '4', '5', '6', '6'],
-                                       probe.config, probe.cgroup, probe.pid)
+        self.assertEqual(report.call_args_list, [
+            call(['1', '2', '3', '4', '5', '6', '6'], probe.config, probe.cgroup, probe.pid),
+            call(['1', '2', '3', '4', '5', '6', '7', '8'], probe.config, probe.cgroup, probe.pid),
+        ])
         self.assertEqual(probe.peaks['processes'], 8)
-        self.assertEqual(probe.stop.wait.call_count, 4)
-        self.assertEqual(probe.log.call_count, 4)
+        self.assertTrue(probe.process_limit_reported)
+        self.assertTrue(probe.raw_process_overage_reported)
+        self.assertEqual(probe.stop.wait.call_count, 5)
+        self.assertEqual(probe.log.call_count, 5)
 
     def test_original_run_assertion_still_rejects_seven_processes(self):
         probe = Mock()
@@ -125,6 +131,7 @@ class ProcessLimitUniquePIDTest(unittest.TestCase):
         probe.config = ProcessLimitEvidenceTest.config
         probe.peaks = dict(processes=0, rss_kib=0, fds=0)
         probe.process_limit_reported = False
+        probe.raw_process_overage_reported = False
         probe.stop = Mock()
         probe.stop.is_set.side_effect = [False, True]
         probe.log = Mock()

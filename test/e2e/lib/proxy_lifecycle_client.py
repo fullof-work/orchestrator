@@ -116,6 +116,7 @@ class Probe:
         self.requests = 0
         self.peaks = dict(processes=0, rss_kib=0, fds=0)
         self.process_limit_reported = False
+        self.raw_process_overage_reported = False
         self.stable_fds = []
         self.out = open(config['output'], 'x', buffering=1)
         self.output_lock = threading.Lock()
@@ -222,8 +223,14 @@ class Probe:
             for name, value in dict(processes=len(unique_pids), rss_kib=rss, fds=fds).items():
                 self.peaks[name] = max(value, self.peaks[name])
             self.log(kind='resources', pids=pids, rss_kib=rss, fds=fds)
-            if len(pids) > 6 and not self.process_limit_reported:
-                self.process_limit_reported = True
+            # A duplicate-only raw overage must not consume the diagnostic
+            # for the first actual process-limit violation later in the run.
+            raw_overage = len(pids) > 6 and not self.raw_process_overage_reported
+            unique_overage = len(unique_pids) > 6 and not self.process_limit_reported
+            if raw_overage or unique_overage:
+                self.raw_process_overage_reported = True
+                if unique_overage:
+                    self.process_limit_reported = True
                 report_process_limit(pids, self.config, self.cgroup, self.pid)
             self.stop.wait(.02)
 
