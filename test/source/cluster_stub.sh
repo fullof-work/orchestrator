@@ -417,16 +417,42 @@ wait_tcp "$ROUTER_PORT" "router"
 
 step "waiting for node_link credential-pair cache"
 python3 - "$ADMIN" "$NODES" <<'PY' || fail "credential pairs were not distributed to all stub nodes"
-import json, sys, time, urllib.request
+import json, re, sys, time, urllib.request
 admin, want = sys.argv[1], int(sys.argv[2])
+last_nodes, last_read_attempt = None, None
+exceptions = {}
 for _ in range(300):
     try:
         nodes = json.load(urllib.request.urlopen(admin + "/v1/nodes", timeout=1))
+        last_nodes, last_read_attempt = nodes, _ + 1
         if len(nodes) == want and all(len(n.get("keys", [])) >= 1 for n in nodes):
             sys.exit(0)
-    except Exception:
-        pass
+    except Exception as exc:
+        name = type(exc).__name__
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]{0,63}", name) or (name not in exceptions and len(exceptions) >= 8):
+            name = "other"
+        exceptions[name] = exceptions.get(name, 0) + 1
     time.sleep(0.1)
+# Print only bounded IDs/counts; never keys, response bodies, or exception messages.
+counts = []
+if isinstance(last_nodes, list):
+    for node in last_nodes[:32]:
+        if not isinstance(node, dict):
+            counts.append({"node_id": None, "key_count": None})
+            continue
+        node_id, keys = node.get("node_id"), node.get("keys", [])
+        counts.append({
+            "node_id": node_id if isinstance(node_id, str) and re.fullmatch(r"stub-[0-9]{1,6}", node_id) else None,
+            "key_count": len(keys) if isinstance(keys, list) else None,
+        })
+print("credential-pair readiness: " + json.dumps({
+    "expected_nodes": want,
+    "node_count": len(last_nodes) if isinstance(last_nodes, list) else None,
+    "last_read_attempt": last_read_attempt,
+    "nodes": counts,
+    "nodes_truncated": isinstance(last_nodes, list) and len(last_nodes) > 32,
+    "exception_counts": exceptions,
+}, sort_keys=True), file=sys.stderr)
 sys.exit(1)
 PY
 
@@ -487,7 +513,7 @@ for key in ("sandboxID", "envdAccessToken", "trafficAccessToken", "forwardAccess
 assert isinstance(connected.get("templateID"), str) and connected["templateID"], "stub assertion failed: isinstance(connected.get(\"templateID\"), str) and connected[\"templateID\"]"
 PY
 
-python3 - "$ADMIN" "$GROUP" "$SESSION1_SID" <<'PY' || fail "CmdConnect did not preserve the node identity and cluster context"
+SESSION1_NODE_SID="$(python3 - "$ADMIN" "$GROUP" "$SESSION1_SID" <<'PY'
 import json, sys, urllib.request
 admin, group, stable_sid = sys.argv[1:]
 commands = json.load(urllib.request.urlopen(admin + "/v1/commands", timeout=2))
@@ -496,12 +522,19 @@ connects = [c for c in commands if c.get("kind") == "connect" and c.get("cluster
 assert len(creates) == 1, "stub assertion failed: len(creates) == 1"
 assert len(connects) == 1, "stub assertion failed: len(connects) == 1"
 created, connected = creates[0], connects[0]
-assert connected.get("sid") == created.get("sid") == stable_sid + "-g0", "stub assertion failed: connected.get(\"sid\") == created.get(\"sid\") == stable_sid + \"-g0\""
-cluster = connected.get("cluster", {})
-assert cluster.get("group") == group, "stub assertion failed: cluster.get(\"group\") == group"
-assert cluster.get("route_key") == "user1/session1", "stub assertion failed: cluster.get(\"route_key\") == \"user1/session1\""
-assert cluster.get("stable_id") == stable_sid, "stub assertion failed: cluster.get(\"stable_id\") == stable_sid"
+# NodeSandboxID is opaque; pre-delivery retries may consume generations.
+node_sid = created.get("sid")
+assert isinstance(node_sid, str) and node_sid, "create command missing NodeSandboxID"
+assert node_sid != stable_sid, "node command used the public stable ID"
+assert connected.get("sid") == node_sid, "CmdConnect changed the NodeSandboxID"
+for command in (created, connected):
+    cluster = command.get("cluster", {})
+    assert cluster.get("group") == group, "stub assertion failed: cluster group"
+    assert cluster.get("route_key") == "user1/session1", "stub assertion failed: cluster route key"
+    assert cluster.get("stable_id") == stable_sid, "stub assertion failed: cluster stable ID"
+print(node_sid)
 PY
+)" || fail "CmdConnect did not preserve the node identity and cluster context"
 
 step "checking cluster exec-session issuance through Registry CmdExecSession"
 code="$(http_code "$WORK/exec-session1.response" -D "$WORK/exec-session1.headers" -X POST \
@@ -529,10 +562,10 @@ for line in open(headers_path):
 assert headers.get("cache-control") == ["no-store"], "stub assertion failed: headers.get(\"cache-control\") == [\"no-store\"]"
 PY
 
-python3 - "$ADMIN" "$GROUP" "$SESSION1_SID" "$WORK/exec-session1.response" "$WORK" <<'PY' || \
+python3 - "$ADMIN" "$GROUP" "$SESSION1_SID" "$WORK/exec-session1.response" "$WORK" "$SESSION1_NODE_SID" <<'PY' || \
     fail "CmdExecSession did not preserve identity or exposed its token"
 import json, pathlib, sys, urllib.request
-admin, group, stable_sid, response_path, work_dir = sys.argv[1:]
+admin, group, stable_sid, response_path, work_dir, node_sid = sys.argv[1:]
 token = json.load(open(response_path))["execAccessToken"]
 condition = "request.argv == ['/bin/true']"
 commands = json.load(urllib.request.urlopen(admin + "/v1/commands", timeout=2))
@@ -544,7 +577,7 @@ exec_commands = [
 ]
 assert len(exec_commands) == 1, "stub assertion failed: len(exec_commands) == 1"
 command = exec_commands[0]
-assert command.get("sid") == stable_sid + "-g0", "stub assertion failed: command.get(\"sid\") == stable_sid + \"-g0\""
+assert command.get("sid") == node_sid, "CmdExecSession changed the NodeSandboxID"
 assert command.get("profile") == "e2b", "stub assertion failed: command.get(\"profile\") == \"e2b\""
 cluster = command.get("cluster", {})
 assert cluster.get("group") == group, "stub assertion failed: cluster.get(\"group\") == group"
@@ -557,10 +590,10 @@ assert condition not in observed, "exec condition appeared in node-stub observat
 PY
 
 step "checking invalid exec KAT rejection at Router and node data endpoint"
-python3 - "$ROUTER_PORT" "$DATA_PORT" "$GROUP" "$ADMIN" "$SESSION1_SID" <<'PY' || \
+python3 - "$ROUTER_PORT" "$DATA_PORT" "$GROUP" "$ADMIN" "$SESSION1_SID" "$SESSION1_NODE_SID" <<'PY' || \
     fail "invalid exec KAT reached lifecycle or data-plane handling"
 import json, socket, sys, urllib.request
-router_port, node_port, group, admin, stable_sid = sys.argv[1:]
+router_port, node_port, group, admin, stable_sid, node_sid = sys.argv[1:]
 
 def observations():
     commands = json.load(urllib.request.urlopen(admin + "/v1/commands", timeout=2)) or []
@@ -591,7 +624,7 @@ def rejected_connect(port, sandbox_id, include_cluster):
 
 before = observations()
 rejected_connect(router_port, stable_sid, True)
-rejected_connect(node_port, stable_sid + "-g0", False)
+rejected_connect(node_port, node_sid, False)
 after = observations()
 assert after == before, "stub assertion failed: after == before"
 PY
@@ -652,14 +685,14 @@ after = len(json.load(urllib.request.urlopen(admin + "/v1/data-hits", timeout=2)
 assert after == before, "stub assertion failed: after == before"
 PY
 
-python3 - "$ADMIN" "$GROUP" "$SESSION1_SID" <<'PY' || fail "exec tunnel did not reach the current NodeSandboxID"
+python3 - "$ADMIN" "$GROUP" "$SESSION1_SID" "$SESSION1_NODE_SID" <<'PY' || fail "exec tunnel did not reach the current NodeSandboxID"
 import json, sys, urllib.request
-admin, group, stable_sid = sys.argv[1:]
+admin, group, stable_sid, node_sid = sys.argv[1:]
 hits = json.load(urllib.request.urlopen(admin + "/v1/data-hits", timeout=2))
 exec_hits = [hit for hit in hits if hit.get("path") == "/exec-admitted"]
 assert len(exec_hits) == 1, "stub assertion failed: len(exec_hits) == 1"
 hit = exec_hits[0]
-assert hit.get("sid") == stable_sid + "-g0", "stub assertion failed: hit.get(\"sid\") == stable_sid + \"-g0\""
+assert hit.get("sid") == node_sid, "exec tunnel changed the NodeSandboxID"
 assert hit.get("method") == "EXEC", "stub assertion failed: hit.get(\"method\") == \"EXEC\""
 assert hit.get("host") == "exec", "stub assertion failed: hit.get(\"host\") == \"exec\""
 cluster = hit.get("cluster", {})

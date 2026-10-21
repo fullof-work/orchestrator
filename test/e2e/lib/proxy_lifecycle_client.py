@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Observe real Proxy images, service actions and unretried Guest business."""
 import base64
+import errno
 import hashlib
 import http.client
 import json
@@ -37,8 +38,59 @@ def record_service_exit(path):
 def cgroup_processes(cgroup):
     try:
         return (cgroup / 'cgroup.procs').read_text().split()
-    except FileNotFoundError:
-        return []  # systemd may remove the empty cgroup between observations.
+    except OSError as error:
+        # Removal can race either opening the path or reading an open cgroup.
+        if error.errno in (errno.ENOENT, errno.ENODEV):
+            return []
+        raise
+
+
+def wait_exec_shutdown_observations(cgroup, exit_record, owned, started):
+    # cgroup.procs can be empty before the last owned PID is reaped. Wait for
+    # every existing final assertion within the same original 18-second budget.
+    while (cgroup_processes(cgroup) or not exit_record.exists() or
+           any(Path('/proc', pid).exists() for pid in owned)) and time.monotonic() - started < 18:
+        time.sleep(.02)
+
+
+def owned_process_observations(owned):
+    result = {}
+    for pid in owned:
+        try:
+            lines = Path('/proc', pid, 'status').read_text().splitlines()
+            result[pid] = {key: value.strip() for key, value in
+                           (line.split(':', 1) for line in lines if ':' in line)
+                           if key in ('State', 'PPid', 'TracerPid', 'Threads', 'NSpid')}
+        except FileNotFoundError:
+            result[pid] = {'gone_during_observation': True}
+        except OSError as error:
+            result[pid] = {'observation_errno': error.errno}
+    return result
+
+
+def report_process_limit(pids, config, cgroup, main_pid):
+    # Preserve the raw cgroup sample, including duplicates. These subsequent
+    # /proc reads are observations, not an atomic process snapshot.
+    sample = pids[:32]
+    processes = owned_process_observations(sample)
+    for pid in sample:
+        try:
+            processes[pid]['exe'] = os.readlink('/proc/' + pid + '/exe')[:512]
+        except OSError as error:
+            processes[pid]['exe_errno'] = error.errno
+    observation = dict(kind='process_limit_observation', time=time.time(),
+                       entry=config['entry'], source=config['source'],
+                       unit=config['unit'], cgroup=str(cgroup), main_pid=main_pid,
+                       observed_count=len(pids), unique_count=len(set(pids)),
+                       pids=sample, truncated=len(pids) > len(sample),
+                       processes=processes)
+    try:
+        # A diagnostic must not become a workflow command or hide the original
+        # process-count assertion if stderr is unavailable.
+        print(json.dumps(observation).replace('#', r'\u0023'),
+              file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        pass
 
 
 class UnixHTTP(http.client.HTTPConnection):
@@ -63,6 +115,7 @@ class Probe:
         self.errors = []
         self.requests = 0
         self.peaks = dict(processes=0, rss_kib=0, fds=0)
+        self.process_limit_reported = False
         self.stable_fds = []
         self.out = open(config['output'], 'x', buffering=1)
         self.output_lock = threading.Lock()
@@ -165,6 +218,9 @@ class Probe:
             for name, value in dict(processes=len(pids), rss_kib=rss, fds=fds).items():
                 self.peaks[name] = max(value, self.peaks[name])
             self.log(kind='resources', pids=pids, rss_kib=rss, fds=fds)
+            if len(pids) > 6 and not self.process_limit_reported:
+                self.process_limit_reported = True
+                report_process_limit(pids, self.config, self.cgroup, self.pid)
             self.stop.wait(.02)
 
     def finite(self, key):
@@ -396,8 +452,34 @@ class Probe:
             time.sleep(.02)
         assert self.main_pid() == 0, 'application did not finish its own bounded shutdown'
         result = json.loads(exit_record.read_text())
-        assert result == dict(SERVICE_RESULT='success', EXIT_CODE='exited',
-                              EXIT_STATUS='0', INVOCATION_ID=invocation), result
+        try:
+            assert result == dict(SERVICE_RESULT='success', EXIT_CODE='exited',
+                                  EXIT_STATUS='0', INVOCATION_ID=invocation), result
+        except AssertionError:
+            # Query this invocation before cleanup removes the failed unit.
+            # JSON keeps large fields bounded by journalctl's default limit;
+            # do not request --all or include environment/command-line fields.
+            diagnostic = dict(kind='full_shutdown_journal', unit=self.config['unit'],
+                              invocation=invocation)
+            try:
+                journal = subprocess.run(
+                    ['journalctl', '--no-pager', '--quiet', '--output=json',
+                     '--output-fields=MESSAGE,PRIORITY,_PID', '--lines=80',
+                     '_SYSTEMD_UNIT=' + self.config['unit'],
+                     '_SYSTEMD_INVOCATION_ID=' + invocation],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    timeout=5)
+                diagnostic.update(returncode=journal.returncode,
+                                  journal_tail=journal.stdout[-16384:].decode('utf-8', 'replace'))
+            except (OSError, subprocess.TimeoutExpired) as error:
+                diagnostic['journal_error'] = type(error).__name__
+            try:
+                # The runner also recognizes legacy commands inside a line.
+                print(json.dumps(diagnostic).replace('##[', r'\u0023\u0023['),
+                      file=sys.stderr, flush=True)
+            except (OSError, ValueError):
+                pass  # Diagnostic output must not replace the original failure.
+            raise
         # ExecStopPost must also have ended before checking the complete cgroup.
         while cgroup_processes(self.cgroup) and time.monotonic() - started < 15:
             time.sleep(.02)
@@ -496,8 +578,13 @@ class Probe:
                 assert tunnel.recv(1) == b'', 'tunnel survived application deadline'
             else:
                 complete()
-            while (cgroup_processes(self.cgroup) or not exit_record.exists()) and time.monotonic() - started < 18:
-                time.sleep(.02)
+            wait_exec_shutdown_observations(self.cgroup, exit_record, owned, started)
+            remaining_owned = [pid for pid in owned if Path('/proc', pid).exists()]
+            if remaining_owned:
+                observation = dict(elapsed=time.monotonic() - started,
+                                   pids=owned_process_observations(remaining_owned))
+                self.log(kind='exec_stop_incomplete', **observation)
+                print('exec-stop cleanup incomplete: ' + json.dumps(observation), file=sys.stderr, flush=True)
             assert not cgroup_processes(self.cgroup), 'B/workers survived their own drain budget'
             assert all(not Path('/proc', pid).exists() for pid in owned), owned
             result = json.loads(exit_record.read_text())
