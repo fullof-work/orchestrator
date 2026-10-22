@@ -86,6 +86,46 @@ PY
 write_checkpoint_payload 8
 checkpoint_hash >"$WORK/checkpoint-active.hash"
 if cmp -s "$WORK/checkpoint-original.hash" "$WORK/checkpoint-active.hash"; then fail "overwrite did not change data"; fi
+# Guest fsync/sync is not a host BlockCOW writeback boundary. A temporary named
+# capture explicitly drains accepted writes while the original version remains
+# held. Its content-addressed E stays case-owned until final BaseDir deletion.
+# This fence is test preparation, not a native Pause/export performance sample.
+FENCE_STARTED=$(checkpoint_clock)
+FENCE_ID=$(python3 "$SCRIPT_DIR/disk_checkpoint.py" new-id)
+python3 "$SCRIPT_DIR/disk_checkpoint.py" fence-state "$WORK/lib/node-ctl.db" "$SID" "$WORK/checkpoint-second.json" \
+    >"$WORK/checkpoint-fence.before.json"
+timeout -k 5s 120 "$ORCH_BIN_DIR/sandbox-ctl" export --json --resume --checkpoint "$FENCE_ID" \
+    --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local \
+    --run-root "$EXECUTE_RUN_ROOT/sandboxes" >"$WORK/checkpoint-fence.export.json"
+checkpoint_guest /bin/true
+checkpoint_list "$SID" "$WORK/checkpoint-fence.held.json"
+python3 "$SCRIPT_DIR/disk_checkpoint.py" fence-refs "$WORK/checkpoint-second.json" \
+    "$WORK/checkpoint-fence.export.json" "$WORK/checkpoint-fence.held.json" "$CHECKPOINT_ROOT/$SID/checkpoint" "$FENCE_ID" \
+    >"$WORK/checkpoint-fence.refs.json"
+mapfile -t FENCE_DIFF_IDS < <(python3 - "$WORK/checkpoint-fence.refs.json" <<'PY'
+import json, sys
+for ref in json.load(open(sys.argv[1])): print(ref['diff_id'])
+PY
+)
+[ "${#FENCE_DIFF_IDS[@]}" -gt 0 ] || fail "temporary fence returned no exact DIFF identities"
+FENCE_DELETE_ARGS=()
+for diff_id in "${FENCE_DIFF_IDS[@]}"; do FENCE_DELETE_ARGS+=(--diff-id "$diff_id"); done
+timeout -k 2s 30 "$BIN/sandbox-ctl" checkpoint delete --path-id "$SID" --checkpoint "$FENCE_ID" \
+    "${FENCE_DELETE_ARGS[@]}" --run-root "$EXECUTE_RUN_ROOT/sandboxes" --json >"$WORK/checkpoint-fence.deleted.json"
+checkpoint_list "$SID" "$WORK/checkpoint-fence.remaining.json"
+python3 - "$WORK/checkpoint-held.json" "$WORK/checkpoint-fence.remaining.json" \
+    "$WORK/checkpoint-fence.refs.json" "$WORK/checkpoint-fence.deleted.json" <<'PY'
+import json, sys
+def refs(path): return sorted((ref['diff_id'], ref['id']) for ref in json.load(open(path)))
+assert refs(sys.argv[1]) == refs(sys.argv[2]), 'temporary fence changed the original held versions'
+assert refs(sys.argv[3]) == refs(sys.argv[4]), 'temporary fence deletion did not match its exact refs'
+PY
+python3 "$SCRIPT_DIR/disk_checkpoint.py" fence-state "$WORK/lib/node-ctl.db" "$SID" "$WORK/checkpoint-second.json" \
+    >"$WORK/checkpoint-fence.after.json"
+cmp "$WORK/checkpoint-fence.before.json" "$WORK/checkpoint-fence.after.json"
+kill -0 "$PUBLISH_PID" 2>/dev/null && [ -e "$PUBLISH_BARRIER_REACHED" ] && [ ! -e "$PUBLISH_BARRIER_RELEASE" ] \
+    || fail "publisher did not remain held through the writeback fence"
+checkpoint_measure test_writeback_fence "$FENCE_STARTED" 8
 RETAINED_BYTES=$(checkpoint_allocated "$SID")
 checkpoint_measure export_held_after_overwrite "$(checkpoint_clock)" 8
 : >"$PUBLISH_BARRIER_RELEASE"

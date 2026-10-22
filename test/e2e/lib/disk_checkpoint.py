@@ -1,8 +1,10 @@
 """Read public Checkpoint artifacts and host observations for platform E2E."""
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import subprocess
 import tarfile
@@ -17,15 +19,47 @@ def checkpoint_id(raw):
     return raw
 
 
-def local_artifact(database, sid):
+def fresh_checkpoint_id():
+    raw = bytearray(os.urandom(16))
+    raw[:6] = (time.time_ns() // 1_000_000).to_bytes(6, "big")
+    raw[6] = (raw[6] & 0x0f) | 0x70
+    raw[8] = (raw[8] & 0x3f) | 0x80
+    return str(uuid.UUID(bytes=bytes(raw)))
+
+
+def fence_state(database, sid, metadata):
+    """The test's temporary capture must preserve the publisher's original E."""
+    original = json.loads(Path(metadata).read_text())
+    path = Path(original["artifact"])
+    with path.open("rb") as source:
+        digest = hashlib.file_digest(source, "sha256").hexdigest()
     with sqlite3.connect(database, timeout=5) as db:
-        row = db.execute("select state, base_dir, resume_source_kind, resume_source_ref, resume_sandbox_ref from sandboxes where id=?", (sid,)).fetchone()
-    assert row and row[0] == "paused" and row[2] in ("sandbox", "snapshot"), row
-    ref = row[4] if row[2] == "snapshot" else row[3]
-    assert ref.startswith("file://") and "@digest:" in ref, ref
-    name = ref.removeprefix("file://").split("@", 1)[0]
-    assert name == os.path.basename(name) and name.endswith(".sandbox"), ref
-    path = Path(row[1], "checkpoint", name)
+        row = db.execute("select state, resume_source_kind, resume_source_ref, resume_sandbox_ref from sandboxes where id=?", (sid,)).fetchone()
+    assert row and row[0] == "running", row
+    return {"artifact": str(path), "sha256": digest, "resume_source": row[1:]}
+
+
+def fence_refs(metadata, report_path, held_path, directory, identity):
+    checkpoint_id(identity)
+    original, report, held = (json.loads(Path(path).read_text()) for path in (metadata, report_path, held_path))
+    assert identity != original["checkpoint_id"]
+    assert isinstance(report, dict) and set(report) == {"sandboxRef", "removedRefs"} and report["removedRefs"] == [], report
+    match = re.fullmatch(r"file://([0-9a-f]{64}\.sandbox)@digest:([0-9a-f]{64})", report["sandboxRef"])
+    assert match, report
+    path = Path(directory) / match.group(1)
+    assert path.is_file() and not path.is_symlink() and path.resolve() != Path(original["artifact"]).resolve(), path
+    names, payload = artifact_content(path)
+    assert set(names) == {"sandbox.runtime.cfg", "checkpoint.json"}, names
+    assert payload["version"] == 1 and payload["checkpoint_id"] == identity, payload
+    assert payload["root"] == original["root"] and (payload.get("disks") or []) == (original.get("disks") or []), payload
+    ids = [disk["diff_id"] for disk in [original["root"], *(original.get("disks") or [])]]
+    assert len(ids) == len(set(ids))
+    expected = {(diff_id, original["checkpoint_id"]) for diff_id in ids} | {(diff_id, identity) for diff_id in ids}
+    assert len(held) == len(expected) and {(ref["diff_id"], ref["id"]) for ref in held} == expected, (held, expected)
+    return [{"diff_id": diff_id, "id": identity} for diff_id in ids]
+
+
+def artifact_content(path):
     with tarfile.open(path) as carrier:
         members = [m for m in carrier if m.isfile() and not m.name.startswith(".kuasar.")]
         assert len(members) == 1, members
@@ -35,7 +69,19 @@ def local_artifact(database, sid):
             names = logical.namelist()
             assert len(names) == len(set(names)), names
             result = json.loads(logical.read("checkpoint.json")) if "checkpoint.json" in names else None
-    return path, names, result
+    return names, result
+
+
+def local_artifact(database, sid):
+    with sqlite3.connect(database, timeout=5) as db:
+        row = db.execute("select state, base_dir, resume_source_kind, resume_source_ref, resume_sandbox_ref from sandboxes where id=?", (sid,)).fetchone()
+    assert row and row[0] == "paused" and row[2] in ("sandbox", "snapshot"), row
+    ref = row[4] if row[2] == "snapshot" else row[3]
+    assert ref.startswith("file://") and "@digest:" in ref, ref
+    name = ref.removeprefix("file://").split("@", 1)[0]
+    assert name == os.path.basename(name) and name.endswith(".sandbox"), ref
+    path = Path(row[1], "checkpoint", name)
+    return path, *artifact_content(path)
 
 
 def local_metadata(database, sid):
@@ -60,6 +106,39 @@ def disk_state(directory):
                        "logical_file_bytes": st.st_size, "allocated_bytes": st.st_blocks * 512})
     assert result, f"no persistent DIFF in {root}"
     return result
+
+
+def live_root_disk(base_directory, run_directory, pids):
+    """Require the fresh one-disk runtime to use its derived persistent DIFF."""
+    base, run = Path(base_directory), Path(run_directory)
+    directory = base / "checkpoint" / "diffs"
+    assert base.resolve() == base and run.resolve() == run and directory.resolve() == directory, (base, run, directory)
+    assert not base.is_relative_to(run) and not run.is_relative_to(base), (base, run)
+    disks = disk_state(directory)
+    assert len(disks) == 1, disks
+    assert re.fullmatch(r"[0-9a-f]{32}\.diff", disks[0]["name"]), disks
+    path = directory / disks[0]["name"]
+    assert list(base.rglob("*.diff")) == [path], "unexpected writable DIFF outside the checkpoint layout"
+    references = []
+    for pid in pids:
+        try:
+            descriptors = list(Path(f"/proc/{pid}/fd").iterdir())
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        for descriptor in descriptors:
+            try:
+                if os.readlink(descriptor) == str(path):
+                    info = (descriptor.parent.parent / "fdinfo" / descriptor.name).read_text()
+                    flags = next(int(line.split()[1], 8) for line in info.splitlines() if line.startswith("flags:"))
+                    if flags & os.O_ACCMODE != os.O_RDWR:
+                        continue
+                    current = descriptor.stat()
+                    assert (current.st_dev, current.st_ino) == (disks[0]["device"], disks[0]["inode"])
+                    references.append({"pid": pid, "fd": descriptor.name})
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+    assert references, f"runtime has no open reference to {path}"
+    return {"path": str(path), "disk": disks[0], "runtime_references": references}
 
 
 def runtime_memory(database, sid, prefix):
@@ -125,6 +204,13 @@ def tree_allocation(directory):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("new-id")
+    fence = sub.add_parser("fence-state")
+    for field in ("database", "sid", "metadata"):
+        fence.add_argument(field)
+    refs = sub.add_parser("fence-refs")
+    for field in ("metadata", "report", "held", "directory", "identity"):
+        refs.add_argument(field)
     meta = sub.add_parser("metadata")
     meta.add_argument("database")
     meta.add_argument("sid")
@@ -134,15 +220,27 @@ def main():
     layout.add_argument("database")
     layout.add_argument("sid")
     layout.add_argument("mode", choices=("checkpoint", "baseline-copy"))
+    live = sub.add_parser("live-root-disk")
+    for field in ("database", "sid", "prefix", "base_directory", "run_directory"):
+        live.add_argument(field)
     measure = sub.add_parser("measure")
     for field in ("output", "database", "sid", "prefix", "directory", "phase", "started", "payload_mib"):
         measure.add_argument(field)
     measure.add_argument("--mode", choices=("checkpoint", "baseline-copy"), default="checkpoint")
     args = parser.parse_args()
-    if args.command == "metadata":
+    if args.command == "new-id":
+        print(fresh_checkpoint_id())
+    elif args.command == "fence-state":
+        print(json.dumps(fence_state(args.database, args.sid, args.metadata), sort_keys=True))
+    elif args.command == "fence-refs":
+        print(json.dumps(fence_refs(args.metadata, args.report, args.held, args.directory, args.identity), sort_keys=True))
+    elif args.command == "metadata":
         print(json.dumps(local_metadata(args.database, args.sid), sort_keys=True))
     elif args.command == "disks":
         print(json.dumps(disk_state(args.directory), sort_keys=True))
+    elif args.command == "live-root-disk":
+        pids = runtime_memory(args.database, args.sid, args.prefix)["runtime_pids"]
+        print(json.dumps(live_root_disk(args.base_directory, args.run_directory, pids), sort_keys=True))
     elif args.command == "layout":
         if args.mode == "checkpoint":
             print(json.dumps(local_metadata(args.database, args.sid), sort_keys=True))

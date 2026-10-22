@@ -87,6 +87,82 @@ class DiskCheckpoint(unittest.TestCase):
             with self.subTest(state=state, kind=kind, ref=ref), self.assertRaises(AssertionError):
                 disk_checkpoint.local_metadata(self.database, "sandbox")
 
+    def test_fence_ids_are_fresh_canonical_v7(self):
+        identities = [disk_checkpoint.fresh_checkpoint_id() for _ in range(3)]
+        self.assertEqual(len(set(identities)), len(identities))
+        for identity in identities:
+            self.assertEqual(disk_checkpoint.checkpoint_id(identity), identity)
+
+    def test_fence_state_detects_original_artifact_or_resume_source_changes(self):
+        self.artifact_payload()
+        metadata = self.root / "original.json"
+        metadata.write_text(json.dumps(disk_checkpoint.local_metadata(self.database, "sandbox")))
+        with self.assertRaises(AssertionError):
+            disk_checkpoint.fence_state(self.database, "sandbox", metadata)
+        with sqlite3.connect(self.database) as db:
+            db.execute("update sandboxes set state='running'")
+        before = disk_checkpoint.fence_state(self.database, "sandbox", metadata)
+        self.assertEqual(before, disk_checkpoint.fence_state(self.database, "sandbox", metadata))
+        self.artifact.write_bytes(b"replaced original")
+        self.assertNotEqual(before, disk_checkpoint.fence_state(self.database, "sandbox", metadata))
+        self.artifact_payload()
+        self.assertEqual(before, disk_checkpoint.fence_state(self.database, "sandbox", metadata))
+        with sqlite3.connect(self.database) as db:
+            db.execute("update sandboxes set resume_source_ref='unexpected replacement'")
+        self.assertNotEqual(before, disk_checkpoint.fence_state(self.database, "sandbox", metadata))
+
+    def test_fence_requires_new_artifact_same_disks_and_exact_held_refs(self):
+        self.artifact_payload()
+        original = disk_checkpoint.local_metadata(self.database, "sandbox")
+        metadata, report_path, held_path = (self.root / name for name in ("original.json", "report.json", "held.json"))
+        metadata.write_text(json.dumps(original))
+        identity = disk_checkpoint.fresh_checkpoint_id()
+        new_path = self.checkpoint / ("c" * 64 + ".sandbox")
+        report = {"sandboxRef": "file://" + new_path.name + "@digest:" + "d" * 64, "removedRefs": []}
+        fresh = [{"diff_id": diff_id, "id": identity} for diff_id in ("root", "data")]
+        held = [{"diff_id": diff_id, "id": IDENTITY} for diff_id in ("root", "data")] + fresh
+
+        def prepare():
+            payload = {key: value for key, value in original.items() if key != "artifact"}
+            payload["checkpoint_id"] = identity
+            current = self.artifact
+            self.artifact = new_path
+            try:
+                self.artifact_payload(payload)
+            finally:
+                self.artifact = current
+            report_path.write_text(json.dumps(report))
+            held_path.write_text(json.dumps(held))
+
+        def validate():
+            return disk_checkpoint.fence_refs(metadata, report_path, held_path, self.checkpoint, identity)
+
+        prepare()
+        self.assertEqual(validate(), fresh)
+        for changed in (held[1:], held + [held[0]], [*held[:-1], {"diff_id": "other", "id": identity}]):
+            held_path.write_text(json.dumps(changed))
+            with self.subTest(held=changed), self.assertRaises(AssertionError):
+                validate()
+        for changed in ({**report, "removedRefs": [self.reference]},
+                        {**report, "sandboxRef": self.reference},
+                        {**report, "unexpected": True}):
+            prepare()
+            report_path.write_text(json.dumps(changed))
+            with self.subTest(report=changed), self.assertRaises(AssertionError):
+                validate()
+        for key, value in (("checkpoint_id", IDENTITY), ("root", {"diff_id": "other"})):
+            prepare()
+            payload = {name: entry for name, entry in original.items() if name != "artifact"}
+            payload["checkpoint_id"] = identity
+            payload[key] = value
+            current, self.artifact = self.artifact, new_path
+            try:
+                self.artifact_payload(payload)
+            finally:
+                self.artifact = current
+            with self.subTest(payload=payload), self.assertRaises(AssertionError):
+                validate()
+
     def test_allocated_bytes_distinguish_sparse_size_and_preserve_inode(self):
         disk = self.checkpoint / "root.diff"
         with disk.open("wb") as stream:
@@ -116,6 +192,40 @@ class DiskCheckpoint(unittest.TestCase):
         self.assertEqual(result["files"], 1)
         self.assertEqual(result["logical_file_bytes"], source.stat().st_size)
         self.assertEqual(result["allocated_bytes"], source.stat().st_blocks * 512)
+
+    def test_live_root_requires_runtime_reference_to_the_derived_diff(self):
+        directory = self.checkpoint / "diffs"
+        directory.mkdir()
+        disk = directory / ("a" * 32 + ".diff")
+        disk.write_bytes(b"fixture")
+        run = self.root.parent / (self.root.name + "-run")
+        with self.assertRaisesRegex(AssertionError, "no open reference"):
+            disk_checkpoint.live_root_disk(self.root, run, [os.getpid()])
+        with disk.open("rb"):
+            with self.assertRaisesRegex(AssertionError, "no open reference"):
+                disk_checkpoint.live_root_disk(self.root, run, [os.getpid()])
+        with disk.open("r+b"):
+            result = disk_checkpoint.live_root_disk(self.root, run, [os.getpid()])
+            self.assertEqual(result["path"], str(disk))
+            self.assertEqual(result["runtime_references"][0]["pid"], os.getpid())
+            legacy = self.root / "sandbox.overlay.diff"
+            legacy.write_bytes(b"legacy")
+            with self.assertRaisesRegex(AssertionError, "outside the checkpoint layout"):
+                disk_checkpoint.live_root_disk(self.root, run, [os.getpid()])
+            legacy.unlink()
+            with self.assertRaises(AssertionError):
+                disk_checkpoint.live_root_disk(self.root, self.root / "run", [os.getpid()])
+        disk.rename(directory / "arbitrary.diff")
+        with self.assertRaises(AssertionError):
+            disk_checkpoint.live_root_disk(self.root, run, [os.getpid()])
+
+    def test_live_root_rejects_a_symlinked_diff_directory(self):
+        directory = self.checkpoint / "diffs"
+        external = self.root / "external"
+        external.mkdir()
+        directory.symlink_to(external, target_is_directory=True)
+        with self.assertRaises(AssertionError):
+            disk_checkpoint.live_root_disk(self.root, self.root.parent / "run", [os.getpid()])
 
     def test_exact_capture_gate_checks_uuid_and_every_remaining_argument(self):
         log = self.root / "capture.jsonl"
