@@ -7,6 +7,10 @@ set -euo pipefail
 . "$SCRIPT_DIR/execute_checkpoint.sh"
 unset CHECKPOINT_PERF_MODE
 write_orchestrator_config unset controller
+# This serial storage scenario builds a 6 GiB template. Admit that single
+# startup on 12 GiB developer hosts without changing production defaults or
+# the controller's measured physical-memory limit.
+sed -i '/^resource_listen:$/a\  watermarks: { startup_factor: 0.8 }' "$WORK/config.yaml"
 start_orchestrator "$WORK/orch.log"
 wait_mmds_listener
 "$BIN/node-ctl" manifest-key add --socket "$WORK/node-ctl.socket" "$MK" >/dev/null
