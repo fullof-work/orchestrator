@@ -119,12 +119,23 @@ type sandboxRunEndWork struct {
 	again   bool
 	due     time.Time
 	delay   time.Duration
+	// Only startup lost-unit recovery carries an observed owner. Keep that
+	// path distinct from disconnect reports, which synthesize a run result.
+	missing, nextMissing *types.Sandbox
 }
 
 func (o *Orchestrator) startSandboxRunEndCheck(runID string) {
 	if runID == "" {
 		return
 	}
+	o.startSandboxRunEndWork(runID, nil)
+}
+
+func (o *Orchestrator) startMissingRunningSandboxCleanup(observed *types.Sandbox) {
+	o.startSandboxRunEndWork(resultCleanupKey(observed.ID, observed.RunID), cloneSandbox(observed))
+}
+
+func (o *Orchestrator) startSandboxRunEndWork(runID string, missing *types.Sandbox) {
 	ctx := o.launchContext()
 	finishAdmission, err := o.acceptedOps.Begin(ctx)
 	if err != nil {
@@ -143,10 +154,15 @@ func (o *Orchestrator) startSandboxRunEndCheck(runID string) {
 		// a future read and do not need another queue entry.
 		if work.running {
 			work.again = true
+			work.nextMissing = missing
+		} else if missing != nil {
+			// Legacy empty-RunID rows can reuse this key for a successor. A
+			// fresh startup observation must replace the stale pending owner.
+			work.missing = missing
 		}
 		return
 	}
-	o.runEndActive[runID] = &sandboxRunEndWork{}
+	o.runEndActive[runID] = &sandboxRunEndWork{missing: missing}
 	o.runEndQueue = append(o.runEndQueue, runID)
 	o.wakeSandboxRunEndLocked()
 	limit := o.runEndWorkerLimit
@@ -228,9 +244,17 @@ func (o *Orchestrator) sandboxRunEndWorker(ctx context.Context, finish func()) {
 		}
 		o.runEndMu.Unlock()
 
-		err := o.checkDisconnectedRunOnce(ctx, runKindSandbox, runID)
+		var err error
+		if work.missing != nil {
+			err = o.finalizeMissingRunningSandboxOnce(ctx, work.missing)
+		} else {
+			err = o.checkDisconnectedRunOnce(ctx, runKindSandbox, runID)
+		}
 		o.runEndMu.Lock()
 		work.running = false
+		if work.nextMissing != nil {
+			work.missing, work.nextMissing = work.nextMissing, nil
+		}
 		switch {
 		case ctx.Err() != nil:
 			delete(o.runEndActive, runID)

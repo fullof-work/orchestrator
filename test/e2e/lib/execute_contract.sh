@@ -28,6 +28,7 @@ cleanup() {
     local forwarding_clean=1
     set +e
     [ -e "${PAUSE_BARRIER_TARGET:-}" ] && : > "$PAUSE_BARRIER_RELEASE"
+    [ -e "${PUBLISH_BARRIER_TARGET:-}" ] && : > "$PUBLISH_BARRIER_RELEASE"
     [ "$MMDS_ROUTES_E2E" = 1 ] && stop_mmds_service_backend
     stop_owned_units "$RUNNER_PREFIX" "$BUILDER_PREFIX"
     [ -n "$IMMEDIATE_DATA_PID" ] && kill "$IMMEDIATE_DATA_PID" 2>/dev/null

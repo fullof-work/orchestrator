@@ -1865,7 +1865,7 @@ route-applied barrier;失败在完成本地 cleanup 后以 exact owner CAS 收�
 Pause 的 `CommitRunningPaused` 继续原子提交 state 与 source。其后 RunID、port、RunDir 分别只在
 Stop/Reset fence、Detach、checkpoint 选择性清理及 RemoveAll 成功后 exact-clear；RunDir CAS 同时清除该目录拥有的 envd/ci
 UDS path。任一步失败都保留尚未完成的字段供当前进程或 startup Reconcile 重试。fully-cleaned paused
-row 只保留 BaseDir/checkpoint 与 source；Resume/Wake/Exec 在取得新 runtime owner 前完成 backlog，
+row 保留含 checkpoint 数据及来源操作锁的 BaseDir 与 source；Resume/Wake/Exec 在取得新 runtime owner 前完成 backlog，
 并在 `paused -> starting` acceptance 中原子恢复 canonical RunDir/UDS。这样 paused BaseDir 永不被
 runtime cleanup 删除，显式 Delete 仍可从 fully-cleaned paused row 删除 BaseDir 后 hard-delete。
 
@@ -1922,12 +1922,12 @@ durable Sandbox row,不通过 metadata 隧道传递。
 ```text
 CaptureSnapshot:
   sandbox-ctl snapshot --json --path-id <sid> --output <dir> --mode <local|bundle> \
-    --run-root <run-root> [--merge-ref=...] [--drop-caches=...]
+    --run-root <run-root> --checkpoint <UUID-v7> [--merge-ref=...] [--drop-caches=...]
   -> ResumeSource{kind:snapshot, ref:<actual S basename + identity>, sandboxRef:<actual E basename + identity>}
 
 CaptureSandbox:
   sandbox-ctl export --json --path-id <sid> --output <dir> --mode <local|bundle> \
-    --run-root <run-root>
+    --run-root <run-root> --checkpoint <UUID-v7>
   -> ResumeSource{kind:sandbox, ref:<actual E basename + identity>, sandboxRef:""}
 ```
 
@@ -1947,6 +1947,70 @@ exact-CAS 清 network；任一步失败保留尚需重试的字段。checkpoint 
 取得 runtime owner，当前进程的下一次 admission 与 startup Reconcile 都会重试。BaseDir 与当前 checkpoint 依赖始终保留，已知且无用的旧 checkpoint 文件会选择性清除。capture 失败保持 state=running、旧 source、runner 和 network 不变,不创建
 成功 alias,也不从 S 降级为 E。
 
+##### 本地磁盘 Checkpoint
+
+每次实际沙箱启动，包括冷/内存恢复、重启及空闲 runner 接到任务后的启动，都传入
+`--enable-checkpoint`。可写 DIFF 保留在
+`<BaseRoot>/sandboxes/<SandboxID>/checkpoint/diffs`，清理 RunDir 不删除它。
+目录沿用既有 BaseRoot 与 PathID，不增加独立租户选项。Builder 阶段使用相同后端，
+见 [Build 执行](node-build_zh.md#5-按目标执行与发布)。
+
+每次实际命名捕获都生成新的 UUID v7，根盘和全部可写数据盘共用该 ID。
+UUID 生成失败时尚不启动捕获命令；没有再次捕获的重复请求不创建新版本。
+`checkpoint.mode` 仍选择 local 或 Bundle 载体，`memory`、`merge_ref`、`drop_caches`
+保留各自的含义。E 在 `checkpoint.json` 中记录固定磁盘版本，本次捕获不复制普通磁盘 payload。
+
+旧运行实例不原地转换。只有 sandbox-ctl 明确返回不支持（退出码 78）时，才允许一次
+不带 `--checkpoint` 的普通捕获重试；重试使用独立参数和输出缓冲，并校验自己的完整报告。
+I/O、空间不足、损坏或报告不完整都不能触发降级。新启动必须支持已启用的模式。
+部署需使用包含 [sandboxer #336](https://github.com/kuasar-sandbox/sandboxer/pull/336)
+的匹配源码和二进制（`7cd3ed4c5a8807b75b175bdb845867effb1c5018` 或后继版本）；
+`go.mod` replacement 实际选择的兄弟模块也是这一要求的一部分。
+
+Task-local Open、Clone、Validate 保留 Checkpoint 布局。即使普通 active-base 字段为空，
+根盘和数据盘也已有活动内容，因此预检不注入空白盘。普通直接 EROFS 来源仍需准备可写 upper。
+Resume 原样传递已提交来源：目录、磁盘身份、容量、base 及最新活动版本匹配时，sandboxer
+可以重开原 DIFF；历史版本、活动内容已变化或目标目录不同则需要物化。
+来源制品相对其实际载体解析，与目标 RunDir/BaseDir 分开。
+
+命名本地捕获去除了历史磁盘 payload 的复制，不代表整个 Pause 或 Resume 为常量时间。
+Drain、内存捕获和业务收尾仍有成本。DIFF 重开先完成必要检查，再于首次访问查询 presence，
+因此应把 guest ready、首批工作集与 Open 时间一并衡量。保留版本可能增加空间和共享写入成本；
+普通活动 DIFF 导出仍需遍历索引。存储层测量不能替代平台 pause/resume 的实测结果。
+
+平台验证使用公开 `orchestrator.checkpoint.sh` 用例，要求命名版本、同目录 DIFF 重用、
+内存/冷恢复及可移植发布后的 guest 数据正确性、导出期间保留版本，以及释放后实际分配字节下降。
+用例允许有界后台 GC 宽限，仅有 `List=[]` 不能判定空间已回收。Build 阶段必须启用
+Checkpoint，最终模板捕获仍为普通产物。
+
+可选性能对比应通过中央 E2E prepare 流程准备独立的普通复制基线和候选工作区，两者都包含
+当前 `orchestrator.checkpoint.sh` 的依赖和测试 helper。基线和候选的 `node-ctl` 分别来自
+对应源码，其余 sandboxer/产品、execute Image、架构和宿主资源相同。在 orchestrator
+仓库中顺序运行，输出目录必须是尚不存在的新目录：
+
+```sh
+sudo python3 test/perf/run_checkpoint_platform.py --workspace /path/to/baseline-prepared \
+  --mode baseline-copy --sizes 0,1 --out /path/to/baseline-observations
+sudo python3 test/perf/run_checkpoint_platform.py --workspace /path/to/candidate-prepared \
+  --mode checkpoint --sizes 0,1 --out /path/to/candidate-observations
+```
+
+独立测量入口调用 prepared 内的公开 `workspace.verify`、能力探测、`load_images` 和
+`case_environment`，结束后再次校验输入。它不改写 prepared 产品，也不回退到宿主产品；
+其结果不代表 E2E 验收通过。报告保留完整 prepared 来源、产品 SHA-256、Image 身份、
+实际 argv 和捕获布局。基线必须没有 Checkpoint 启动/捕获参数和元数据，候选必须启用
+新模式并使用不同的 UUID v7。
+
+两边使用相同 Build 请求、2 GiB 文件系统和确定性的 0/1 GiB 密集数据生成规则，0 GiB
+仍包含正常 guest/文件系统写入。启动元数据和加密可能使生成的模板身份不同，报告分别记录它们。
+Build 准备不计入 Create、Pause、热/冷恢复、发布及从发布模板 Create 的延迟。
+每次恢复都校验数据，包括删除原来源后从发布产物创建。`checkpoint-platform.jsonl`
+分别记录 BaseDir/RunDir 普通文件及 DIFF 的实际分配空间、runtime unit 的 RSS/cgroup
+内存采样，以及存活进程 `/proc/PID/io` 和 cgroup `io.stat` 计数。
+共享缓存、Store 输出和 node daemon 不在这些口径内；内存不是峰值，I/O 计数随 runtime
+重建而重置。这些采样不能直接证明写放大比率或普遍加速幅度。报告应说明版本、文件系统、
+缓存状态和测量口径；需要判断波动时重复成对测试。
+
 ##### 托管 checkpoint 历史合并与选择性清理
 
 `merge_ref=false` 独立记录本轮驻留工作集。已有 `S1 -> S0` 时，下一次捕获先流式生成新的
@@ -1959,7 +2023,7 @@ exact-CAS 清 network；任一步失败保留尚需重试的字段。checkpoint 
 前缀必须属于当前沙箱的规范 `BaseDir/checkpoint`。先按完整来源绑定和 Bundle 实际成员选择
 物理载体，再比较路径。named location 或外部模板是边界，即使文件可在本机读取、甚至映射
 到同一路径也不能越界合并。该边界及其后的 lower refs 保持原顺序。local tarstream、Bundle
-和混合载体使用相同规则。可写磁盘链始终吸收同设备的连续本地前缀，不受内存开关影响；
+和混合载体使用相同规则。普通复制式可写磁盘捕获吸收同设备的连续本地前缀，不受内存开关影响；
 不可变 EROFS base 与 ext4 upper 保持分离。Data 和不透明 Zero 覆盖下层，Hole 向下穿透。
 历史读取走宿主制品 stream，不读 guest memfd，因此不会扩大本轮工作集。
 
@@ -2004,6 +2068,20 @@ checkpoint 清理和既有 paused 收尾均成功。既有 worker 在 SID lifecy
 不会持锁等待需要同一锁完成的 export。Resume/Wake/Exec 遵守既有 pending-cleanup admission
 合同。候选已不存在视为完成；权限、I/O 和身份错误继续保留重试责任。普通 Kill 和 BuildBaseDir
 终态删除仍由原 finalizer 负责；此步骤不回收任何共享或外部制品。
+
+##### Resume 后释放磁盘版本
+
+运行期磁盘版本释放与上述 paused 制品文件清理分别执行。成功提交 running、实际导出完成及
+启动接管触发共同释放检查。检查重新读取当前状态、精确 runtime 与路径归属；只有 running、
+没有终态执行结果、且没有仍在使用 checkpoint 的来源操作时才可释放。
+starting、恢复失败回退 paused、尚未恢复的 `keepSource` 都保留版本。
+
+检查使用 sandboxer 完整的 List 结果，删除其中精确的 `{DiffID, ID}` 引用。
+部分或结果不确定的 Delete 重试保持同一集合，不把旧选择交给另一个运行实例。
+错误会记录并通过有界调用和退避重试，不撤销已成功的启动或发布。
+这一步不执行 `checkpoint-cleanup`、不删除 DIFF 目录，也不删除内存依赖。
+Delete 使旧版本可回收，实际空间由 sandboxer 后续 GC 归还，而非同步回收。
+因此 running row 仍保留 `ResumeSource` 字段，并不保证下一次捕获失败后还能退回该旧暂停点。
 
 #### 8.1.2 Resume admission、Connect 与 Wake
 
@@ -2190,11 +2268,25 @@ ServiceSecret/Envd/Traffic/Forward token;目标 node 从本地 trusted key table
 ManifestKey 并校验 fingerprints、runtime digest 和 profile。token 不携 raw tenant roots、host path、
 MMDS secret value、cluster Group/RouteKey 或 generation。
 
+本地磁盘 Checkpoint 的发布由 sandboxer 将固定版本物化为普通可移植磁盘产物，并从发布 E
+中移除 `checkpoint.json`，原本地来源不变。移往其他节点或回退到不支持 Checkpoint E 的
+reader 前，先完成 publish；只复制元数据不会转移本地 DIFF 内容。
+
+导出准入先完成待办 paused 清理，再登记 attempt 或启动发布。checkpoint 目录之外的私有
+来源操作锁由捕获、清理、导出、磁盘版本释放和终态资源删除共同使用。
+publisher、capture CLI 和 `checkpoint-cleanup` 继承其描述符，因此 conductor 取消或退出
+不会在实际子进程结束前解除保护。锁文件随 BaseDir 保留到终态目录删除，不能单独 unlink
+或替换。发生争用时，在 SID lifecycle lock 之外等待重试，重新读取当前状态和路径。
+已清理干净的来源可在发布期间 resume，但版本释放和终态删除等待来源使用真正结束；
+发出取消不代表已经完成。正常执行结束、确认运行实例失联及显式删除共同使用受来源保护的
+资源收尾，保留的 dead 历史与执行结果继续保持原有业务含义。
+
 Export 的 publish 阶段不持有长 lifecycle lock。结果校验通过后，在 per-SID lifecycle lock
 内检查完整原始 S/E 对、源实例和导出 attempt。Resume 先成功 `BeginResume` 时，KMT
 export 被取消并返回 409；template publish 可 detached 完成并返回 TemplateID，但不清理
-source。Export 先赢得收尾权时，`keepSource=true` 保持 ResumeSource、row、cache、route
-与 checkpoint 全部不变。之后再对保留的源执行 move，仍使用同一删除流程。
+source。Export 先赢得收尾权时，`keepSource=true` 在准入已完成待办 paused 清理并持久清空
+相应归属后，保留原 ResumeSource 及必要 checkpoint 产物；发布收尾不改写保留的来源。
+之后再对保留的源执行 move，仍使用同一删除流程。
 
 `keepSource=false` 校验本地路径所有权后，调用正常的锁内删除接纳入口。成功表示
 有效 token/template 结果和持久 `deleting` 行，物理清理可能尚未完成。Export 返回前

@@ -245,7 +245,7 @@ func (o *Orchestrator) pressureSandboxes() []*types.Sandbox {
 }
 
 func (o *Orchestrator) pauseForPressure(ctx context.Context, candidate *types.Sandbox) error {
-	unlock, err := o.lockLifecycleMutation(ctx, candidate.ID)
+	ctx, unlock, err := o.lockLifecycleMutation(ctx, candidate.ID)
 	if err != nil {
 		return err
 	}

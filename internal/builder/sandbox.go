@@ -92,7 +92,7 @@ func (p *buildPipeline) startSandboxYAML(phase string, document []byte, connect 
 }
 
 func phaseSandboxRunArgs(s *configsock.BuildSpec, phase, sid, yamlPath string, connect []string, from string, replaceBoot bool) []string {
-	args := []string{"run"}
+	args := []string{"run", "--enable-checkpoint"}
 	if from != "" {
 		args = append(args, "--from", from)
 		if replaceBoot {

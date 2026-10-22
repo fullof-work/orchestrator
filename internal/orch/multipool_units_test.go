@@ -105,6 +105,19 @@ func TestMultiPoolSandboxRecoveryAndIndexLifetime(t *testing.T) {
 		t.Run(state, func(t *testing.T) {
 			f := newSandboxFinalizerFixture(t, "multi-"+state)
 			o, sb := f.o, f.sb
+			// Startup adoption now schedules disk-version release. Match the
+			// conductor shutdown order: stop retries and drain their current
+			// attempt before the fixture closes SQLite or removes private dirs.
+			lifecycle, cancel := context.WithCancel(context.Background())
+			o.SetLifecycleContext(lifecycle)
+			t.Cleanup(func() {
+				cancel()
+				drain, stop := context.WithTimeout(context.Background(), 10*time.Second)
+				defer stop()
+				if err := o.DrainPauses(drain); err != nil {
+					t.Errorf("drain adopted sandbox work: %v", err)
+				}
+			})
 			o.cfg.Units = multiPoolUnits()
 			id := sb.RunID
 			actual := instanceUnit("shared@.service", id)

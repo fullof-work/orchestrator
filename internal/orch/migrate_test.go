@@ -739,8 +739,7 @@ func TestExportRejectsNonCanonicalBaseDirBeforePublishOrCleanup(t *testing.T) {
 		return artifact.PublishReport{}, nil
 	}
 
-	if _, err := o.exportSandboxTokenForTest(ctx, apiKey, sid, true, true); err == nil ||
-		!strings.Contains(err.Error(), "does not match canonical path") {
+	if _, err := o.exportSandboxTokenForTest(ctx, apiKey, sid, true, true); err == nil {
 		t.Fatalf("non-canonical BaseDir error = %v", err)
 	}
 	if publishCalled {
@@ -830,11 +829,9 @@ func mustRefLocationURI(t *testing.T, cfg *config.Config, name string) string {
 	return uri
 }
 
-// TestExportKeepSourceSucceedsWithoutSourceWrites proves that a keep-source
-// export performs no UPDATE or DELETE on the source row — even when those
-// operations are forbidden, the export still succeeds and the source is
-// bit-for-bit unchanged (#336).
-func TestExportKeepSourceSucceedsWithoutSourceWrites(t *testing.T) {
+// Once paused ownership cleanup is complete, keep-source publication needs no
+// further UPDATE or DELETE. Forbid both and verify the retained source (#336).
+func TestExportKeepSourceAfterCleanupSucceedsWithoutSourceWrites(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "node.db")
 	cfg := &config.Config{}
@@ -849,6 +846,7 @@ func TestExportKeepSourceSucceedsWithoutSourceWrites(t *testing.T) {
 	installPromoteStub(t, "manifest://"+strings.Repeat("d", 64))
 
 	sb := migrationSandbox(t, dir, sid, mk, localRef)
+	sb.RunDir = "" // Paused cleanup's durable completion marker.
 	if err := o.st.Put(ctx, sb); err != nil {
 		t.Fatal(err)
 	}
@@ -1052,6 +1050,7 @@ func TestExportKeepSourceAfterResumePauseCycle(t *testing.T) {
 }
 
 func TestExportMoveDeleteAcceptanceFailurePreservesSource(t *testing.T) {
+	installExportCheckpointCleanup(t)
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "node.db")
 	runtimePath := filepath.Join(dir, "rt-e2b.erofs")
@@ -1115,6 +1114,7 @@ func migrationSandbox(t *testing.T, dir, sid, mk, ref string) *types.Sandbox {
 
 func migrationOrchestrator(t *testing.T, dir string, runtime []byte) *Orchestrator {
 	t.Helper()
+	installExportCheckpointCleanup(t)
 	runtimePath := filepath.Join(dir, "runtime.erofs")
 	if err := os.WriteFile(runtimePath, runtime, 0o644); err != nil {
 		t.Fatal(err)

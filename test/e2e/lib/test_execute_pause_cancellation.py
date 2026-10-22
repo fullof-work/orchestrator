@@ -257,6 +257,30 @@ trap pause_fixture_exit EXIT
         self.completed(self.wrapper("snapshot", "--path-id", "pause-target"))
         self.assertFalse(self.reached.exists())
 
+    def test_publish_source_waits_for_release_and_forwards_exact_arguments(self):
+        self.target = self.root / "publish-barrier-target"
+        self.reached = self.root / "publish-barrier-reached"
+        self.release = self.root / "publish-barrier-release"
+        source = str(self.root / "source with spaces" / "checkpoint")
+        self.target.write_text(source + "\n")
+        args = ["publish", "--json", "file://" + source + "/root.sandbox@digest:" + "a" * 64]
+        wrapper = self.wrapper(*args)
+        self.arrival(wrapper)
+        self.release.touch()
+        self.completed(wrapper)
+        self.assertEqual(json.loads(self.forwarded.read_text()), args)
+
+    def test_publish_sibling_directory_does_not_wait(self):
+        target = self.root / "publish-barrier-target"
+        source = str(self.root / "checkpoint")
+        target.write_text(source + "\n")
+        for ref in ("file://" + source + "-other/root.sandbox", "file:///other/checkpoint/root.sandbox"):
+            with self.subTest(ref=ref):
+                args = ["publish", "--json", ref]
+                self.completed(self.wrapper(*args))
+                self.assertFalse((self.root / "publish-barrier-reached").exists())
+                self.assertEqual(json.loads(self.forwarded.read_text()), args)
+
     def test_arrival_then_actual_sigterm_exit_143_before_release(self):
         driver = self.driver("gated")
         self.event(b"C")

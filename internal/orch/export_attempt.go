@@ -2,7 +2,9 @@ package orch
 
 import (
 	"context"
+	"errors"
 	"sync"
+	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -131,21 +133,47 @@ func (g *exportAttemptGroup) Finish(attempt *exportAttempt) {
 // mutations: they remain serialized behind an active export. Resume admission
 // and internal launch commits deliberately use lifecycle.Lock directly so they
 // can overtake or complete a detached template upload.
-func (o *Orchestrator) lockLifecycleMutation(ctx context.Context, sid string) (func(), error) {
+func (o *Orchestrator) lockLifecycleMutation(ctx context.Context, sid string) (context.Context, func(), error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	for {
+		if err := ctx.Err(); err != nil {
+			return ctx, nil, err
+		}
 		unlock := o.lifecycle.Lock(sid)
 		done := o.exports.ActiveDone(sid)
 		if done == nil {
-			return unlock, nil
+			sb, err := o.st.Get(ctx, sid)
+			if err != nil {
+				unlock()
+				return ctx, nil, err
+			}
+			guardCtx, release, err := o.trySourceOperation(ctx, sb)
+			if err == nil {
+				return guardCtx, func() { release(); unlock() }, nil
+			}
+			if !errors.Is(err, errSourceOperationBusy) {
+				unlock()
+				return ctx, nil, err
+			}
 		}
 		unlock()
-		select {
-		case <-done:
-		case <-ctx.Done():
-			return nil, ctx.Err()
+		if done != nil {
+			select {
+			case <-done:
+				continue
+			case <-ctx.Done():
+				return ctx, nil, ctx.Err()
+			}
 		}
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx, nil, ctx.Err()
+		}
+		timer.Stop()
 	}
 }

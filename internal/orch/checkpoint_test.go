@@ -120,7 +120,7 @@ func TestPauseCheckpointModeAndPolicyArgv(t *testing.T) {
 			checkpointDir := filepath.Join(sb.BaseDir, "checkpoint")
 			want := []string{"snapshot", "--json", "--path-id", sb.ID, "--output", checkpointDir, "--mode", tc.mode, "--run-root", nodepath.SandboxRunRoot(cfg.Paths.RunRoot)}
 			want = append(want, tc.wantTail...)
-			if got := readCheckpointArgs(t, argsPath); !reflect.DeepEqual(got, want) {
+			if got, _ := splitNamedCheckpointArgs(t, readCheckpointArgs(t, argsPath)); !reflect.DeepEqual(got, want) {
 				t.Fatalf("snapshot argv = %#v, want %#v", got, want)
 			}
 			stored, err := o.st.Get(context.Background(), sb.ID)
@@ -150,7 +150,7 @@ func TestPauseSandboxCaptureAndTTLAutoPauseSelection(t *testing.T) {
 			}
 			checkpointDir := filepath.Join(sb.BaseDir, "checkpoint")
 			want := []string{"export", "--json", "--path-id", sb.ID, "--output", checkpointDir, "--mode", mode, "--run-root", nodepath.SandboxRunRoot(cfg.Paths.RunRoot)}
-			if got := readCheckpointArgs(t, argsPath); !reflect.DeepEqual(got, want) {
+			if got, _ := splitNamedCheckpointArgs(t, readCheckpointArgs(t, argsPath)); !reflect.DeepEqual(got, want) {
 				t.Fatalf("export argv = %#v, want %#v", got, want)
 			}
 			stored, err := o.st.Get(context.Background(), sb.ID)

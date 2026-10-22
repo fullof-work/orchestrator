@@ -2,6 +2,7 @@
 # e2e-requires: ["bpf-map","bpf-tc","cgroup-v2","docker","journald","kvm","netns","systemd","tun","userfaultfd"]
 set -euo pipefail
 . "${E2E_LIB:?}/orchestrator/execute_env.sh"
+. "$SCRIPT_DIR/execute_checkpoint.sh"
 write_orchestrator_config unset controller
 start_orchestrator "$WORK/orch.log"
 wait_mmds_listener
@@ -29,21 +30,19 @@ B_LOCAL="$CHECKPOINT_ROOT/$SID/checkpoint/$SID.snapshot"
 B_ARTIFACT="$(readlink -f "$B_LOCAL")"
 B_SNAPSHOT_BASENAME="$(basename "$B_ARTIFACT")"
 "$BIN/sandbox-ctl" info --json "$B_LOCAL" >"$WORK/b-local.json"
+checkpoint_local_metadata "$SID" "$WORK/b-checkpoint.json"
 exec_through_connect "$SID" "$EXEC_TOKEN" "BASELINE_RESTORE_$RANDOM"
 EXACT_EXEC_TOKEN="$(issue_exec_session "$SID" "$AK" '{"conditions":[{"expr":"request.argv == [\"/bin/true\"]"}]}')"
 # ---- local B -> working-set W -> independent portable publication --------
-# The second local Pause keeps memory self separate while disks still merge.
-# Make the restored disk delta observably different from B: a content-addressed
-# merge with no intervening writes can legitimately reproduce B's top digest.
-# This W-only marker makes removal of B's old disk top a meaningful proof.
+# The second local Pause keeps memory self separate and creates a fresh version
+# in the same DIFF. The W-only marker proves the new version captures its writes.
 W_DISK_PERSIST="W_DISK_PERSIST_$RANDOM"
 python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
     "echo $W_DISK_PERSIST > /home/user/working-set-disk.txt" >"$WORK/w-disk-write.out" 2>&1 || true
 grep -q 'EXIT_CODE 0' "$WORK/w-disk-write.out" \
     || { sed 's/^/  guest| /' "$WORK/w-disk-write.out"; fail "write W-only disk marker"; }
-# Removing B's old root-disk top before promotion proves publish treats
-# B.snapshot as an opaque memory lower instead of recursively publishing B's
-# stale disk graph.
+# Retiring B's old E metadata before promotion proves publish treats B.snapshot
+# as an opaque memory lower rather than following its obsolete disk version.
 PORTABLE_W_CALL=$(snapshot_argv_count)
 freeze_service_probe || fail "envd freeze service disappeared before portable W pause"
 FREEZE_COUNTER_BEFORE_W=$FREEZE_COUNTER
@@ -66,7 +65,9 @@ PORTABLE_W_UNIT="${RUNNER_PREFIX}$PORTABLE_W_RUN_ID.service"
 wait_unit_journal_contains "$PORTABLE_W_UNIT" \
     'quiesce: guest acked (drop_caches=skipped' "$WORK/w-portable-local.journal" \
     || { tail -40 "$WORK/w-portable-local.journal" | sed 's/^/  unit| /'; fail "working-set Pause did not preserve guest page cache"; }
-B_ROOT_TOP_BASENAME=$(python3 - "$WORK/b-local.json" "$WORK/w-portable-local.json" "$B_SNAPSHOT_BASENAME" <<'PY'
+wait_paused_cleanup "$SID" || fail "W checkpoint cleanup did not finish"
+checkpoint_local_metadata "$SID" "$WORK/w-checkpoint.json"
+B_RUNTIME_ARTIFACT=$(python3 - "$WORK/b-local.json" "$WORK/w-portable-local.json" "$B_SNAPSHOT_BASENAME" "$WORK/b-checkpoint.json" "$WORK/w-checkpoint.json" <<'PY'
 import json, os, sys
 
 with open(sys.argv[1], encoding="utf-8") as source:
@@ -84,33 +85,20 @@ if os.path.basename(memory_path) != sys.argv[3]:
 if memory_refs[1:] != parent_refs:
     raise SystemExit(f"working-set lower tail={memory_refs[1:]!r}, want inherited {parent_refs!r}")
 
-def top(node):
-    overlay = node.get("Overlay")
-    return overlay["Base"] if overlay else node["Base"]
-
-def chain(node):
-    overlay = node.get("Overlay")
-    return (overlay.get("BaseFromRefs") if overlay else node.get("BaseFromRefs")) or []
-
-parent_top = top(parent["Boot"]["Root"])
-working_root = working["Boot"]["Root"]
-if parent_top == top(working_root) or parent_top in chain(working_root):
-    raise SystemExit(f"W retained B disk top {parent_top!r}; local disks must merge")
-if not parent_top.startswith("file://"):
-    raise SystemExit(f"B root disk top is not local: {parent_top!r}")
-relative = parent_top[len("file://"):].split("@", 1)[0]
-if (
-    relative != os.path.basename(relative)
-    or not relative.endswith((".overlay", ".sandbox"))
-):
-    raise SystemExit(f"refusing to remove unexpected B disk ref {parent_top!r}")
-print(relative)
+with open(sys.argv[4], encoding="utf-8") as source:
+    before = json.load(source)
+with open(sys.argv[5], encoding="utf-8") as source:
+    after = json.load(source)
+assert before["checkpoint_id"] != after["checkpoint_id"], (before, after)
+assert before["root"] == after["root"], (before, after)
+assert (before.get("disks") or []) == (after.get("disks") or []), (before, after)
+assert before["artifact"] != after["artifact"], (before, after)
+print(before["artifact"])
 PY
 ) || fail "local B/W graph validation failed"
-B_ROOT_TOP_PATH="$CHECKPOINT_ROOT/$SID/checkpoint/$B_ROOT_TOP_BASENAME"
-wait_paused_cleanup "$SID" || fail "W checkpoint cleanup did not finish"
-[ ! -e "$B_ROOT_TOP_PATH" ] || fail "unused B root disk top remains after managed checkpoint cleanup: $B_ROOT_TOP_PATH"
-echo "==> PASS: W -> local B is separate; managed cleanup retired B's merged disk top"
+[ ! -e "$B_RUNTIME_ARTIFACT" ] || fail "obsolete B runtime metadata remains after managed checkpoint cleanup: $B_RUNTIME_ARTIFACT"
+[ -e "$B_ARTIFACT" ] || fail "W still needs B's memory lower"
+echo "==> PASS: W retains B memory, reuses its DIFF with a new version and retires obsolete B runtime metadata"
 
 W_LOCAL_PAIR=$(checkpoint_pair "$SID" snapshot "$W_PORTABLE_LOCAL") || fail "invalid W capture pair"
 W_RUNTIME_REF=$(checkpoint_runtime_ref "$W_LOCAL_PAIR" "$CHECKPOINT_ROOT/$SID/checkpoint")
@@ -135,8 +123,8 @@ PY
 PORTABLE_W_KEY="${PORTABLE_W_REF#manifest://}"
 [[ "$PORTABLE_W_REF" == manifest://* && "$PORTABLE_W_KEY" =~ ^[0-9a-f]{64}$ ]] \
     || fail "published W ref is not manifest://<64hex>: $PORTABLE_W_REF"
-# keep-source must leave the paused source row bit-for-bit unchanged after both
-# exports, and must retain the local checkpoint it resumes from (#336).
+# After paused cleanup, keep-source publication must preserve the resume pair
+# and its necessary local checkpoint through both exports (#336).
 [ "$(checkpoint_pair "$SID" snapshot "$W_PORTABLE_LOCAL")" = "$W_LOCAL_PAIR" ] \
     || fail "keep-source export rewrote the W S/E pair"
 [ -e "$CHECKPOINT_ROOT/$SID/checkpoint" ] || fail "keep-source export removed the retained W checkpoint"
@@ -404,17 +392,20 @@ PY_BUNDLE
 [ ! -e "$BUNDLE_B_TARGET" ] && [ ! -e "$BUNDLE_TARGET" ] \
     || fail "Bundle C cleanup retained obsolete A/B carriers"
 BUNDLE_LOCAL_PAIR=$(checkpoint_pair "$SID" snapshot "$BUNDLE_LOCAL") || fail "invalid Bundle capture pair"
-BUNDLE_TOKEN=$(E2B_API_KEY="$AK" "$ORCH_BIN_DIR/node-ctl" export-sandbox "$SID" \
-    --keep-source --socket "$WORK/node-ctl.socket") \
+E2B_API_KEY="$AK" "$ORCH_BIN_DIR/node-ctl" export-sandbox "$SID" \
+    --keep-source --json --socket "$WORK/node-ctl.socket" >"$WORK/bundle-publish.json" \
     || fail "bundle keep-source export failed"
+BUNDLE_TOKEN=$(json_field "$WORK/bundle-publish.json" result)
 case "$BUNDLE_TOKEN" in kmt1.*) ;; *) fail "bundle export returned a non-KMT result" ;; esac
-# keep-source must leave the paused source row unchanged and retain its local
-# checkpoint (#336). The published root stays content-addressed under the
-# local bundle's ManifestKey, which the Store lookup below proves.
+# After paused cleanup, keep-source retains the resume pair and local checkpoint
+# (#336). Publication materializes an ordinary portable graph, whose new identity
+# comes from the public export report rather than the local Checkpoint Bundle.
 [ "$(checkpoint_pair "$SID" snapshot "$BUNDLE_LOCAL")" = "$BUNDLE_LOCAL_PAIR" ] \
     || fail "Bundle keep-source export rewrote the S/E pair"
 [ -e "$CHECKPOINT_ROOT/$SID/checkpoint" ] || fail "bundle keep-source export removed the retained checkpoint"
-BUNDLE_REMOTE_REF="manifest://$BUNDLE_ROOT_KEY"
+BUNDLE_REMOTE_REF=$(json_field "$WORK/bundle-publish.json" snapshotRef)
+[[ "$BUNDLE_REMOTE_REF" == manifest://* && "$BUNDLE_REMOTE_REF" != "manifest://$BUNDLE_ROOT_KEY" ]] \
+    || fail "Bundle publication did not return a new portable Snapshot identity"
 MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
     "$BUNDLE_REMOTE_REF" >"$WORK/bundle-remote.json" \
     || fail "published Bundle root $BUNDLE_REMOTE_REF is unreadable from Store"
@@ -437,18 +428,20 @@ E_BUNDLE_TARGET=$(readlink -f "$E_BUNDLE_LOCAL")
 case "$E_BUNDLE_TARGET" in *.bundle) ;; *) fail "Bundle Sandbox E target is not .bundle: $E_BUNDLE_TARGET" ;; esac
 E_BUNDLE_PAIR=$(checkpoint_pair "$SID" sandbox "$E_BUNDLE_LOCAL") || fail "invalid E-only Bundle capture"
 E_BUNDLE_RUNTIME_REF=$(checkpoint_runtime_ref "$E_BUNDLE_PAIR" "$CHECKPOINT_ROOT/$SID/checkpoint")
-E_BUNDLE_TOKEN=$(E2B_API_KEY="$AK" "$ORCH_BIN_DIR/node-ctl" export-sandbox "$SID" \
-    --keep-source --socket "$WORK/node-ctl.socket") \
+E2B_API_KEY="$AK" "$ORCH_BIN_DIR/node-ctl" export-sandbox "$SID" \
+    --keep-source --json --socket "$WORK/node-ctl.socket" >"$WORK/bundle-e-publish.json" \
     || fail "Bundle Sandbox E publish failed"
+E_BUNDLE_TOKEN=$(json_field "$WORK/bundle-e-publish.json" result)
 case "$E_BUNDLE_TOKEN" in kmt1.*) ;; *) fail "Bundle Sandbox E export returned a non-KMT result" ;; esac
 # keep-source leaves the paused Bundle E row pointing at its retained local
-# checkpoint (#336); the published artifact lands in the Store under the
-# bundle's content-addressed root key.
+# checkpoint (#336); the public report identifies the ordinary portable E.
 [ "$(checkpoint_pair "$SID" sandbox "$E_BUNDLE_LOCAL")" = "$E_BUNDLE_PAIR" ] \
     || fail "Bundle Sandbox E keep-source export rewrote the source"
 [ -L "$E_BUNDLE_LOCAL" ] || fail "Bundle Sandbox E keep-source export removed the retained local symlink"
 [ -e "$CHECKPOINT_ROOT/$SID/checkpoint" ] || fail "Bundle Sandbox E keep-source export removed the retained local directory"
-E_BUNDLE_REMOTE_REF="manifest://$(basename "$E_BUNDLE_TARGET" .bundle)"
+E_BUNDLE_REMOTE_REF=$(json_field "$WORK/bundle-e-publish.json" sandboxRef)
+[[ "$E_BUNDLE_REMOTE_REF" == manifest://* && "$E_BUNDLE_REMOTE_REF" != "manifest://$(basename "$E_BUNDLE_TARGET" .bundle)" ]] \
+    || fail "Bundle publication did not return a new portable Sandbox identity"
 MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
     "$E_BUNDLE_REMOTE_REF" >"$WORK/bundle-e-remote.json" \
     || fail "published Bundle E root is unreadable from Store"

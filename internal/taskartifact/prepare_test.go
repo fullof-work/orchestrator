@@ -941,6 +941,12 @@ func writeTaskManifestBundle(t testing.TB, directory string, refs []string, cfgB
 
 func writeTaskManifestBundleArtifacts(t testing.TB, directory string, refs []string, cfgBody string) (string, string, string, string) {
 	t.Helper()
+	sandboxSource, fromRefs := taskSandboxSource(t, cfgBody)
+	return writeTaskManifestBundleSource(t, directory, refs, sandboxSource, fromRefs)
+}
+
+func writeTaskManifestBundleSource(t testing.TB, directory string, refs []string, sandboxSource sparse.Source, fromRefs []string) (string, string, string, string) {
+	t.Helper()
 	customerKey := [32]byte{0x41, 0x42, 0x43}
 	manifestCfg := &manifest.Config{
 		Manifest: manifest.ManifestSubConfig{Key: hex.EncodeToString(customerKey[:])},
@@ -957,7 +963,6 @@ func writeTaskManifestBundleArtifacts(t testing.TB, directory string, refs []str
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = sink.Close() })
-	sandboxSource, fromRefs := taskSandboxSource(t, cfgBody)
 	sandboxRef, _, err := sink.AbsorbSandbox(context.Background(), sandboxSource)
 	if err != nil {
 		t.Fatal(err)
