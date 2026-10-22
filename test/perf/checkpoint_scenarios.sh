@@ -2,12 +2,33 @@
 # Independent performance flows. Public prepared helpers remain unchanged.
 GUEST_WORKLOAD="$(cat "$PERF_DIR/checkpoint_guest_workload.py")"
 PERF_TAG=setup
+PERF_GUEST_TIMEOUT=180
 checkpoint_measure() { # same frozen observation helper, with a unique sample label
     python3 "$SCRIPT_DIR/disk_checkpoint.py" measure "$CASE_OUT/checkpoint-platform.jsonl" \
         "$WORK/lib/node-ctl.db" "$SID" "$RUNNER_PREFIX" "$CHECKPOINT_ROOT/$SID" \
         "$PERF_TAG.$1" "$2" "$3" --mode "$CHECKPOINT_PERF_MODE"
 }
-perf_guest() { checkpoint_guest python3 -c "$GUEST_WORKLOAD" "$@"; }
+perf_guest_budget() { # MiB; short public E2E guest-command budget stays unchanged
+    PERF_GUEST_TIMEOUT=$((180 + ($1 * 420 + 1023) / 1024))
+    [ "$PERF_GUEST_TIMEOUT" -le 1200 ] || PERF_GUEST_TIMEOUT=1200
+}
+perf_guest() {
+    timeout -k 5s "$PERF_GUEST_TIMEOUT" "$BIN/sandbox-ctl" exec --path-id "$SID" \
+        --run-root "$EXECUTE_RUN_ROOT/sandboxes" -- python3 -c "$GUEST_WORKLOAD" "$@"
+}
+perf_hash() { # label; preserve full content verification and separately record its cost
+    local started output="$CASE_OUT/$PERF_TAG.$1.verification.json"
+    started=$(checkpoint_clock)
+    perf_guest verify --path /home/user/checkpoint-payload >"$output"
+    python3 - "$output" "$started" "$PERF_GUEST_TIMEOUT" <<'PY'
+import json, pathlib, sys, time
+path = pathlib.Path(sys.argv[1])
+result = json.loads(path.read_text())
+result.update(host_elapsed_seconds=time.monotonic() - float(sys.argv[2]), timeout_seconds=int(sys.argv[3]))
+path.write_text(json.dumps(result, sort_keys=True) + '\n')
+print(result['sha256'] + '  /home/user/checkpoint-payload')
+PY
+}
 perf_cache() { # action label; control file page cache after hashing, outside Pause
     perf_guest prepare-capture >"$CASE_OUT/$PERF_TAG.$1.cache-preparation.json"
 }
@@ -40,6 +61,7 @@ perf_lifecycle() {
         for gib in ${CHECKPOINT_MEASURE_GIB//,/ }; do
             [ "$layout:$gib" != sparse:0 ] || continue
             mib=$((gib * 1024))
+            perf_guest_budget "$mib"
             PERF_TAG="$layout-${gib}GiB-r$round"
             sample="$PERF_TAG"
             TEMPLATE="$INITIAL_TEMPLATE"
@@ -47,7 +69,7 @@ perf_lifecycle() {
             local -a init=(initialize --path /home/user/checkpoint-payload --mib "$mib")
             [ "$layout" != sparse ] || init+=(--sparse)
             perf_guest "${init[@]}" >"$CASE_OUT/$sample.initialization.json"
-            checkpoint_hash >"$CASE_OUT/$sample.expected.hash"
+            perf_hash initialized >"$CASE_OUT/$sample.expected.hash"
             perf_cache before_snapshot
             checkpoint_measure before_pause "$(checkpoint_clock)" "$mib"
             pause_checkpoint_guest snapshot "$mib"
@@ -55,14 +77,14 @@ perf_lifecycle() {
             resume_checkpoint_guest "$mib" hot_ready
             perf_first_reads hot_first_working_set
             perf_require_release
-            checkpoint_hash >"$WORK/measure-hot.hash"
+            perf_hash hot_restored >"$WORK/measure-hot.hash"
             cmp "$CASE_OUT/$sample.expected.hash" "$WORK/measure-hot.hash"
             perf_cache before_sandbox
             pause_checkpoint_guest sandbox "$mib"
             perf_layout sandbox
             started=$(checkpoint_clock)
-            E2B_API_KEY="$AK" timeout -k 5s 1200 "$ORCH_BIN_DIR/node-ctl" export-sandbox "$SID" \
-                --keep-source --to-template --json --socket "$WORK/node-ctl.socket" >"$CASE_OUT/$sample.publish.json"
+            E2B_API_KEY="$AK" python3 "$PERF_DIR/checkpoint_export.py" \
+                --socket "$WORK/node-ctl.socket" --sid "$SID" --timeout 1200 >"$CASE_OUT/$sample.publish.json"
             checkpoint_measure publish "$started" "$mib"
             resume_checkpoint_guest "$mib" cold_ready
             perf_first_reads cold_first_working_set
@@ -76,32 +98,33 @@ perf_lifecycle() {
             resume_checkpoint_guest "$mib" cold_ready
             perf_first_reads cold_first_working_set
             perf_require_release
-            checkpoint_hash >"$WORK/measure-cold.hash"
+            perf_hash cold_restored >"$WORK/measure-cold.hash"
             cmp "$CASE_OUT/$sample.expected.hash" "$WORK/measure-cold.hash"
             delete_checkpoint_guest
             PERF_TAG="$sample"
             TEMPLATE=$(json_field "$CASE_OUT/$sample.publish.json" result)
             create_checkpoint_guest "$mib" published_ready
             perf_first_reads published_first_working_set
-            checkpoint_hash >"$WORK/measure-portable.hash"
+            perf_hash published >"$WORK/measure-portable.hash"
             cmp "$CASE_OUT/$sample.expected.hash" "$WORK/measure-portable.hash"
             delete_checkpoint_guest
         done
     done
 }
 perf_retention_workloads() {
-    local round="$1" pattern index retained current previous=-1 stable=0 reclaimed=0 started threshold
-    PERF_TAG="retention-64MiB-r$round"
+    local round="$1" pattern index retained current previous=-1 stable=0 reclaimed=0 started threshold offset
+    PERF_TAG="retention-64MiB-disjoint-v2-r$round"
+    perf_guest_budget 64
     TEMPLATE="$INITIAL_TEMPLATE"
     create_checkpoint_guest 64
     perf_guest initialize --path /home/user/checkpoint-payload --mib 64 >"$CASE_OUT/$PERF_TAG.initialization.json"
-    checkpoint_hash >"$CASE_OUT/$PERF_TAG.frozen.hash"
+    perf_hash frozen >"$CASE_OUT/$PERF_TAG.frozen.hash"
     perf_cache before_sandbox
     pause_checkpoint_guest sandbox 64
     perf_layout retained
     printf '%s\n' "$CHECKPOINT_ROOT/$SID/checkpoint" >"$PUBLISH_BARRIER_TARGET"
-    E2B_API_KEY="$AK" timeout -k 5s 1200 "$ORCH_BIN_DIR/node-ctl" export-sandbox "$SID" \
-        --keep-source --to-template --json --socket "$WORK/node-ctl.socket" \
+    E2B_API_KEY="$AK" python3 "$PERF_DIR/checkpoint_export.py" \
+        --socket "$WORK/node-ctl.socket" --sid "$SID" --timeout 1200 \
         >"$CASE_OUT/$PERF_TAG.publish.json" 2>"$CASE_OUT/$PERF_TAG.publish.log" &
     PUBLISH_PID=$!
     PIDS+=("$PUBLISH_PID")
@@ -123,11 +146,14 @@ assert refs and {(ref['diff_id'], ref['id']) for ref in refs} == want, (refs, wa
 PY
     fi
     perf_cache before_retained_workloads
+    offset=0
     for pattern in sequential random hot partial mixed; do
         perf_observe "retained.$pattern" run --path /home/user/checkpoint-payload \
-            --pattern "$pattern" --operations "$CHECKPOINT_PERF_OPERATIONS" --epoch 1
+            --pattern "$pattern" --operations "$CHECKPOINT_PERF_OPERATIONS" --epoch 1 \
+            --offset-bytes "$offset" --length-bytes 12582912
+        offset=$((offset + 12582912))
     done
-    checkpoint_hash >"$WORK/retained-active.hash"
+    perf_hash retained_active >"$WORK/retained-active.hash"
     if [ "$CHECKPOINT_PERF_MODE" = checkpoint ]; then retained=$(checkpoint_allocated "$SID"); fi
     : >"$PUBLISH_BARRIER_RELEASE"
     wait "$PUBLISH_PID" || fail "retained-view publisher failed"
@@ -155,18 +181,21 @@ json.dump({'elapsed_seconds': time.monotonic() - float(sys.argv[2]), 'retained_a
 PY
         [ "$reclaimed" = 1 ] && [ "$stable" -ge 3 ] || fail "released workload could not begin after bounded physical GC"
     fi
-    checkpoint_hash >"$WORK/released-active.hash"
+    perf_hash released_active >"$WORK/released-active.hash"
     cmp "$WORK/retained-active.hash" "$WORK/released-active.hash"
     perf_cache before_released_workloads
+    offset=0
     for pattern in sequential random hot partial mixed; do
         perf_observe "released.$pattern" run --path /home/user/checkpoint-payload \
-            --pattern "$pattern" --operations "$CHECKPOINT_PERF_OPERATIONS" --epoch 2
+            --pattern "$pattern" --operations "$CHECKPOINT_PERF_OPERATIONS" --epoch 2 \
+            --offset-bytes "$offset" --length-bytes 12582912
+        offset=$((offset + 12582912))
     done
-    checkpoint_hash >"$CASE_OUT/$PERF_TAG.active-final.hash"
+    perf_hash active_final >"$CASE_OUT/$PERF_TAG.active-final.hash"
     delete_checkpoint_guest
     TEMPLATE=$(json_field "$CASE_OUT/$PERF_TAG.publish.json" result)
     create_checkpoint_guest 64 retained_published_ready
-    checkpoint_hash >"$WORK/frozen-published.hash"
+    perf_hash frozen_published >"$WORK/frozen-published.hash"
     cmp "$CASE_OUT/$PERF_TAG.frozen.hash" "$WORK/frozen-published.hash"
     delete_checkpoint_guest
 }

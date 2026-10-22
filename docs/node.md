@@ -262,10 +262,11 @@ node-ctl manifest-key list   [--socket S]
 These clients use conductor's local **API plane** for `POST /sandboxes/{id}/export` and `POST /sandboxes/import`. `E2B_API_KEY` must authenticate the owner. See §8.1.
 
 ```
-node-ctl export-sandbox <sid> [--to-template] [--keep-source] [--json] [--socket S]
+node-ctl export-sandbox <sid> [--to-template] [--keep-source] [--json] [--timeout D] [--socket S]
 node-ctl import-sandbox <token> [--socket S]
 ```
 
+- `--timeout` bounds the complete export request (default `20m`, positive Go duration). Publication materializes disk contents and can exceed short administrative deadlines. A timeout cancels this client request; it is not proof that an already accepted server operation rolled back. Check the source/result before retrying.
 - `export-sandbox <sid>` prints one opaque `kmt1.` migration token. By default, success means the valid result is ready and source deletion is durably accepted; physical cleanup may finish after the response; `--keep-source` retains it paused with its original ResumeSource and local checkpoint — the source resumes from exactly where it would have resumed without the export (#336).
 - `export-sandbox <sid> --to-template` publishes paused E or S and prints persistent `sbx`/`snp` templateID for fan-out. Source retention is identical: `--keep-source` retains it; omission accepts its deletion with the same eventual cleanup semantics.
 - Resume remains allowed during local-artifact upload. If Resume wins first, KMT Export cancels upload and returns 409, whereas Template Export continues and returns templateID. Both abandon the source finalizer without updating/deleting source or local artifact.
@@ -1546,21 +1547,49 @@ after execution. It changes no prepared product and has no host-product fallback
 its result is not an E2E acceptance result. It records full prepared provenance,
 product SHA-256 values, image identity, actual argv and capture layouts. The
 baseline must omit Checkpoint startup/capture flags and metadata, while the
-candidate must use the new mode and distinct UUID v7 identities.
+candidate must use the new mode and distinct UUID v7 identities. Both modes publish
+through the same public UDS export API with a 1,200-second client budget; this
+avoids the older CLI's fixed 30-second timeout without changing its server.
 
-Both runs use the same Build request, 2 GiB filesystem and deterministic dense
-0/1 GiB payload recipe; zero still includes guest/filesystem writes. Startup
-metadata and encryption can change the resulting template identity, which is
-recorded separately. Build setup is excluded from measured Create, Pause,
-hot/cold resume, publication and Create-from-published-template latency. Every
-restore validates the data, including publication after the source is deleted.
-`checkpoint-platform.jsonl` reports BaseDir/RunDir regular-file allocation and
-DIFF allocation separately, plus sampled runtime-unit RSS/cgroup memory and
-live `/proc/PID/io`/cgroup `io.stat` counters. Shared caches/Store output and the
-node daemon are outside these scopes; memory is not a peak, and I/O counters
-reset with the runtime. These samples do not establish a write-amplification
-ratio or a general speedup. Report the revisions, filesystem, cache state and
-measurement scope, and repeat paired runs when variance matters.
+Both runs use the same Build request and filesystem capacity (the largest selected
+payload plus 2 GiB). The default samples are 0/1 GiB dense data and a 1 GiB sparse
+file with 64 MiB mapped payload; zero still includes guest/filesystem writes.
+`--sizes 10` explicitly selects a larger run after memory and free-space checks.
+The serial test configures the controller's startup factor to 0.8 so its 6 GiB
+Build fits developer hosts; production defaults and physical-memory detection
+are unchanged. Startup metadata and encryption can change template identity.
+
+Build preparation is timed separately from Create, Pause, hot/cold resume,
+publication and Create from a published template. Each restore verifies data,
+including after deleting the source. Full SHA-256 verification separately records
+cache preparation, hashing and host elapsed time, with a size-based bounded
+budget. After hashing, a separately timed guest
+sync/cache-drop fixes the file-cache condition before capture; normal Pause
+policy remains unchanged. Direct reads separately measure the first payload
+page and a 256-page working set after readiness. A second cold Pause has no
+explicit intervening payload write, although guest housekeeping can still write.
+These timings do not isolate internal Drain, index registration or DIFF Open.
+
+A 64 MiB workload compares a real publisher retaining a fixed version with the
+same guest after publication, version release and observed physical reclamation.
+It performs sequential/random 4 KiB writes, 2 MiB hot-set writes, sector-aligned
+512-byte partial-page writes and mixed reads/writes with `O_DIRECT|O_DSYNC`, QD1.
+The five patterns use disjoint 12 MiB regions, with each hot set inside its own
+region; recorded offsets distinguish these samples from older cumulative runs.
+Unsupported direct I/O fails explicitly. The default 1,024 operations per pattern
+retain raw syscall latency, read/write p50/p95/p99 and throughput. Throughput also
+includes deterministic buffer generation. Both states use the same address seed
+and different content to force writes; retention always runs first, so cache,
+ordering and background-GC effects must be considered. Use `--rounds 3` for
+repeated samples; `--skip-lifecycle` or `--skip-workloads` selects one group.
+
+`checkpoint-platform.jsonl` reports BaseDir/RunDir and DIFF allocation separately.
+Workload observations sample runtime-unit RSS/cgroup memory and `/proc/PID/io`/
+cgroup `io.stat` every 250 ms, retaining counter resets and before/after deltas.
+The sampled memory maximum is not a process peak. Shared caches, Store output
+and the node daemon are outside these scopes. Short workload I/O deltas are not
+a physical-media write-amplification ratio. Report source revisions, filesystem,
+cache conditions, raw samples and these limits with any comparison.
 
 ##### Managed checkpoint history and selective cleanup
 

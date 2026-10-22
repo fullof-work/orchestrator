@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"time"
 )
 
 // exportSandboxCmd implements `node-ctl export-sandbox <sid>` as a client of
@@ -25,6 +26,7 @@ func exportSandboxCmd(args []string, _ *slog.Logger) error {
 	toTemplate := fs.Bool("to-template", false, "publish + print a reusable snapshot template id instead of a migration token")
 	asJSON := fs.Bool("json", false, "print the complete export result and publication references")
 	keepSource := fs.Bool("keep-source", false, "retain the paused source after successful export finalization (default: delete it)")
+	requestTimeout := fs.Duration("timeout", 20*time.Minute, "maximum export request duration (positive Go duration, e.g. 20m)")
 	if err := fs.Parse(rest); err != nil {
 		return err
 	}
@@ -32,15 +34,20 @@ func exportSandboxCmd(args []string, _ *slog.Logger) error {
 		sid = fs.Arg(0)
 	}
 	if sid == "" {
-		return fmt.Errorf("usage: node-ctl export-sandbox <sid> [--to-template] [--keep-source] [--json] [--socket S]")
+		return fmt.Errorf("usage: node-ctl export-sandbox <sid> [--to-template] [--keep-source] [--json] [--timeout D] [--socket S]")
+	}
+	if *requestTimeout <= 0 {
+		return fmt.Errorf("export-sandbox: --timeout must be positive")
 	}
 	apiKey := os.Getenv("E2B_API_KEY")
 	if apiKey == "" {
 		return fmt.Errorf("export-sandbox: E2B_API_KEY is required")
 	}
 	body := map[string]any{"toTemplate": *toTemplate, "keepSource": *keepSource}
-	code, resp, err := udsDo(resolveSocket(*socket), http.MethodPost,
-		"/sandboxes/"+sid+"/export", map[string]string{"X-API-KEY": apiKey}, body)
+	// Publishing a local Checkpoint materializes its fixed disk view and may
+	// legitimately exceed the short administrative request timeout.
+	code, resp, err := udsDoWithTimeout(resolveSocket(*socket), http.MethodPost,
+		"/sandboxes/"+sid+"/export", map[string]string{"X-API-KEY": apiKey}, body, *requestTimeout)
 	if err != nil {
 		return err
 	}

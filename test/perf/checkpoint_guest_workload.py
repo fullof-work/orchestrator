@@ -56,17 +56,24 @@ def initialize(path, logical_mib, sparse):
             "mapped_payload_bytes": mapped * MIB, "elapsed_seconds": time.monotonic() - started}
 
 
-def workload(path, pattern, operations, epoch):
+def workload_region(size, offset, length):
+    length = size - offset if length is None else length
+    if offset < 0 or offset % PAGE or length < PAGE or length % PAGE or offset + length > size:
+        raise ValueError("workload region must be page-aligned, nonempty, and within the payload")
+    return offset, length
+
+
+def workload(path, pattern, operations, epoch, offset_bytes=0, length_bytes=None):
     size = os.stat(path).st_size
-    if size < PAGE:
-        raise ValueError("workload requires at least one full page")
+    region_offset, region_length = workload_region(size, offset_bytes, length_bytes)
     descriptor = direct_open(path)
     buffer = mmap.mmap(-1, PAGE)
     latencies, read_latencies, write_latencies = [], [], []
     written, read, write_ops, read_ops = 0, 0, 0, 0
     started = time.monotonic()
     try:
-        for index, (offset, length, is_read) in enumerate(positions(pattern, operations, size // PAGE)):
+        for index, (relative_offset, length, is_read) in enumerate(positions(pattern, operations, region_length // PAGE)):
+            offset = region_offset + relative_offset
             view = memoryview(buffer)[:length]
             if not is_read:
                 view[:] = hashlib.shake_256(f"477/{pattern}/{epoch}/{index}".encode()).digest(length)
@@ -96,12 +103,32 @@ def workload(path, pattern, operations, epoch):
             "read_operations": read_ops, "write_operations": write_ops, "read_bytes": read, "write_bytes": written,
             "elapsed_seconds": elapsed, "iops": operations / elapsed,
             "throughput_mib_s": (read + written) / MIB / elapsed,
-            "logical_working_set_bytes": min(size, 2 * MIB) if pattern == "hot" else size,
+            "region_offset_bytes": region_offset, "region_length_bytes": region_length,
+            "logical_working_set_bytes": min(region_length, 2 * MIB) if pattern == "hot" else region_length,
             "io": "O_DIRECT|O_DSYNC, QD1; partial is actual sector-aligned 512-byte pwritev",
             "timing": "latency is the I/O syscall; throughput includes deterministic buffer generation",
             "read_latency": latency_summary(read_latencies) if read_latencies else None,
             "write_latency": latency_summary(write_latencies) if write_latencies else None,
             **latency_summary(latencies)}
+
+
+def verify(path):
+    started = time.monotonic()
+    os.sync()
+    with open("/proc/sys/vm/drop_caches", "w") as stream:
+        stream.write("3\n")
+    hash_started = time.monotonic()
+    digest = hashlib.sha256()
+    count = 0
+    with open(path, "rb") as stream:
+        while block := stream.read(MIB):
+            digest.update(block)
+            count += len(block)
+    finished = time.monotonic()
+    return {"action": "verify", "sha256": digest.hexdigest(), "bytes_read": count,
+            "cache_preparation_seconds": hash_started - started,
+            "hash_seconds": finished - hash_started, "elapsed_seconds": finished - started,
+            "scope": "complete payload SHA256 after guest sync + drop_caches=3; buffered 1 MiB hash reads, outside lifecycle timing"}
 
 
 def first_reads(path, pages):
@@ -142,6 +169,10 @@ def main():
     run.add_argument("--pattern", choices=PATTERNS, required=True)
     run.add_argument("--operations", type=int, default=1024)
     run.add_argument("--epoch", type=int, required=True)
+    run.add_argument("--offset-bytes", type=int, default=0)
+    run.add_argument("--length-bytes", type=int)
+    verification = sub.add_parser("verify")
+    verification.add_argument("--path", required=True)
     probe = sub.add_parser("first-reads")
     probe.add_argument("--path", required=True)
     probe.add_argument("--pages", type=int, default=256)
@@ -154,7 +185,9 @@ def main():
     elif args.action == "run":
         if not 1 <= args.operations <= 16384:
             parser.error("operations must be between 1 and 16384")
-        result = workload(args.path, args.pattern, args.operations, args.epoch)
+        result = workload(args.path, args.pattern, args.operations, args.epoch, args.offset_bytes, args.length_bytes)
+    elif args.action == "verify":
+        result = verify(args.path)
     elif args.action == "first-reads":
         if not 1 <= args.pages <= 4096:
             parser.error("pages must be between 1 and 4096")

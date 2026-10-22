@@ -388,10 +388,11 @@ serve daemon **api 平面**的客户端(经本机控制 socket 调 `POST /sandbo
 与 `POST /sandboxes/import`),鉴权 `E2B_API_KEY` env(须属主)。语义见 §8.1。
 
 ```
-node-ctl export-sandbox <sid> [--to-template] [--keep-source] [--json] [--socket S]
+node-ctl export-sandbox <sid> [--to-template] [--keep-source] [--json] [--timeout D] [--socket S]
 node-ctl import-sandbox <token> [--socket S]
 ```
 
+- `--timeout` 限定完整导出请求时间，默认 `20m`，必须是正的 Go duration。发布需要物化磁盘内容，可能超过短管理请求的预算。超时会取消本次客户端请求，但不证明已接纳的服务端操作已经回滚；重试前应核对来源及发布结果。
 - `export-sandbox <sid>`:打印单行 `kmt1.` opaque 迁移 token。默认成功表示结果有效且源删除
   已被持久接纳，物理清理可在响应之后完成；`--keep-source` 保留 paused source,且 ResumeSource 与
   local checkpoint 均保持原样——源沙箱仍从导出前的恢复位置恢复(#336).
@@ -1999,17 +2000,35 @@ sudo python3 test/perf/run_checkpoint_platform.py --workspace /path/to/candidate
 `case_environment`，结束后再次校验输入。它不改写 prepared 产品，也不回退到宿主产品；
 其结果不代表 E2E 验收通过。报告保留完整 prepared 来源、产品 SHA-256、Image 身份、
 实际 argv 和捕获布局。基线必须没有 Checkpoint 启动/捕获参数和元数据，候选必须启用
-新模式并使用不同的 UUID v7。
+新模式并使用不同的 UUID v7。两边均通过相同公开 UDS export API 发布，客户端预算为
+1,200 秒；这样可避开旧 CLI 固定 30 秒的限制，不改变其服务端。
 
-两边使用相同 Build 请求、2 GiB 文件系统和确定性的 0/1 GiB 密集数据生成规则，0 GiB
-仍包含正常 guest/文件系统写入。启动元数据和加密可能使生成的模板身份不同，报告分别记录它们。
-Build 准备不计入 Create、Pause、热/冷恢复、发布及从发布模板 Create 的延迟。
-每次恢复都校验数据，包括删除原来源后从发布产物创建。`checkpoint-platform.jsonl`
-分别记录 BaseDir/RunDir 普通文件及 DIFF 的实际分配空间、runtime unit 的 RSS/cgroup
-内存采样，以及存活进程 `/proc/PID/io` 和 cgroup `io.stat` 计数。
-共享缓存、Store 输出和 node daemon 不在这些口径内；内存不是峰值，I/O 计数随 runtime
-重建而重置。这些采样不能直接证明写放大比率或普遍加速幅度。报告应说明版本、文件系统、
-缓存状态和测量口径；需要判断波动时重复成对测试。
+两边使用相同 Build 请求和文件系统容量（本轮最大数据量再加 2 GiB）。默认覆盖 0/1 GiB
+密集数据，以及逻辑 1 GiB、实际写入 64 MiB 的稀疏文件；0 GiB 仍包含正常 guest/文件系统写入。
+`--sizes 10` 显式选择更大样本，执行前检查可用内存和磁盘空间。串行测试把 controller 的
+startup factor 显式设为 0.8，以容纳开发机上的 6 GiB Build；不改变生产默认值或物理内存探测。
+启动元数据和加密可能导致模板身份不同，报告分别记录。
+
+Build 准备独立计时，不混入 Create、Pause、热/冷恢复、发布及发布模板 Create 的耗时。
+每次恢复校验数据，包括删除来源后恢复。完整 SHA-256 校验分别记录缓存准备、哈希和
+宿主总耗时，预算按数据量设置并有上限。哈希校验后独立计时 sync/cache-drop，使捕获前的
+文件缓存条件一致；正常 Pause 策略不变。ready 之后另测数据文件首次页和 256 页工作集的
+直接读取。再次冷 Pause 前不显式写入业务文件，但 guest 后台工作仍可能写盘。这些端到端
+计时没有单独隔离内部 Drain、版本登记或 DIFF Open。
+
+64 MiB 短负载比较真实 publisher 保留固定版本与发布完成、版本释放并观察到物理回收后的
+同一 guest：顺序/随机 4 KiB 写、2 MiB 热集写、512 字节部分页写和混合读写，使用
+`O_DIRECT|O_DSYNC`、QD1。五种负载各用互不重叠的 12 MiB 区域，热集位于各自区域内；
+结果记录偏移，不能与旧的累积区域样本混算。不支持直接 I/O 时明确失败。默认每种 1,024 次操作，保留原始
+系统调用延迟、读/写 p50/p95/p99 和吞吐，吞吐包含确定性缓冲生成成本。两阶段使用相同地址
+种子、不同内容以确保真实改写；保留阶段总是先执行，需要考虑缓存、顺序及后台 GC 影响。
+`--rounds 3` 重复采样，`--skip-lifecycle` 或 `--skip-workloads` 可单独运行一组。
+
+`checkpoint-platform.jsonl` 分别记录 BaseDir/RunDir 与 DIFF 分配空间。负载期间每 250 ms
+采样 runtime unit 的 RSS/cgroup 内存及 `/proc/PID/io`、cgroup `io.stat`，保留计数重置和
+前后增量。采样最大值不是进程峰值；共享缓存、Store 输出和 node daemon 不在此口径内。
+短负载 I/O 增量不等于物理介质写放大比率。比较结果应同时说明源码版本、文件系统、缓存条件、
+原始样本及上述限制。
 
 ##### 托管 checkpoint 历史合并与选择性清理
 

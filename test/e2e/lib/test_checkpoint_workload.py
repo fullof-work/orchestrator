@@ -2,6 +2,7 @@
 import errno
 import hashlib
 import importlib.util
+import io
 import os
 from pathlib import Path
 import tempfile
@@ -20,6 +21,24 @@ host = load("checkpoint_observe")
 
 
 class CheckpointWorkload(unittest.TestCase):
+    def test_disjoint_regions_bound_every_pattern_and_repeat_across_states(self):
+        length = 12 * 1024**2
+        previous_end = 0
+        for index, pattern in enumerate(guest.PATTERNS):
+            start, capacity = guest.workload_region(64 * 1024**2, index * length, length)
+            self.assertGreaterEqual(start, previous_end)
+            previous_end = start + capacity
+            retained = list(guest.positions(pattern, 1024, capacity // guest.PAGE))
+            self.assertEqual(retained, list(guest.positions(pattern, 1024, capacity // guest.PAGE)))
+            for relative, transferred, _ in retained:
+                self.assertGreaterEqual(start + relative, start)
+                self.assertLessEqual(start + relative + transferred, start + capacity)
+                if pattern == "hot":
+                    self.assertLessEqual(relative + transferred, 2 * 1024**2)
+        for start, capacity in ((-4096, 4096), (1, 4096), (0, 0), (0, 4097), (8192, 4096)):
+            with self.subTest(start=start, capacity=capacity), self.assertRaises(ValueError):
+                guest.workload_region(8192, start, capacity)
+
     def test_positions_repeat_and_partial_io_has_real_sector_alignment(self):
         for pattern in guest.PATTERNS:
             first = list(guest.positions(pattern, 64, 16384))
@@ -48,6 +67,45 @@ class CheckpointWorkload(unittest.TestCase):
             self.assertGreater(result["throughput_mib_s"], 0)
             self.assertLessEqual(result["p50_us"], result["p95_us"])
             self.assertLessEqual(result["p95_us"], result["p99_us"])
+
+    def test_region_writes_preserve_other_patterns_bytes_and_report_actual_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "payload"
+            initial = hashlib.shake_256(b"regions").digest(4096 * 8)
+            path.write_bytes(initial)
+            with patch.object(guest, "direct_open", side_effect=lambda name: os.open(name, os.O_RDWR)):
+                result = guest.workload(path, "partial", 32, 1, 4096 * 2, 4096 * 3)
+            final = path.read_bytes()
+            self.assertEqual(final[:4096 * 2], initial[:4096 * 2])
+            self.assertEqual(final[4096 * 5:], initial[4096 * 5:])
+            self.assertNotEqual(final[4096 * 2:4096 * 5], initial[4096 * 2:4096 * 5])
+            self.assertEqual(result["region_offset_bytes"], 4096 * 2)
+            self.assertEqual(result["region_length_bytes"], 4096 * 3)
+            self.assertEqual(result["logical_working_set_bytes"], 4096 * 3)
+
+    def test_verification_hashes_all_bytes_and_separates_cache_preparation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "payload"
+            payload = b"full payload" * 8193
+            path.write_bytes(payload)
+            real_open = open
+            writes = []
+            class DropCaches(io.StringIO):
+                def close(self):
+                    writes.append(self.getvalue())
+                    super().close()
+            def opened(name, *args):
+                return DropCaches() if name == "/proc/sys/vm/drop_caches" else real_open(name, *args)
+            with patch("builtins.open", side_effect=opened), patch.object(guest.os, "sync") as sync, \
+                 patch.object(guest, "MIB", 4096), patch.object(guest.time, "monotonic", side_effect=[1, 3, 10]):
+                result = guest.verify(path)
+            sync.assert_called_once()
+            self.assertEqual(writes, ["3\n"])
+            self.assertEqual(result["sha256"], hashlib.sha256(payload).hexdigest())
+            self.assertEqual(result["bytes_read"], len(payload))
+            self.assertEqual(result["cache_preparation_seconds"], 2)
+            self.assertEqual(result["hash_seconds"], 7)
+            self.assertEqual(result["elapsed_seconds"], 9)
 
     def test_rejected_direct_io_is_reported_without_buffered_retry(self):
         with tempfile.TemporaryDirectory() as directory:
