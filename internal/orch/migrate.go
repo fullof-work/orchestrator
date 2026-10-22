@@ -111,12 +111,14 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 
 		// Retire paused runner/artifact ownership before publication owns the
 		// source. Resume can then proceed without waiting for this upload.
-		if err := o.cleanupPausedOwnership(guardCtx, sb); err != nil {
+		beforeRunID, beforePort, beforeRunDir := sb.RunID, sb.VswitchPort, sb.RunDir
+		cleanupErr := o.cleanupPausedOwnership(guardCtx, sb)
+		o.recordPausedCleanupProgress(sb, beforeRunID, beforePort, beforeRunDir)
+		if cleanupErr != nil {
 			o.startPausedCleanupRetry(sid)
 			unlock()
-			return types.ExportResult{}, fmt.Errorf("export-sandbox: paused source cleanup: %w", err)
+			return types.ExportResult{}, fmt.Errorf("export-sandbox: paused source cleanup: %w", cleanupErr)
 		}
-		o.cache(sb)
 		source = cloneSandbox(sb)
 		opCtx, releaseSource, err = retainSourceOperation(guardCtx)
 		if err != nil {

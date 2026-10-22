@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
@@ -1076,6 +1077,22 @@ func TestExportMoveDeleteAcceptanceFailurePreservesSource(t *testing.T) {
 	installStoreTrigger(t, dbPath, `CREATE TRIGGER fail_begin_delete BEFORE UPDATE OF state ON sandboxes WHEN NEW.state='deleting' BEGIN SELECT RAISE(ABORT, 'forced delete acceptance failure'); END`)
 	events, cancel := o.Subscribe()
 	defer cancel()
+	lifecycle, stop := context.WithCancel(context.Background())
+	o.SetLifecycleContext(lifecycle)
+	t.Cleanup(func() {
+		// Even a failed move requests background checkpoint release when its
+		// publication finishes. Stop and drain that owner before SQLite and
+		// its temporary directory are closed by the fixture.
+		stop()
+		drainCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := o.DrainLaunches(drainCtx); err != nil {
+			t.Errorf("drain failed-move fixture launches: %v", err)
+		}
+		if err := o.DrainPauses(drainCtx); err != nil {
+			t.Errorf("drain failed-move fixture accepted work: %v", err)
+		}
+	})
 
 	tok, err := o.exportSandboxTokenForTest(ctx, apiKey, sid, false, false)
 	if err == nil || !strings.Contains(err.Error(), "delete source") || tok != "" {

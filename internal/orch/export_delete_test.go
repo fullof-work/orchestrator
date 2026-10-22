@@ -144,11 +144,7 @@ func TestExportMoveAcceptsCommonDeletionForEveryArtifactAndResult(t *testing.T) 
 							if err != nil || !reflect.DeepEqual(stored, prepared) || !reflect.DeepEqual(o.lookup(sb.ID), prepared) {
 								t.Fatalf("keep-source changed row/cache: %+v, %v", stored, err)
 							}
-							select {
-							case event := <-events:
-								t.Fatalf("keep-source changed route: %+v", event)
-							default:
-							}
+							assertExportPausedCleanupPublished(t, o, prepared, events, recorder)
 							if _, err := os.Stat(filepath.Join(sb.BaseDir, "checkpoint", sb.ID+".stale")); err != nil {
 								t.Fatal(err)
 							}
@@ -184,6 +180,9 @@ func TestExportMoveAcceptsCommonDeletionForEveryArtifactAndResult(t *testing.T) 
 						}
 						if o.lookup(sb.ID) != nil {
 							t.Fatal("accepted move remained cached")
+						}
+						if !keepFirst {
+							assertExportPausedCleanupPublished(t, o, preparedExportSource(sb), events, recorder)
 						}
 						select {
 						case event := <-events:
@@ -286,6 +285,7 @@ func TestExportMoveCleanupFailureKeepsDeletingAndRetries(t *testing.T) {
 			if deleting.ResumeSource != sb.ResumeSource || o.lookup(sb.ID) != nil {
 				t.Fatal("cleanup failure restored or rewrote the source")
 			}
+			assertExportPausedCleanupPublished(t, o, preparedExportSource(sb), nil, recorder)
 			if kinds := recorder.sandboxKinds(); len(kinds) != 0 {
 				t.Fatalf("failed cleanup emitted observer event: %v", kinds)
 			}
@@ -430,6 +430,7 @@ func TestExportMoveCancellationAfterAcceptanceKeepsResult(t *testing.T) {
 	unlock := sync.OnceFunc(o.deleteMu.Unlock)
 	defer unlock()
 	done := startExport(o, ctx, fixture.apiKey, sb.ID, false, false)
+	assertExportPausedCleanupPublished(t, o, preparedExportSource(sb), events, nil)
 	select {
 	case event := <-events:
 		if event.Kind != routesync.TypeDelete || event.SID != sb.ID {
@@ -579,6 +580,7 @@ func TestExportMoveDeleteAcceptanceFailurePreservesPreparedSource(t *testing.T) 
 					if _, stops := fixture.lc.stopSnapshot(); stops != 1 || fixture.vs.calls != 1 {
 						t.Fatal("export admission did not finish paused runner/network cleanup exactly once")
 					}
+					assertExportPausedCleanupPublished(t, o, prepared, events, recorder)
 					if kinds := recorder.sandboxKinds(); len(kinds) != 0 {
 						t.Fatalf("failed acceptance observed deletion: %v", kinds)
 					}
