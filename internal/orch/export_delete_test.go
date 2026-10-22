@@ -695,7 +695,7 @@ func TestExportMoveSameIDConflictUntilCleanupCompletes(t *testing.T) {
 				}
 			}
 			if admission != "import" {
-				waitForSandbox(t, o, ctx, sb.ID, func(current *types.Sandbox) bool { return current.State == types.StateRunning }, "same-ID successor running")
+				fixture.waitForRunning(t, "same-ID successor running")
 			}
 		})
 	}

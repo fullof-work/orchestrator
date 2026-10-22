@@ -90,6 +90,22 @@ func newExportResumeFixture(t *testing.T) exportResumeFixture {
 	cfg.Paths.BaseRoot = filepath.Join(dir, "lib")
 	lc := &countingLauncher{}
 	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+	ctx, stop := context.WithCancel(ctx)
+	o.SetLifecycleContext(ctx)
+	t.Cleanup(func() {
+		// A durable running row precedes launch completion and checkpoint
+		// release. Drain both owners before the shared fixture closes SQLite
+		// or removes the directories they may still use.
+		stop()
+		drainCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := o.DrainLaunches(drainCtx); err != nil {
+			t.Errorf("drain export fixture launches: %v", err)
+		}
+		if err := o.DrainPauses(drainCtx); err != nil {
+			t.Errorf("drain export fixture accepted work: %v", err)
+		}
+	})
 
 	manifestKey := strings.Repeat("6", 64)
 	apiSecret, apiKey := defaultTestCredentials(t, manifestKey)
@@ -151,15 +167,30 @@ func waitExportResult(t *testing.T, done <-chan asyncExportResult) asyncExportRe
 
 func assertLocalResumeWon(t *testing.T, fixture exportResumeFixture) {
 	t.Helper()
-	stored := waitForSandbox(t, fixture.o, fixture.ctx, fixture.sb.ID, func(current *types.Sandbox) bool {
-		return current.State == types.StateRunning
-	}, "running after export-time resume")
+	stored := fixture.waitForRunning(t, "running after export-time resume")
 	if stored.ResumeSource != (types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: fixture.localRef}) {
 		t.Fatalf("resumed source = %+v, want local snapshot %q", stored.ResumeSource, fixture.localRef)
 	}
 	if _, err := os.Stat(fixture.localRef); err != nil {
 		t.Fatalf("resume-winning export removed local snapshot: %v", err)
 	}
+}
+
+func (fixture exportResumeFixture) waitForRunning(t *testing.T, description string) *types.Sandbox {
+	t.Helper()
+	// Wait for the actual launch owner, rather than continuously competing
+	// with its commits through SQLite polling. A failed launch is reported at
+	// its completion boundary instead of appearing as a stale starting row.
+	waitCtx, cancel := context.WithTimeout(fixture.ctx, 3*time.Second)
+	defer cancel()
+	if _, err := fixture.o.launches.Wait(waitCtx, fixture.sb.ID); err != nil {
+		t.Fatalf("launch did not complete for %s: %v (runner error: %v)", description, err, fixture.launcher.taskError())
+	}
+	stored, err := fixture.o.st.Get(fixture.ctx, fixture.sb.ID)
+	if err != nil || stored == nil || stored.State != types.StateRunning {
+		t.Fatalf("sandbox did not become %s: %+v, %v", description, stored, err)
+	}
+	return stored
 }
 
 func TestExportResumeDuringPublish(t *testing.T) {

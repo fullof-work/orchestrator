@@ -51,6 +51,7 @@ class CheckpointPerformanceDriver(unittest.TestCase):
         # Host boundaries are replaced; argument/environment selection and the
         # real driver's before/after verification and result writing execute.
         with patch.object(driver, "load", side_effect=[self.inputs, self.contract, self.probe]), \
+             patch.object(driver, "resource_preflight", return_value={"fixture": True}), \
              patch.object(driver.subprocess, "run", self.run), \
              patch.object(driver.sys, "argv", arguments), \
              patch.dict(os.environ, {"BASH_ENV": "/ambient", "FIXTURE_HELPER": "/host/helper",
@@ -94,6 +95,24 @@ class CheckpointPerformanceDriver(unittest.TestCase):
             self.invoke()
         self.assertFalse(self.output.exists())
         self.run.assert_not_called()
+
+    def test_explicit_ten_gib_is_supported_but_thirty_and_duplicates_are_rejected(self):
+        import argparse
+        self.assertEqual(driver.sizes("0,1,10"), "0,1,10")
+        for value in ("30", "0,0", "1,30", "01", ""):
+            with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
+                driver.sizes(value)
+
+    def test_resource_preflight_accounts_for_coexisting_copies(self):
+        with patch.object(driver.Path, "read_text", return_value="MemAvailable: 10485760 kB\n"), \
+             patch.object(driver.shutil, "disk_usage", return_value=types.SimpleNamespace(free=20 * 1024**3)):
+            result = driver.resource_preflight(1, self.root, self.root)
+            self.assertEqual(result["disk_checks"][0]["required_bytes"], 14 * 1024**3)
+            with self.assertRaisesRegex(ValueError, "insufficient case_data"):
+                driver.resource_preflight(10, self.root, self.root)
+        with patch.object(driver.Path, "read_text", return_value="MemAvailable: 1048576 kB\n"):
+            with self.assertRaisesRegex(ValueError, "MemAvailable"):
+                driver.resource_preflight(0, self.root, self.root)
 
 
 if __name__ == "__main__":

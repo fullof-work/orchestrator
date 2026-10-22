@@ -86,7 +86,7 @@ class ExecuteOwnership(unittest.TestCase):
                                   text=True, capture_output=True, timeout=20)
 
     def test_async_starting_waits_for_the_real_run_observation(self):
-        result = self.wait_case(["run", "--sandbox-id", "fixture-sandbox", "--from", "/fixture/ready.sandbox"], 0.15)
+        result = self.wait_case(["run", "--enable-checkpoint", "--sandbox-id", "fixture-sandbox", "--from", "/fixture/ready.sandbox"], 0.15)
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_missing_run_observation_still_fails(self):
@@ -95,8 +95,8 @@ class ExecuteOwnership(unittest.TestCase):
         self.assertIn("timed out waiting for run call 0", result.stderr)
 
     def test_observed_wrong_source_or_identity_is_not_retried_or_accepted(self):
-        for call in (["run", "--sandbox-id", "fixture-sandbox", "--restore", "/fixture/ready.snapshot"],
-                     ["run", "--sandbox-id", "another-sandbox", "--from", "/fixture/ready.sandbox"]):
+        for call in (["run", "--enable-checkpoint", "--sandbox-id", "fixture-sandbox", "--restore", "/fixture/ready.snapshot"],
+                     ["run", "--enable-checkpoint", "--sandbox-id", "another-sandbox", "--from", "/fixture/ready.sandbox"]):
             result = self.wait_case(call)
             self.assertNotEqual(result.returncode, 0)
             self.assertNotIn("timed out", result.stderr)
