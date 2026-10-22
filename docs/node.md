@@ -1570,18 +1570,24 @@ page and a 256-page working set after readiness. A second cold Pause has no
 explicit intervening payload write, although guest housekeeping can still write.
 These timings do not isolate internal Drain, index registration or DIFF Open.
 
-A 64 MiB workload compares a real publisher retaining a fixed version with the
-same guest after publication, version release and observed physical reclamation.
-It performs sequential/random 4 KiB writes, 2 MiB hot-set writes, sector-aligned
-512-byte partial-page writes and mixed reads/writes with `O_DIRECT|O_DSYNC`, QD1.
-The five patterns use disjoint 12 MiB regions, with each hot set inside its own
-region; recorded offsets distinguish these samples from older cumulative runs.
+A fully initialized 128 MiB workload compares a real publisher retaining a fixed
+version with the same guest after publication, version release and observed
+physical reclamation. It performs sequential/random 4 KiB writes, 2 MiB hot-set
+writes, sector-aligned 512-byte partial-page writes and mixed reads/writes with
+`O_DIRECT|O_DSYNC`, QD1. Retained and released stages use different 64 MiB halves;
+the retained half alternates between rounds. Each half contains five disjoint
+12 MiB regions. Thus the released stage first overwrites previously untouched
+payload pages, rather than repeating writes to pages already privatized while
+retained. Recorded offsets distinguish this `fresh-v3` protocol from earlier
+same-address samples, which must not be pooled with it.
+
 Unsupported direct I/O fails explicitly. The default 1,024 operations per pattern
 retain raw syscall latency, read/write p50/p95/p99 and throughput. Throughput also
-includes deterministic buffer generation. Both states use the same address seed
-and different content to force writes; retention always runs first, so cache,
-ordering and background-GC effects must be considered. Use `--rounds 3` for
-repeated samples; `--skip-lifecycle` or `--skip-workloads` selects one group.
+includes deterministic buffer generation. Both states use the same relative
+address seed and different content to force writes. Retention always runs first;
+cache, index, allocator, ordering and background-GC effects remain, so this is not
+an isolated causal measurement of Delete. Use `--rounds 3` for repeated samples;
+`--skip-lifecycle` or `--skip-workloads` selects one group.
 
 `checkpoint-platform.jsonl` reports BaseDir/RunDir and DIFF allocation separately.
 Workload observations sample runtime-unit RSS/cgroup memory and `/proc/PID/io`/

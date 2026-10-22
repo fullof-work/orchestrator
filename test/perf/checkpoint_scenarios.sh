@@ -112,15 +112,17 @@ perf_lifecycle() {
     done
 }
 perf_retention_workloads() {
-    local round="$1" pattern index retained current previous=-1 stable=0 reclaimed=0 started threshold offset
-    PERF_TAG="retention-64MiB-disjoint-v2-r$round"
-    perf_guest_budget 64
+    local round="$1" pattern index retained current previous=-1 stable=0 reclaimed=0 started threshold offset retained_half released_half
+    PERF_TAG="retention-128MiB-fresh-v3-r$round"
+    retained_half=$(((round + 1) % 2 * 67108864))
+    released_half=$((67108864 - retained_half))
+    perf_guest_budget 128
     TEMPLATE="$INITIAL_TEMPLATE"
-    create_checkpoint_guest 64
-    perf_guest initialize --path /home/user/checkpoint-payload --mib 64 >"$CASE_OUT/$PERF_TAG.initialization.json"
+    create_checkpoint_guest 128
+    perf_guest initialize --path /home/user/checkpoint-payload --mib 128 >"$CASE_OUT/$PERF_TAG.initialization.json"
     perf_hash frozen >"$CASE_OUT/$PERF_TAG.frozen.hash"
     perf_cache before_sandbox
-    pause_checkpoint_guest sandbox 64
+    pause_checkpoint_guest sandbox 128
     perf_layout retained
     printf '%s\n' "$CHECKPOINT_ROOT/$SID/checkpoint" >"$PUBLISH_BARRIER_TARGET"
     E2B_API_KEY="$AK" python3 "$PERF_DIR/checkpoint_export.py" \
@@ -134,7 +136,7 @@ perf_retention_workloads() {
         sleep 0.1
     done
     [ -e "$PUBLISH_BARRIER_REACHED" ] || fail "publisher did not reach source barrier"
-    resume_checkpoint_guest 64 retained_ready
+    resume_checkpoint_guest 128 retained_ready
     perf_first_reads retained_first_working_set
     if [ "$CHECKPOINT_PERF_MODE" = checkpoint ]; then
         checkpoint_list "$SID" "$CASE_OUT/$PERF_TAG.retained-list.json"
@@ -146,7 +148,7 @@ assert refs and {(ref['diff_id'], ref['id']) for ref in refs} == want, (refs, wa
 PY
     fi
     perf_cache before_retained_workloads
-    offset=0
+    offset="$retained_half"
     for pattern in sequential random hot partial mixed; do
         perf_observe "retained.$pattern" run --path /home/user/checkpoint-payload \
             --pattern "$pattern" --operations "$CHECKPOINT_PERF_OPERATIONS" --epoch 1 \
@@ -184,7 +186,7 @@ PY
     perf_hash released_active >"$WORK/released-active.hash"
     cmp "$WORK/retained-active.hash" "$WORK/released-active.hash"
     perf_cache before_released_workloads
-    offset=0
+    offset="$released_half"
     for pattern in sequential random hot partial mixed; do
         perf_observe "released.$pattern" run --path /home/user/checkpoint-payload \
             --pattern "$pattern" --operations "$CHECKPOINT_PERF_OPERATIONS" --epoch 2 \
@@ -194,7 +196,7 @@ PY
     perf_hash active_final >"$CASE_OUT/$PERF_TAG.active-final.hash"
     delete_checkpoint_guest
     TEMPLATE=$(json_field "$CASE_OUT/$PERF_TAG.publish.json" result)
-    create_checkpoint_guest 64 retained_published_ready
+    create_checkpoint_guest 128 retained_published_ready
     perf_hash frozen_published >"$WORK/frozen-published.hash"
     cmp "$CASE_OUT/$PERF_TAG.frozen.hash" "$WORK/frozen-published.hash"
     delete_checkpoint_guest

@@ -24,7 +24,7 @@ PY
 
 # Record the actual immutable prepared products, complete provenance and input
 # image before timing. There is no product replacement or host-binary fallback.
-python3 - "$BIN" "$CASE_OUT" "$CHECKPOINT_PERF_MODE" "$ORCHESTRATOR_EXECUTE_IMAGE" "$0" "$OVERLAY_GIB" "$BUILDER_CPU" <<'PY'
+python3 - "$BIN" "$CASE_OUT" "$CHECKPOINT_PERF_MODE" "$ORCHESTRATOR_EXECUTE_IMAGE" "$0" "$OVERLAY_GIB" "$BUILDER_CPU" "$CHECKPOINT_PERF_ROUNDS" <<'PY'
 import hashlib, json, pathlib, platform, shutil, sys
 products, output = map(pathlib.Path, sys.argv[1:3])
 provenance = products.parent / 'provenance.json'
@@ -47,8 +47,10 @@ report = {'mode': sys.argv[3], 'image_config_id': sys.argv[4],
           'resource_startup_factor': 0.8,
           'builder_cpu_count': int(sys.argv[7]), 'builder_memory_mib': 6144,
           'target_cpu_count': 2, 'target_memory_mib': 2560,
-          'retention_protocol': 'disjoint-v2: same guest, retained then released; five disjoint 12 MiB regions in sequential/random/hot/partial/mixed order; identical region/address seed/count across states, different content epochs; report order/cache/background-GC effects rather than infer a write-amplification ratio',
-          'retention_regions': {name: {'offset_bytes': index * 12 * 1024**2, 'length_bytes': 12 * 1024**2}
+          'retention_protocol': 'fresh-v3: fully initialized 128 MiB before capture; retained writes one 64 MiB half and released writes the other previously untouched half; each half contains five disjoint 12 MiB regions; retained half alternates with round; same relative seeds/counts and different epochs; order, index/cache, allocator, GC effects remain',
+          'payload_mib': 128,
+          'region_base_by_round': [{'round': r, 'retained_bytes': ((r+1)%2)*67108864, 'released_bytes': (r%2)*67108864} for r in range(1, int(sys.argv[8]) + 1)],
+          'relative_regions_within_each_half': {name: {'offset_bytes': index * 12 * 1024**2, 'length_bytes': 12 * 1024**2}
                                 for index, name in enumerate(('sequential', 'random', 'hot', 'partial', 'mixed'))},
           'verification_timeout_policy': 'min(1200, 180 + ceil(payload_MiB * 420 / 1024)) seconds; record full hash and cache preparation separately; no timeout is a successful verification',
           'export_request': {'client': 'checkpoint_export.py: Python stdlib HTTPConnection over UDS, same client for both prepared versions',

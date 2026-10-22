@@ -54,7 +54,7 @@ def main():
     parser.add_argument("--layouts", choices=("dense", "sparse", "dense,sparse"), default="dense,sparse")
     parser.add_argument("--rounds", type=int, default=1, help="1..5 repetitions; combine with --skip-lifecycle for short write-load repeats")
     parser.add_argument("--operations", type=int, default=1024, help="128..16384 I/O operations per pattern/state")
-    parser.add_argument("--skip-lifecycle", action="store_true", help="run only the 64 MiB retained/released workloads")
+    parser.add_argument("--skip-lifecycle", action="store_true", help="run only the 128 MiB retained/released fresh-region workloads")
     parser.add_argument("--skip-workloads", action="store_true", help="run lifecycle samples without the short write-load comparison")
     parser.add_argument("--out", type=Path, required=True, help="new output directory outside prepared inputs")
     args = parser.parse_args()
