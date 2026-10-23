@@ -1689,7 +1689,11 @@ failed resume rolled back to paused, and an unresumed `keepSource` retain them.
 
 The check uses sandboxer's complete List result and deletes those exact
 `{DiffID, ID}` references. Partial or uncertain Delete retries keep the same set;
-a different runtime cannot inherit that selection. Errors are logged and retried
+a different runtime cannot inherit that selection. If List explicitly reports
+`checkpoint_unsupported`, the current check ends successfully without Delete or
+retry. This does not cache capability by SID: an independent later or concurrent
+trigger still starts another check. Other List errors, incomplete lists and all
+Delete errors are logged and retried
 with bounded calls and backoff, without rolling back a successful launch or
 publication. This does not run `checkpoint-cleanup`, remove the DIFF directory or
 delete memory dependencies. Delete makes old versions reclaimable; physical space

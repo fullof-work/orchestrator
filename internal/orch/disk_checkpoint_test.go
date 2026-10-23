@@ -24,6 +24,8 @@ type diskCheckpointPeer struct {
 	lists                         int
 	deletes                       [][]ctl.DiffCheckpointRef
 	truncateList, loseDeleteReply bool
+	listError, deleteError        *ctl.Response
+	beforeListReply               func()
 }
 
 func newDiskCheckpointFixture(t *testing.T, sid string) sandboxFinalizerFixture {
@@ -72,6 +74,14 @@ func serveDiskCheckpointPeer(t *testing.T, sb *types.Sandbox) *diskCheckpointPee
 				switch req.Type {
 				case ctl.TypeCheckpointListRequest:
 					p.lists++
+					listError := p.listError
+					if p.beforeListReply != nil {
+						p.beforeListReply()
+					}
+					if listError != nil {
+						_ = ctl.WriteMessage(c, *listError)
+						return
+					}
 					if p.truncateList {
 						_ = ctl.WriteMessage(c, ctl.Response{Type: ctl.TypeCheckpointListChunk, Checkpoints: p.refs})
 						return
@@ -82,6 +92,10 @@ func serveDiskCheckpointPeer(t *testing.T, sb *types.Sandbox) *diskCheckpointPee
 						t.Error("online release supplied an offline owner")
 					}
 					p.deletes = append(p.deletes, append([]ctl.DiffCheckpointRef(nil), req.CheckpointRefs...))
+					if p.deleteError != nil {
+						_ = ctl.WriteMessage(c, *p.deleteError)
+						return
+					}
 					var remaining []ctl.DiffCheckpointRef
 					for _, ref := range p.refs {
 						removed := false
@@ -106,6 +120,159 @@ func serveDiskCheckpointPeer(t *testing.T, sb *types.Sandbox) *diskCheckpointPee
 	}()
 	t.Cleanup(func() { ln.Close(); <-done })
 	return p
+}
+
+func diskCheckpointReleaseLifecycle(t *testing.T, o *Orchestrator) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	o.SetLifecycleContext(ctx)
+	t.Cleanup(func() {
+		cancel()
+		drain, stop := context.WithTimeout(context.Background(), 10*time.Second)
+		defer stop()
+		if err := o.acceptedOps.Drain(drain); err != nil {
+			t.Error(err)
+		}
+	})
+}
+
+func waitDiskCheckpointRelease(t *testing.T, o *Orchestrator, sid string) {
+	t.Helper()
+	// Wait for the accepted worker to finish without closing admission or
+	// cancelling its lifecycle; a later independent trigger must still work.
+	o.acceptedOps.mu.Lock()
+	idle := o.acceptedOps.idle
+	o.acceptedOps.mu.Unlock()
+	select {
+	case <-idle:
+	case <-time.After(3 * time.Second):
+		t.Fatal("disk checkpoint release worker did not finish")
+	}
+	o.diskReleaseMu.Lock()
+	active := o.diskReleaseActive[sid] != nil
+	o.diskReleaseMu.Unlock()
+	if active {
+		t.Fatal("finished worker retained its SID")
+	}
+}
+
+func TestDiskCheckpointReleaseUnsupportedStopsWorker(t *testing.T) {
+	f := newDiskCheckpointFixture(t, "disk-unsupported")
+	p := serveDiskCheckpointPeer(t, f.sb)
+	diskCheckpointReleaseLifecycle(t, f.o)
+	p.mu.Lock()
+	p.listError = &ctl.Response{Type: ctl.TypeError, Code: ctl.CheckpointUnsupportedCode, Msg: "checkpoint disabled"}
+	p.mu.Unlock()
+	f.o.requestDiskCheckpointRelease(f.sb.ID)
+	waitDiskCheckpointRelease(t, f.o, f.sb.ID)
+	p.mu.Lock()
+	lists, deletes := p.lists, len(p.deletes)
+	p.mu.Unlock()
+	if lists != 1 || deletes != 0 {
+		t.Fatalf("unsupported List: lists=%d deletes=%d", lists, deletes)
+	}
+	got, err := f.o.st.Get(context.Background(), f.sb.ID)
+	if err != nil || got == nil || got.State != types.StateRunning || got.RunID != f.sb.RunID {
+		t.Fatalf("unsupported check changed running ownership: %+v, %v", got, err)
+	}
+
+	// Unsupported is not cached by SID. An independent later trigger still
+	// discovers and deletes versions when the runtime supports Checkpoint.
+	refs := []ctl.DiffCheckpointRef{{DiffID: "root", ID: "later"}}
+	p.mu.Lock()
+	p.listError, p.refs = nil, refs
+	p.mu.Unlock()
+	f.o.requestDiskCheckpointRelease(f.sb.ID)
+	waitDiskCheckpointRelease(t, f.o, f.sb.ID)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.lists != 2 || len(p.deletes) != 1 || !reflect.DeepEqual(p.deletes[0], refs) {
+		t.Fatalf("later trigger was skipped: lists=%d deletes=%+v", p.lists, p.deletes)
+	}
+}
+
+func TestDiskCheckpointReleaseUnsupportedPreservesConcurrentTrigger(t *testing.T) {
+	f := newDiskCheckpointFixture(t, "disk-unsupported-trigger")
+	p := serveDiskCheckpointPeer(t, f.sb)
+	diskCheckpointReleaseLifecycle(t, f.o)
+	refs := []ctl.DiffCheckpointRef{{DiffID: "root", ID: "concurrent"}}
+	p.mu.Lock()
+	p.listError = &ctl.Response{Type: ctl.TypeError, Code: ctl.CheckpointUnsupportedCode, Msg: "checkpoint disabled"}
+	// The peer has selected the unsupported response but has not sent it yet.
+	// Trigger another check while the original worker is still in List.
+	p.beforeListReply = func() {
+		p.beforeListReply, p.listError, p.refs = nil, nil, refs
+		f.o.requestDiskCheckpointRelease(f.sb.ID)
+	}
+	p.mu.Unlock()
+	f.o.requestDiskCheckpointRelease(f.sb.ID)
+	waitDiskCheckpointRelease(t, f.o, f.sb.ID)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.lists != 2 || len(p.deletes) != 1 || !reflect.DeepEqual(p.deletes[0], refs) {
+		t.Fatalf("concurrent trigger was lost: lists=%d deletes=%+v", p.lists, p.deletes)
+	}
+}
+
+func TestDiskCheckpointReleaseListErrorsRemainRetryable(t *testing.T) {
+	for _, message := range []string{"temporary storage failure", ctl.CheckpointUnsupportedCode, "unknown type: " + ctl.TypeCheckpointListRequest} {
+		t.Run(message, func(t *testing.T) {
+			f := newDiskCheckpointFixture(t, "disk-list-error")
+			p := serveDiskCheckpointPeer(t, f.sb)
+			diskCheckpointReleaseLifecycle(t, f.o)
+			refs := []ctl.DiffCheckpointRef{{DiffID: "root", ID: "retry"}}
+			p.mu.Lock()
+			p.refs = refs
+			p.listError = &ctl.Response{Type: ctl.TypeError, Msg: message}
+			p.mu.Unlock()
+			selected := &diskCheckpointSelection{}
+			err := f.o.releaseDiskCheckpointsOnce(context.Background(), f.sb.ID, selected)
+			if err == nil || errors.Is(err, ctl.ErrCheckpointUnsupported) || selected.listed {
+				t.Fatalf("ordinary List error accepted: selected=%+v err=%v", selected, err)
+			}
+			p.mu.Lock()
+			if len(p.deletes) != 0 {
+				t.Error("failed List issued Delete")
+			}
+			// The worker's first attempt still fails. Only its automatic retry
+			// can observe a complete list and release the selected version.
+			p.beforeListReply = func() { p.beforeListReply, p.listError = nil, nil }
+			p.mu.Unlock()
+			f.o.requestDiskCheckpointRelease(f.sb.ID)
+			waitDiskCheckpointRelease(t, f.o, f.sb.ID)
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			if p.lists != 3 || len(p.deletes) != 1 || !reflect.DeepEqual(p.deletes[0], refs) {
+				t.Fatalf("ordinary error was not retried: lists=%d deletes=%+v", p.lists, p.deletes)
+			}
+		})
+	}
+}
+
+func TestDiskCheckpointReleaseDeleteUnsupportedRemainsRetryable(t *testing.T) {
+	f := newDiskCheckpointFixture(t, "disk-delete-unsupported")
+	p := serveDiskCheckpointPeer(t, f.sb)
+	refs := []ctl.DiffCheckpointRef{{DiffID: "root", ID: "selected"}}
+	p.setup(refs, false, false)
+	p.mu.Lock()
+	p.deleteError = &ctl.Response{Type: ctl.TypeError, Code: ctl.CheckpointUnsupportedCode, Msg: "delete unsupported"}
+	p.mu.Unlock()
+	selected := &diskCheckpointSelection{}
+	if err := f.o.releaseDiskCheckpointsOnce(context.Background(), f.sb.ID, selected); !errors.Is(err, ctl.ErrCheckpointUnsupported) {
+		t.Fatalf("Delete error was swallowed: %v", err)
+	}
+	p.mu.Lock()
+	p.deleteError = nil
+	p.refs = append(p.refs, ctl.DiffCheckpointRef{DiffID: "root", ID: "new"})
+	p.mu.Unlock()
+	if err := f.o.releaseDiskCheckpointsOnce(context.Background(), f.sb.ID, selected); err != nil {
+		t.Fatal(err)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.lists != 1 || len(p.deletes) != 2 || !reflect.DeepEqual(p.deletes[0], refs) || !reflect.DeepEqual(p.deletes[1], refs) {
+		t.Fatalf("Delete error changed retry selection: lists=%d deletes=%+v", p.lists, p.deletes)
+	}
 }
 
 func TestDiskCheckpointReleaseBothCompletionOrders(t *testing.T) {
