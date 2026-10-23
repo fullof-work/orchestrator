@@ -134,7 +134,7 @@ func TestStartSandboxPassesReadinessFDAndClosesParentWriter(t *testing.T) {
 	wantSID := phaseSandboxID("a", p.spec.BuildID)
 	wantConfig := filepath.Join(runDir, "a", "sandbox.yaml")
 	wantArgs := []string{
-		"run", "--enable-checkpoint", "--config", wantConfig,
+		"run", "--config", wantConfig,
 		"--run-root", runDir, "--base-root", baseDir,
 		"--path-id", "a", "--sandbox-id", wantSID,
 	}
@@ -211,6 +211,8 @@ func TestPhaseSandboxSourceArgumentsSeparateMaterializationAndMemoryCapture(t *t
 		replaceBoot bool
 		wantReplace bool
 	}{
+		{name: "image import", phase: "a"},
+		{name: "image build steps", phase: "b"},
 		{name: "image cold run", phase: "c"},
 		{name: "source materialization", phase: "b", from: source},
 		{name: "source memory capture", phase: "c", from: source, replaceBoot: true, wantReplace: true},
@@ -234,7 +236,7 @@ func TestPhaseSandboxSourceArgumentsSeparateMaterializationAndMemoryCapture(t *t
 					}
 				}
 			}
-			if checkpointFlags != 1 || hasRestore || hasReplace != test.wantReplace || fromValue != test.from {
+			if checkpointFlags != 0 || hasRestore || hasReplace != test.wantReplace || fromValue != test.from {
 				t.Fatalf("phase args = %#v; from=%q replace=%t restore=%t", args, fromValue, hasReplace, hasRestore)
 			}
 		})

@@ -1950,10 +1950,10 @@ exact-CAS 清 network；任一步失败保留尚需重试的字段。checkpoint 
 
 ##### 本地磁盘 Checkpoint
 
-每次实际沙箱启动，包括冷/内存恢复、重启及空闲 runner 接到任务后的启动，都传入
+每次托管业务沙箱的实际启动，包括冷/内存恢复、重启及空闲 runner 接到任务后的启动，都传入
 `--enable-checkpoint`。可写 DIFF 保留在
 `<BaseRoot>/sandboxes/<SandboxID>/checkpoint/diffs`，清理 RunDir 不删除它。
-目录沿用既有 BaseRoot 与 PathID，不增加独立租户选项。Builder 阶段使用相同后端，
+目录沿用既有 BaseRoot 与 PathID，不增加独立租户选项。Build 阶段不传此参数，使用单层可写盘，
 见 [Build 执行](node-build_zh.md#5-按目标执行与发布)。
 
 每次实际命名捕获都生成新的 UUID v7，根盘和全部可写数据盘共用该 ID。
@@ -1981,8 +1981,8 @@ Drain、内存捕获和业务收尾仍有成本。DIFF 重开先完成必要检�
 
 平台验证使用公开 `orchestrator.checkpoint.sh` 用例，要求命名版本、同目录 DIFF 重用、
 内存/冷恢复及可移植发布后的 guest 数据正确性、导出期间保留版本，以及释放后实际分配字节下降。
-用例允许有界后台 GC 宽限，仅有 `List=[]` 不能判定空间已回收。Build 阶段必须启用
-Checkpoint，最终模板捕获仍为普通产物。
+用例允许有界后台 GC 宽限，仅有 `List=[]` 不能判定空间已回收。Build 阶段必须使用单层盘，
+业务沙箱启动必须启用 Checkpoint，最终模板捕获仍为普通产物。
 
 可选性能对比应通过中央 E2E prepare 流程准备独立的普通复制基线和候选工作区，两者都包含
 当前 `orchestrator.checkpoint.sh` 的依赖和测试 helper。基线和候选的 `node-ctl` 分别来自

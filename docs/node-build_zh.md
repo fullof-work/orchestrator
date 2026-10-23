@@ -341,14 +341,17 @@ Build 从不恢复来源 Snapshot S 的 memory/VMM 状态；S 只用于找到它
 不得引用来源 S、来源 E、来源 writable/data disk 或 memory parent，memory 结果中唯一允许的
 `S -> E` 是本次 Build 自身产生的关系。
 
-实际启动的每个 A/B/C 沙箱都传入 `--enable-checkpoint`。可写 DIFF 位于
-`<BuildBaseDir>/<phase>/checkpoint/diffs`：阶段 PathID 仍为 `a`、`b` 或 `c`，
-与阶段 SandboxID 分开。最终模板捕获仍在 `<BuildBaseDir>/checkpoint` 输出普通复制产物，
-不传 `--checkpoint`；发布结果因此可独立于阶段 DIFF 目录使用。既有 Build finalizer
-在执行归属结束后删除这些目录。
+A/B/C 沙箱使用单层可写盘（明文 raw，加密 v1），不传 `--enable-checkpoint`。
+Build 不使用业务 pause/resume，因此导入、构建步骤及最终模板准备无需承担版本化后端的
+索引和写时复制成本。阶段 PathID 仍为 `a`、`b` 或 `c`，与阶段 SandboxID 分开。
+最终模板 snapshot 仍可捕获内存，在 `<BuildBaseDir>/checkpoint` 输出普通复制产物，
+不传 `--checkpoint`。`checkpoint.mode` 仅选择 local/bundle 产物载体，不选择可写盘后端。
+发布模板独立于阶段磁盘，后续可用于启动启用 Checkpoint 的托管业务沙箱。
+既有 Build finalizer 在执行归属结束后清理所属目录。
 
 来源预检经过 Open、Clone、Validate 保留 Checkpoint E 布局，从 S 选出 E 时也如此，
-不会用空白模板替换已有活动磁盘内容。仅根盘的 E 继续支持既有 Build 继承路径；
+即使 Build 运行期不启用 Checkpoint，也会先将来源固定磁盘内容物化到独立 Build 存储，
+不会用空白模板替换。仅根盘的 E 继续支持既有 Build 继承路径；
 来源数据盘保留原有不支持的边界。本次后端变更不增加来源内存恢复，也不扩大 Build
 接受的磁盘拓扑。启动准备、首次访问和普通模板复制的成本，与命名本地 Pause 的收益
 分别衡量，见[节点捕获](node_zh.md#本地磁盘-checkpoint)。

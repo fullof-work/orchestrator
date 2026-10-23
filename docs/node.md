@@ -1481,11 +1481,11 @@ Ordering is resolve request → accept operation → capture runtime → CommitR
 
 ##### Local disk Checkpoints
 
-Every actual sandbox start, including cold/memory restore, restart and a task assigned
+Every actual managed business sandbox start, including cold/memory restore, restart and a task assigned
 to an idle runner, passes `--enable-checkpoint`. Writable DIFF files remain under
 `<BaseRoot>/sandboxes/<SandboxID>/checkpoint/diffs`; RunDir cleanup does not remove
 them. The existing BaseRoot and PathID determine this directory, without a separate
-tenant option. Builder stages use the same backend ([Build execution](node-build.md#5-target-aware-execution-and-publication)).
+tenant option. Build stages use single-layer writable disks without this flag ([Build execution](node-build.md#5-target-aware-execution-and-publication)).
 
 Each actual named capture generates a fresh UUID v7 shared by the root and all
 writable data disks. UUID generation failure stops before starting the capture
@@ -1524,8 +1524,8 @@ For platform validation, the public `orchestrator.checkpoint.sh` case requires
 named versions, same-directory DIFF reuse, correct guest data across memory/cold
 resume and portable publication, export-time retention, and actual allocated-byte
 reclamation after release. It allows bounded background-GC grace; `List=[]` alone
-does not satisfy reclamation. Its Build stages must enable Checkpoint while the
-final template capture remains ordinary.
+does not satisfy reclamation. Its Build stages must use single-layer disks, managed business
+launches must enable Checkpoint, and the final template capture remains ordinary.
 
 For an optional comparison, prepare independent baseline-copy and candidate
 workspaces through the central E2E preparation process, both including the current

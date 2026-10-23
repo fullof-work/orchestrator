@@ -22,9 +22,9 @@ runs, captures = ([json.loads(line) for line in open(path) if line.strip()] for 
 assert runs and captures, (runs, captures)
 phases = set()
 for args in runs:
-    assert args.count('--enable-checkpoint') == 1, args
+    assert '--enable-checkpoint' not in args, args
     phases.add(args[args.index('--path-id') + 1])
-assert {'a', 'c'} <= phases, phases
+assert {'a', 'c'} <= phases <= {'a', 'b', 'c'}, phases
 for args in captures:
     assert '--checkpoint' not in args, args
     assert args[args.index('--path-id') + 1] == 'c', args
@@ -173,4 +173,16 @@ cmp "$WORK/checkpoint-original.hash" "$WORK/checkpoint-published.hash"
 delete_checkpoint_guest
 echo "==> PASS: named versions, same-directory reuse, export overlap, physical GC and source-independent cold restore"
 
+# Verify the actual business launches as well as the Build launches above.
+python3 - "$RUN_ARGV_LOG" <<'PY'
+import json, sys
+business = []
+for line in open(sys.argv[1]):
+    if not line.strip(): continue
+    args = json.loads(line)
+    builder = args[args.index('--path-id') + 1] in ('a', 'b', 'c')
+    assert args.count('--enable-checkpoint') == int(not builder), args
+    if not builder: business.append(args)
+assert business, 'no managed business sandbox launches observed'
+PY
 echo "PASS orchestrator.checkpoint.sh"

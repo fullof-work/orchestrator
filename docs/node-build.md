@@ -221,17 +221,22 @@ Register-time builder.target names three outputs: `{kind:"image"}`, `{kind:"sand
 
 Every source first becomes an image or cold Sandbox E, then A/B yields this Build's top-level image. Builds never restore source S memory/VMM state: S only locates E. Final Image/E/S must not reference source S/E, writable/data disks or memory parents. A memory result permits only the S→E relation created by this Build itself.
 
-Every A/B/C sandbox that actually starts passes `--enable-checkpoint`. Its writable
-DIFFs use `<BuildBaseDir>/<phase>/checkpoint/diffs`: the stage PathID remains
-`a`, `b` or `c`, independently of the phase SandboxID. The final template capture
-still writes ordinary copied artifacts under `<BuildBaseDir>/checkpoint` and
-does not pass `--checkpoint`; publication therefore produces a portable result
-that does not depend on stage DIFF directories. The existing Build finalizer
-removes those directories after execution ownership has ended.
+A/B/C sandboxes use single-layer writable disks (raw, or v1 when encrypted),
+without `--enable-checkpoint`. Builds do not use business pause/resume, so their
+import, build steps and final template preparation avoid the versioned backend's
+index and copy-on-write costs. The stage PathID remains `a`, `b` or `c`,
+independently of the phase SandboxID. The final template snapshot can still
+capture memory: it writes ordinary copied artifacts under
+`<BuildBaseDir>/checkpoint` without `--checkpoint`. The `checkpoint.mode`
+setting selects local/bundle artifact packaging, not the writable disk backend.
+The published template is independent of stage disks and can later start a
+managed business sandbox with Checkpoint enabled. The existing Build finalizer
+cleans owned directories after execution ownership has ended.
 
 Source preparation preserves a Checkpoint E layout through Open, Clone and
-Validate, including when S selects that E. Its active disk contents are not
-replaced by a blank template. Root-only E remains eligible for the existing
+Validate, including when S selects that E. Its fixed disk contents are materialized into independent Build storage before
+use, even though the Build runtime disables Checkpoint; they are not replaced
+by a blank template. Root-only E remains eligible for the existing
 Build inheritance path; source data disks retain their existing unsupported
 boundary. This backend change does not add source-memory restoration or expand
 the accepted Build topology. Startup preparation, first-access cost and ordinary

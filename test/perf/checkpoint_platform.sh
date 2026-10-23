@@ -93,7 +93,8 @@ def calls(path):
 runs = calls(sys.argv[2])
 assert runs, 'no actual runtime launches observed'
 for args in runs:
-    assert args.count('--enable-checkpoint') == int(mode == 'checkpoint'), args
+    builder = args[args.index('--path-id') + 1] in ('a', 'b', 'c')
+    assert args.count('--enable-checkpoint') == int(mode == 'checkpoint' and not builder), args
 identities = []
 for path in sys.argv[3:]:
     for args in calls(path):
