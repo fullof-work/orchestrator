@@ -92,6 +92,9 @@ func (p *buildPipeline) startSandboxYAML(phase string, document []byte, connect 
 }
 
 func phaseSandboxRunArgs(s *configsock.BuildSpec, phase, sid, yamlPath string, connect []string, from string, replaceBoot bool) []string {
+	// Build stages do not pause/resume. Keep their writable disks single-layer;
+	// checkpoint-backed inputs can still be materialized, and the final
+	// template snapshot copies disks independently of the runtime backend.
 	args := []string{"run"}
 	if from != "" {
 		args = append(args, "--from", from)

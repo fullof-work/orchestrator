@@ -68,14 +68,16 @@ type Orchestrator struct {
 	mu  sync.Mutex
 	reg map[string]*types.Sandbox // in-memory immutable snapshots (hot path: Route/LaunchSpecFor)
 
-	launches       launchGroup            // sole process-local owner of create and resume attempts
-	acceptedOps    acceptedOperationGroup // accepted pauses/exports drain before shared dependencies close
-	buildWake      chan struct{}
-	buildUsageWake chan struct{}
-	buildOps       acceptedOperationGroup // claimed/recovered Builds drain before store/launcher close
-	deleteOps      acceptedOperationGroup // durable Sandbox finalizers drain before shared dependencies close
-	exports        exportAttemptGroup     // publish/finalize owners that Resume may preempt or detach
-	lifecycle      keyedLockGroup         // serialize lifecycle mutations for one sid
+	launches          launchGroup            // sole process-local owner of create and resume attempts
+	acceptedOps       acceptedOperationGroup // accepted pauses/exports drain before shared dependencies close
+	buildWake         chan struct{}
+	buildUsageWake    chan struct{}
+	buildOps          acceptedOperationGroup // claimed/recovered Builds drain before store/launcher close
+	deleteOps         acceptedOperationGroup // durable Sandbox finalizers drain before shared dependencies close
+	diskReleaseMu     sync.Mutex
+	diskReleaseActive map[string]*diskCheckpointReleaseWork
+	exports           exportAttemptGroup // publish/finalize owners that Resume may preempt or detach
+	lifecycle         keyedLockGroup     // serialize lifecycle mutations for one sid
 
 	deleteMu            sync.Mutex
 	deleteActive        map[string]struct{} // deleting sandbox id -> live retrying finalizer
@@ -512,6 +514,9 @@ func (o *Orchestrator) runLaunch(ctx context.Context, attempt *launchAttempt, sb
 		"failure_stage", failureStage,
 		"starting_total_duration", time.Since(acceptedAt),
 		"err", err)
+	if err == nil {
+		o.requestDiskCheckpointRelease(sb.ID)
+	}
 	return err
 }
 
@@ -1127,7 +1132,7 @@ func (o *Orchestrator) Kill(ctx context.Context, id, apiKey string) (bool, error
 	if o.extensionSandboxHook != nil {
 		return o.killWithExtension(ctx, id, apiKey)
 	}
-	unlock, err := o.lockLifecycleMutation(ctx, id)
+	ctx, unlock, err := o.lockLifecycleMutation(ctx, id)
 	if err != nil {
 		return false, err
 	}
@@ -1144,7 +1149,7 @@ func (o *Orchestrator) Kill(ctx context.Context, id, apiKey string) (bool, error
 }
 
 func (o *Orchestrator) killWithExtension(ctx context.Context, id, apiKey string) (bool, error) {
-	unlock, err := o.lockLifecycleMutation(ctx, id)
+	ctx, unlock, err := o.lockLifecycleMutation(ctx, id)
 	if err != nil {
 		return false, err
 	}
@@ -1178,7 +1183,7 @@ func (o *Orchestrator) killWithExtension(ctx context.Context, id, apiKey string)
 		return false, fmt.Errorf("%w: extension removed delete candidate", api.ErrBadRequest)
 	}
 
-	unlock, err = o.lockLifecycleMutation(ctx, id)
+	ctx, unlock, err = o.lockLifecycleMutation(ctx, id)
 	if err != nil {
 		return false, err
 	}
@@ -1213,7 +1218,7 @@ func (o *Orchestrator) Pause(ctx context.Context, id, apiKey string, request san
 	if o.extensionSandboxHook != nil {
 		return o.pauseWithExtension(ctx, id, apiKey, request)
 	}
-	unlock, err := o.lockLifecycleMutation(ctx, id)
+	ctx, unlock, err := o.lockLifecycleMutation(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -1245,7 +1250,7 @@ func (o *Orchestrator) Pause(ctx context.Context, id, apiKey string, request san
 }
 
 func (o *Orchestrator) pauseWithExtension(ctx context.Context, id, apiKey string, request sandboxcfg.CaptureRequest) error {
-	unlock, err := o.lockLifecycleMutation(ctx, id)
+	ctx, unlock, err := o.lockLifecycleMutation(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -1301,7 +1306,7 @@ func (o *Orchestrator) pauseWithExtension(ctx context.Context, id, apiKey string
 		return fmt.Errorf("%w: extension changed core-owned pause capture kind", api.ErrBadRequest)
 	}
 
-	unlock, err = o.lockLifecycleMutation(ctx, id)
+	ctx, unlock, err = o.lockLifecycleMutation(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -1343,7 +1348,7 @@ func (o *Orchestrator) pauseWithExtension(ctx context.Context, id, apiKey string
 // pauseSandbox captures a running sandbox and stops it — the work behind the
 // reaper's auto-suspend (no API key: the caller has already authorized).
 func (o *Orchestrator) pauseSandbox(ctx context.Context, sb *types.Sandbox) error {
-	unlock, err := o.lockLifecycleMutation(ctx, sb.ID)
+	ctx, unlock, err := o.lockLifecycleMutation(ctx, sb.ID)
 	if err != nil {
 		return err
 	}
@@ -1396,6 +1401,11 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 	if sb.State != types.StateRunning {
 		return api.ErrNotFound
 	}
+	ctx, release, err := o.trySourceOperation(ctx, sb)
+	if err != nil {
+		return err
+	}
+	defer release()
 	opCtx, finish, err := o.beginPauseOperation(ctx)
 	if err != nil {
 		return err
@@ -1428,7 +1438,7 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 		paused.PauseReason = types.PauseReasonExplicit
 	}
 
-	cleanupCtx, cancel := cleanupContext()
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(opCtx), 30*time.Second)
 	defer cancel()
 	if err := o.cleanupPausedOwnership(cleanupCtx, paused); err != nil {
 		// Capture and the paused transition are already committed. Retain every
@@ -1454,6 +1464,14 @@ func (o *Orchestrator) cleanupPausedOwnership(ctx context.Context, sb *types.San
 	if err := o.validateSandboxCleanupPaths(sb); err != nil {
 		return err
 	}
+	if !pausedCleanupPending(sb) {
+		return nil
+	}
+	ctx, release, err := o.trySourceOperation(ctx, sb)
+	if err != nil {
+		return err
+	}
+	defer release()
 	if runID := sb.RunID; runID != "" {
 		if err := o.fenceSandboxRunner(ctx, runID); err != nil {
 			return err
@@ -2007,7 +2025,7 @@ func (o *Orchestrator) ensureResumeAcceptedPreparedFrom(
 }
 
 func (o *Orchestrator) SetTimeout(ctx context.Context, id, apiKey string, timeoutSec int) (bool, error) {
-	unlock, err := o.lockLifecycleMutation(ctx, id)
+	ctx, unlock, err := o.lockLifecycleMutation(ctx, id)
 	if err != nil {
 		return false, err
 	}
@@ -2445,6 +2463,7 @@ func (o *Orchestrator) sandboxFinalLaunchSpec(sb *types.Sandbox, tmpl types.Temp
 	// directories sandbox-ctl owns and local control commands find ctl.sock.
 	args := []string{
 		"run", "--sandbox-id", sb.ID,
+		"--enable-checkpoint",
 		"--path-id", sb.ID,
 		"--config", o.sandboxConfigPath(sb),
 		"--manifest-config", o.cfg.ManifestConfig,
@@ -2568,6 +2587,7 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 	// collect the dead/result-owned ones and tear them down after the scan, since
 	// teardown + terminal writes must not run while the read cursor is open.
 	var deleting, paused, acceptedStarting, interrupted, acceptedRunning, dead, deadHistory []*types.Sandbox
+	var adopted []string
 	knownRuns := make(map[string]bool)
 	if err := o.st.RangeByState(ctx, types.StateDeleting, func(sb *types.Sandbox) error {
 		if sb.RunID != "" {
@@ -2609,6 +2629,7 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 		} else if sb.RunID != "" && alive[sb.RunID] {
 			o.cache(sb) // re-adopt: route + TTL already in store
 			o.observeSandboxUpsert(sb)
+			adopted = append(adopted, sb.ID)
 		} else {
 			dead = append(dead, sb)
 		}
@@ -2625,19 +2646,41 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 	}); err != nil {
 		return err
 	}
+	for _, sid := range adopted {
+		o.requestDiskCheckpointRelease(sid)
+	}
 	for _, sb := range deleting {
 		o.log.Info("reconcile: resume deleting sandbox finalizer", "sid", sb.ID, "run_id", sb.RunID, "port", sb.VswitchPort)
 		if err := o.finalizeSandboxDeleteOnce(ctx, sb.ID); err != nil {
+			if errors.Is(err, errSourceOperationBusy) {
+				o.startSandboxDeleteFinalizer(sb.ID)
+				continue
+			}
 			return fmt.Errorf("reconcile: finalize deleting sandbox %s: %w", sb.ID, err)
 		}
 	}
 	for _, sb := range paused {
 		o.log.Info("reconcile: verify paused ownership cleanup", "sid", sb.ID, "run_id", sb.RunID, "port", sb.VswitchPort)
-		if err := o.cleanupPausedOwnership(ctx, sb); err != nil {
-			return fmt.Errorf("reconcile: cleanup paused sandbox %s: %w", sb.ID, err)
+		if err := o.finalizePausedCleanupOnce(sb.ID); err != nil {
+			if !errors.Is(err, errSourceOperationBusy) {
+				return fmt.Errorf("reconcile: cleanup paused sandbox %s: %w", sb.ID, err)
+			}
+			unlock := o.lifecycle.Lock(sb.ID)
+			o.startPausedCleanupRetry(sb.ID)
+			unlock()
 		}
-		o.cache(sb)
-		o.observeSandboxUpsert(sb)
+		// Cleanup may have durably cleared only part of the ownership. Publish
+		// the fresh row, never the pre-cleanup scan (or a same-ID successor).
+		unlock := o.lifecycle.Lock(sb.ID)
+		current, err := o.st.Get(ctx, sb.ID)
+		if err == nil && current != nil && current.State == types.StatePaused {
+			o.cache(current)
+			o.observeSandboxUpsert(current)
+		}
+		unlock()
+		if err != nil {
+			return err
+		}
 	}
 	for _, sb := range acceptedStarting {
 		o.log.Info("reconcile: accepted result for starting sandbox", "sid", sb.ID, "run_id", sb.RunID, "launch_mode", sb.LaunchMode)
@@ -2699,29 +2742,21 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 	for _, sb := range acceptedRunning {
 		o.log.Info("reconcile: accepted result for running sandbox", "sid", sb.ID, "run_id", sb.RunID)
 		if err := o.finalizeSandboxResultOnce(ctx, sb.ID, sb.RunID); err != nil {
+			if errors.Is(err, errSourceOperationBusy) {
+				o.startSandboxResultCleanup(sb.ID, sb.RunID)
+				continue
+			}
 			return fmt.Errorf("reconcile: cleanup accepted result sandbox %s: %w", sb.ID, err)
 		}
 	}
 	for _, sb := range dead {
 		o.log.Info("reconcile: dead sandbox", "sid", sb.ID)
-		if err := o.teardownPersistedOwnership(ctx, sb, true); err != nil {
+		if err := o.finalizeMissingRunningSandboxOnce(ctx, sb); err != nil {
+			if errors.Is(err, errSourceOperationBusy) {
+				o.startMissingRunningSandboxCleanup(sb)
+				continue
+			}
 			return fmt.Errorf("reconcile: cleanup dead sandbox %s: %w", sb.ID, err)
-		}
-		changed, err := o.st.CommitSandboxDead(ctx, sb)
-		if err != nil {
-			return err
-		}
-		if !changed {
-			return fmt.Errorf("reconcile: running sandbox %s changed before dead commit", sb.ID)
-		}
-		o.runs.forget(sb.RunID)
-		o.releaseDetachedPortFence(sb.VswitchPort)
-		updated, err := o.st.Get(ctx, sb.ID)
-		if err != nil {
-			return err
-		}
-		if updated != nil {
-			o.observeSandboxUpsert(updated)
 		}
 	}
 	for _, sb := range deadHistory {
@@ -3007,23 +3042,47 @@ func (o *Orchestrator) capture(ctx context.Context, sb *types.Sandbox, request s
 }
 
 func (o *Orchestrator) snapshotLocal(ctx context.Context, sb *types.Sandbox, request sandboxcfg.CaptureRequest) (types.ResumeSource, error) {
+	return o.snapshotLocalWithCheckpointID(ctx, sb, request, uuid.NewV7)
+}
+
+func (o *Orchestrator) snapshotLocalWithCheckpointID(ctx context.Context, sb *types.Sandbox, request sandboxcfg.CaptureRequest, newID func() (uuid.UUID, error)) (types.ResumeSource, error) {
+	id, err := newID()
+	if err != nil {
+		return types.ResumeSource{}, fmt.Errorf("orch: create disk Checkpoint ID: %w", err)
+	}
 	dir := filepath.Join(sb.BaseDir, "checkpoint")
 	command := "snapshot"
 	kind := types.ResumeSourceSnapshot
 	if request.Kind == types.CaptureSandbox {
 		command, kind = "export", types.ResumeSourceSandbox
 	}
-	args := []string{command, "--json", "--path-id", sb.ID, "--output", dir, "--mode", o.cfg.Checkpoint.Mode, "--run-root", nodepath.SandboxRunRoot(o.cfg.Paths.RunRoot)}
-	if request.Kind == types.CaptureSnapshot {
-		args = appendSnapshotPolicyArgs(args, request.SnapshotPolicy)
+	run := func(checkpointID string) (types.ResumeSource, error) {
+		// Each attempt owns its argv and buffers. An unsupported old runtime may
+		// have emitted output before returning; it is not part of the copy report.
+		args := []string{command, "--json", "--path-id", sb.ID, "--output", dir, "--mode", o.cfg.Checkpoint.Mode, "--run-root", nodepath.SandboxRunRoot(o.cfg.Paths.RunRoot)}
+		if checkpointID != "" {
+			args = append(args, "--checkpoint", checkpointID)
+		}
+		if request.Kind == types.CaptureSnapshot {
+			args = appendSnapshotPolicyArgs(args, request.SnapshotPolicy)
+		}
+		cmd := exec.CommandContext(ctx, o.executables.SandboxCtl(), args...)
+		var out, errb bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &out, &errb
+		inheritSourceOperation(ctx, cmd)
+		if err := cmd.Run(); err != nil {
+			return types.ResumeSource{}, fmt.Errorf("orch: %s %s (mode %s): %w: %s", command, sb.ID, o.cfg.Checkpoint.Mode, err, errb.String())
+		}
+		return decodeCaptureSource(out.Bytes(), kind)
 	}
-	cmd := exec.CommandContext(ctx, o.executables.SandboxCtl(), args...)
-	var out, errb bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &out, &errb
-	if err := cmd.Run(); err != nil {
-		return types.ResumeSource{}, fmt.Errorf("orch: %s %s (mode %s): %w: %s", command, sb.ID, o.cfg.Checkpoint.Mode, err, errb.String())
+	source, err := run(id.String())
+	var exitErr *exec.ExitError
+	// 78 is sandbox-ctl's explicit checkpoint_unsupported result, including
+	// old running instances. I/O errors and incomplete reports never downgrade.
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 78 {
+		return run("")
 	}
-	return decodeCaptureSource(out.Bytes(), kind)
+	return source, err
 }
 
 // decodeCaptureSource is shared by capture adapters regardless of whether the
@@ -3092,6 +3151,7 @@ func (o *Orchestrator) promote(ctx context.Context, sb *types.Sandbox, source ty
 	}
 	args = append(args, root)
 	cmd := exec.CommandContext(ctx, o.executables.SandboxCtl(), args...)
+	inheritSourceOperation(ctx, cmd)
 	cmd.Env = append(os.Environ(), "MANIFEST_KEY="+sb.ManifestKey)
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb

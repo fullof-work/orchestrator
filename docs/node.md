@@ -262,10 +262,11 @@ node-ctl manifest-key list   [--socket S]
 These clients use conductor's local **API plane** for `POST /sandboxes/{id}/export` and `POST /sandboxes/import`. `E2B_API_KEY` must authenticate the owner. See §8.1.
 
 ```
-node-ctl export-sandbox <sid> [--to-template] [--keep-source] [--json] [--socket S]
+node-ctl export-sandbox <sid> [--to-template] [--keep-source] [--json] [--timeout D] [--socket S]
 node-ctl import-sandbox <token> [--socket S]
 ```
 
+- `--timeout` bounds the complete export request (default `20m`, positive Go duration). Publication materializes disk contents and can exceed short administrative deadlines. A timeout cancels this client request; it is not proof that an already accepted server operation rolled back. Check the source/result before retrying.
 - `export-sandbox <sid>` prints one opaque `kmt1.` migration token. By default, success means the valid result is ready and source deletion is durably accepted; physical cleanup may finish after the response; `--keep-source` retains it paused with its original ResumeSource and local checkpoint — the source resumes from exactly where it would have resumed without the export (#336).
 - `export-sandbox <sid> --to-template` publishes paused E or S and prints persistent `sbx`/`snp` templateID for fan-out. Source retention is identical: `--keep-source` retains it; omission accepts its deletion with the same eventual cleanup semantics.
 - Resume remains allowed during local-artifact upload. If Resume wins first, KMT Export cancels upload and returns 409, whereas Template Export continues and returns templateID. Both abandon the source finalizer without updating/deleting source or local artifact.
@@ -1399,7 +1400,7 @@ Create/Connect/Wake/route activation/native exec/exec-session/migration import s
 
 After durable acceptance, finalizer waits for late launch ownership to finish, then stops/resets exact unit with inactive readback, detaches inside allocation fence, full-owner-CAS clears network tuple, removes RunDir and BaseDir and exactly hard-deletes. Only successful durable network clear releases the detached-port fence. Later directory/row failures retain path/runner ownership without blocking new Attach. Hard-delete publishes terminal Extension/object observation, without another route Delete. Failures retain unfinished ownership and retry in-process or after startup. Fresh Create's route-applied barrier precedes resource launch; failed acceptance cleans locally, then exactly creates owner-free dead history and withdraws route.
 
-CommitRunningPaused atomically stores state/source. RunID, port and RunDir clear individually only after successful Stop/Reset fencing, Detach, selective checkpoint cleanup and RemoveAll. RunDir CAS also clears its envd/CI UDS paths. Each failure retains remaining retry fields. Fully cleaned paused state retains only BaseDir/checkpoint and source. Resume/Wake/Exec finish cleanup backlog before taking a new runtime owner and atomically restore canonical RunDir/UDS on paused→starting. Runtime cleanup never removes paused BaseDir; explicit Delete removes it and then the row.
+CommitRunningPaused atomically stores state/source. RunID, port and RunDir clear individually only after successful Stop/Reset fencing, Detach, selective checkpoint cleanup and RemoveAll. RunDir CAS also clears its envd/CI UDS paths. Each failure retains remaining retry fields. Fully cleaned paused state retains BaseDir with checkpoint data and its source-operation lock, plus the source. Resume/Wake/Exec finish cleanup backlog before taking a new runtime owner and atomically restore canonical RunDir/UDS on paused→starting. Runtime cleanup never removes paused BaseDir; explicit Delete removes it and then the row.
 
 When `resource_listen` is enabled, the node uses the source-independent
 [effective-zone matrix](node-resource.md#42-rawzone-and-effective-zone).
@@ -1457,12 +1458,12 @@ checkpoint.mode accepts local/bundle for both CaptureKinds:
 ```text
 CaptureSnapshot:
   sandbox-ctl snapshot --json --path-id <sid> --output <dir> --mode <local|bundle> \
-    --run-root <run-root> [--merge-ref=...] [--drop-caches=...]
+    --run-root <run-root> --checkpoint <UUID-v7> [--merge-ref=...] [--drop-caches=...]
   -> ResumeSource{kind:snapshot, ref:<actual S basename + identity>, sandboxRef:<actual E basename + identity>}
 
 CaptureSandbox:
   sandbox-ctl export --json --path-id <sid> --output <dir> --mode <local|bundle> \
-    --run-root <run-root>
+    --run-root <run-root> --checkpoint <UUID-v7>
   -> ResumeSource{kind:sandbox, ref:<actual E basename + identity>, sandboxRef:""}
 ```
 
@@ -1477,6 +1478,124 @@ Snapshot stores the actual S/E pair, while E-only capture clears the old Snapsho
 and its association. Capture failure never commits a partial pair.
 
 Ordering is resolve request → accept operation → capture runtime → CommitRunningPaused(id, exact RunID, source) → stop/reset exact runner → detach exact network → selectively clean checkpoint → remove RunDir → publish paused. State/source commit is atomic; remaining RunID/port/RunDir means cleanup pending. Successful stop/detach clears its field by exact CAS. Checkpoint or RunDir cleanup failure blocks new Resume/Wake/Exec ownership and is retried at admission or startup. BaseDir/checkpoint remains. Capture failure keeps running state, old source, runner/network and creates no success alias; it never downgrades S to E.
+
+##### Local disk Checkpoints
+
+Every actual managed business sandbox start, including cold/memory restore, restart and a task assigned
+to an idle runner, passes `--enable-checkpoint`. Writable DIFF files remain under
+`<BaseRoot>/sandboxes/<SandboxID>/checkpoint/diffs`; RunDir cleanup does not remove
+them. The existing BaseRoot and PathID determine this directory, without a separate
+tenant option. Build stages use single-layer writable disks without this flag ([Build execution](node-build.md#5-target-aware-execution-and-publication)).
+
+Each actual named capture generates a fresh UUID v7 shared by the root and all
+writable data disks. UUID generation failure stops before starting the capture
+command. Repeated requests that do not capture again create no new version.
+`checkpoint.mode` still selects local or Bundle output, and `memory`, `merge_ref`
+and `drop_caches` retain their own meanings. E records fixed disk versions in
+`checkpoint.json`; the ordinary disk payload is not copied during this capture.
+
+Old running instances are not converted in place. Only sandbox-ctl's explicit
+unsupported result (exit 78) permits one retry without `--checkpoint`, using fresh
+arguments and output buffers and validating that retry's complete report. I/O,
+space, corruption and incomplete-report failures never trigger this fallback.
+New starts must support the enabled mode. Deploy matching sandboxer source and
+binaries containing [sandboxer #336](https://github.com/kuasar-sandbox/sandboxer/pull/336)
+(`7cd3ed4c5a8807b75b175bdb845867effb1c5018` or a successor); the sibling module
+selected by `go.mod` replacement is part of that requirement.
+
+Task-local Open, Clone and Validate preserve the Checkpoint layout. Its root and
+data disks already contain active data even when the ordinary active-base field
+is empty, so preparation does not inject a blank disk. Ordinary direct EROFS inputs
+still need their writable upper. Resume passes the committed source unchanged:
+sandboxer may reopen the original DIFF when directory, disk identity, capacity,
+base and latest active version match. Older versions, changed active contents or
+another directory require materialization. Source artifacts resolve relative to
+their actual carrier, independently of the target RunDir/BaseDir.
+
+This removes historical disk-payload copying from named local capture; it does
+not make the complete Pause or Resume constant-time. Drain, memory capture and
+business cleanup still contribute. DIFF reopening performs required initial
+checks and queries presence on first access, so evaluate guest readiness and the
+first working set together with Open time. Retained versions can increase space
+and shared-write cost; ordinary active-DIFF export still traverses its index.
+Storage-layer measurements alone are not platform pause/resume measurements.
+
+For platform validation, the public `orchestrator.checkpoint.sh` case requires
+named versions, same-directory DIFF reuse, correct guest data across memory/cold
+resume and portable publication, export-time retention, and actual allocated-byte
+reclamation after release. It allows bounded background-GC grace; `List=[]` alone
+does not satisfy reclamation. Its Build stages must use single-layer disks, managed business
+launches must enable Checkpoint, and the final template capture remains ordinary.
+
+For an optional comparison, prepare independent baseline-copy and candidate
+workspaces through the central E2E preparation process, both including the current
+`orchestrator.checkpoint.sh` dependencies/helpers. Select the baseline `node-ctl`
+from its own source and the candidate from its source; keep sandboxer, other
+products, execute image, architecture and host resources identical. From the
+orchestrator repository, run sequentially with fresh output directories:
+
+```sh
+sudo python3 test/perf/run_checkpoint_platform.py --workspace /path/to/baseline-prepared \
+  --mode baseline-copy --sizes 0,1 --out /path/to/baseline-observations
+sudo python3 test/perf/run_checkpoint_platform.py --workspace /path/to/candidate-prepared \
+  --mode checkpoint --sizes 0,1 --out /path/to/candidate-observations
+```
+
+This separate measurement driver calls the prepared public `workspace.verify`,
+capability probe, `load_images` and `case_environment`, and verifies inputs again
+after execution. It changes no prepared product and has no host-product fallback;
+its result is not an E2E acceptance result. It records full prepared provenance,
+product SHA-256 values, image identity, actual argv and capture layouts. The
+baseline must omit Checkpoint startup/capture flags and metadata, while the
+candidate must use the new mode and distinct UUID v7 identities. Both modes publish
+through the same public UDS export API with a 1,200-second client budget; this
+avoids the older CLI's fixed 30-second timeout without changing its server.
+
+Both runs use the same Build request and filesystem capacity (the largest selected
+payload plus 2 GiB). The default samples are 0/1 GiB dense data and a 1 GiB sparse
+file with 64 MiB mapped payload; zero still includes guest/filesystem writes.
+`--sizes 10` explicitly selects a larger run after memory and free-space checks.
+The serial test configures the controller's startup factor to 0.8 so its 6 GiB
+Build fits developer hosts; production defaults and physical-memory detection
+are unchanged. Startup metadata and encryption can change template identity.
+
+Build preparation is timed separately from Create, Pause, hot/cold resume,
+publication and Create from a published template. Each restore verifies data,
+including after deleting the source. Full SHA-256 verification separately records
+cache preparation, hashing and host elapsed time, with a size-based bounded
+budget. After hashing, a separately timed guest
+sync/cache-drop fixes the file-cache condition before capture; normal Pause
+policy remains unchanged. Direct reads separately measure the first payload
+page and a 256-page working set after readiness. A second cold Pause has no
+explicit intervening payload write, although guest housekeeping can still write.
+These timings do not isolate internal Drain, index registration or DIFF Open.
+
+A fully initialized 128 MiB workload compares a real publisher retaining a fixed
+version with the same guest after publication, version release and observed
+physical reclamation. It performs sequential/random 4 KiB writes, 2 MiB hot-set
+writes, sector-aligned 512-byte partial-page writes and mixed reads/writes with
+`O_DIRECT|O_DSYNC`, QD1. Retained and released stages use different 64 MiB halves;
+the retained half alternates between rounds. Each half contains five disjoint
+12 MiB regions. Thus the released stage first overwrites previously untouched
+payload pages, rather than repeating writes to pages already privatized while
+retained. Recorded offsets distinguish this `fresh-v3` protocol from earlier
+same-address samples, which must not be pooled with it.
+
+Unsupported direct I/O fails explicitly. The default 1,024 operations per pattern
+retain raw syscall latency, read/write p50/p95/p99 and throughput. Throughput also
+includes deterministic buffer generation. Both states use the same relative
+address seed and different content to force writes. Retention always runs first;
+cache, index, allocator, ordering and background-GC effects remain, so this is not
+an isolated causal measurement of Delete. Use `--rounds 3` for repeated samples;
+`--skip-lifecycle` or `--skip-workloads` selects one group.
+
+`checkpoint-platform.jsonl` reports BaseDir/RunDir and DIFF allocation separately.
+Workload observations sample runtime-unit RSS/cgroup memory and `/proc/PID/io`/
+cgroup `io.stat` every 250 ms, retaining counter resets and before/after deltas.
+The sampled memory maximum is not a process peak. Shared caches, Store output
+and the node daemon are outside these scopes. Short workload I/O deltas are not
+a physical-media write-amplification ratio. Report source revisions, filesystem,
+cache conditions, raw samples and these limits with any comparison.
 
 ##### Managed checkpoint history and selective cleanup
 
@@ -1494,7 +1613,7 @@ Selection uses complete source bindings and physical Bundle membership before
 comparing paths. A named location or external template is a boundary even if its
 files are on this host, including a mapping to the same pathname. The boundary
 and remaining lower refs preserve their order. Local tarstream, Bundle, and mixed
-carriers follow the same rules. Writable disk chains always absorb their eligible
+carriers follow the same rules. Ordinary copied writable disk captures absorb their eligible
 same-device local prefix, independently of the memory flag; immutable EROFS bases
 remain separate from ext4 uppers. Data and opaque Zero override lower layers;
 Hole falls through. Historical reads use host artifact streams, never the guest
@@ -1559,6 +1678,25 @@ Missing candidates count as finished; permission, I/O, and identity errors retai
 retry ownership. Ordinary Kill and terminal BuildBaseDir deletion retain their
 existing finalizers. Shared/external artifacts are never reclaimed by this step.
 
+##### Releasing disk versions after Resume
+
+Running disk-version release is separate from the paused artifact-file cleanup
+above. Successful running admission, actual export completion and startup adoption
+request a shared release check. It reloads current state and exact runtime/path
+ownership, and only a running sandbox without a terminal execution result or a
+source operation still using its checkpoint may release versions. Starting,
+failed resume rolled back to paused, and an unresumed `keepSource` retain them.
+
+The check uses sandboxer's complete List result and deletes those exact
+`{DiffID, ID}` references. Partial or uncertain Delete retries keep the same set;
+a different runtime cannot inherit that selection. Errors are logged and retried
+with bounded calls and backoff, without rolling back a successful launch or
+publication. This does not run `checkpoint-cleanup`, remove the DIFF directory or
+delete memory dependencies. Delete makes old versions reclaimable; physical space
+returns through sandboxer's subsequent GC rather than synchronously. A retained
+`ResumeSource` field in a running row therefore does not guarantee that a later
+failed capture can return to that old pause point.
+
 #### 8.1.2 Resume admission, Connect and Wake
 
 Connect accepts a bounded strict JSON object with timeout and optional bool/null memory. The upstream Connect reference checked on 2026-09-07 also exposes memory; Kuasar's exact source-dependent rules below define local behavior rather than claiming complete upstream policy equivalence. Omitted/null maps to ResumeAuto, true to ResumeMemory, false to ResumeCold:
@@ -1608,6 +1746,12 @@ sandbox-ctl publish --json --quiet --manifest-config <cfg> [--to-ref-location <n
 ```
 
 The publication adapter consumes and validates the JSON report while preserving ResumeSource kind. Without a named parent, it publishes to Manifest Store. With checkpoint.remote.ref_location_parent, name is the entity id — the sandbox StableID for E/S publication, the BuildID for build publication (see reflocation.PublicationName) — and URI is `<parent>/<sha256(name)[0:2]>/<sha256(name)[2:4]>/<name>`. Tarstream results are located sandbox/snapshot refs using digest or hmac identity; Bundle results use manifest root selectors. Manifest config is supplied even for named publication because exact Bundle publication validates its Manifest graph. Bundle→Store verifies recorded admission, physical digest and salt domain and commits root last.
+
+For a local disk Checkpoint source, sandboxer materializes the fixed versions into
+ordinary portable disk artifacts and removes `checkpoint.json` from the published
+E. The original local source is unchanged. Publish before moving the result to
+another node or rolling back to a reader that does not understand Checkpoint E;
+copying its metadata alone does not transfer the local DIFF contents.
 
 The name itself is the directory key: every publication of one logical entity — retries, process restarts, re-exports after an import changed the target id, cluster generations — converges on one directory where content-addressed `<digest>.<role>` files accumulate as versions and same-content files are deduplicated by the publisher. Two SHA-256 fan-out levels limit entries. Callers track portable refs, TemplateIDs and migration tokens and own the retention and deletion policies for published artifacts. Publication age alone does not establish that an artifact is no longer referenced. The project provides references and their changes; external retention and deletion are outside node lifecycle. Conductor/tasks share deterministic internal/reflocation resolution; the location name is self-sufficient without side tables.
 
@@ -1687,12 +1831,28 @@ Paused E promotes to sbx, S to snp; E is not rejected for lacking memory. Build 
 
 KMT V1 directly contains resumeSourceKind, resumeSourceRef, resumeSandboxRef and autoPauseMemory. Snapshot requires its exact associated E in resumeSandboxRef; E-only requires that field to be empty. Missing fields, duplicate/unknown JSON and invalid combinations are rejected, including old Snapshot tokens without E. Target expectations compare both S and E. Import performs no artifact access and atomically restores the complete pair, deadline, portable env/metadata and existing ServiceSecret/Envd/Traffic/Forward credentials. Destination retrieves roots from trusted local allowlist and verifies fingerprints/runtime digest/profile. Token contains no raw tenant roots, host paths, MMDS secret values, cluster group/route key or generation.
 
+Export admission completes outstanding paused cleanup before registering the
+attempt or starting publication. A private source-operation lock outside the
+checkpoint directory is shared by capture, cleanup, export, disk-version release
+and terminal resource removal. Publisher, capture CLI and `checkpoint-cleanup`
+inherit its descriptor, so conductor cancellation or exit does not release their
+protection before the actual child exits. The lock file stays with BaseDir until
+terminal directory removal; it must not be independently unlinked or replaced.
+Contention is retried outside the SID lifecycle lock with current state and paths.
+An already clean source can resume while publication runs, but release and
+terminal deletion wait for source use to finish. Cancellation alone is not proof
+of completion. Normal completion, confirmed runtime disappearance and explicit
+deletion share the source-protected resource cleanup; retained dead history and
+execution results keep their existing business meaning.
+
 Publish does not hold a long lifecycle lock. After validating the result, Export
 checks the complete original S/E pair, source instance and export attempt under
 the per-SID lifecycle lock. Resume winning `BeginResume` cancels KMT export with
 409; template publication can finish detached and return its ID without source
-cleanup. If Export wins finalization, `keepSource` leaves the source untouched:
-same ResumeSource, row, cache, route and checkpoint. A later move from that
+cleanup. If Export wins finalization, `keepSource` preserves the original
+ResumeSource and its necessary checkpoint artifacts after admission has completed
+pending paused cleanup and durably cleared that ownership. Publication finalization
+does not rewrite the retained source. A later move from that
 retained source uses the same deletion path as any other move.
 
 Without `keepSource`, Export validates local path ownership and calls the normal

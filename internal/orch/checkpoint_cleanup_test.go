@@ -97,7 +97,7 @@ func TestCheckpointCleanupExportFenceAndStaleSource(t *testing.T) {
 	if !ok {
 		t.Fatal("claim export")
 	}
-	if err := f.o.finalizePausedCleanupOnce(f.sb.ID); err == nil || !strings.Contains(err.Error(), "export still owns source") {
+	if err := f.o.finalizePausedCleanupOnce(f.sb.ID); !errors.Is(err, errSourceOperationBusy) {
 		t.Fatalf("active export not fenced: %v", err)
 	}
 	// Detached template publishers retain the same source until Finish closes the

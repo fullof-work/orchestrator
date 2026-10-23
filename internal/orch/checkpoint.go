@@ -32,9 +32,11 @@ func (o *Orchestrator) cleanupCheckpoint(ctx context.Context, sb *types.Sandbox)
 	}
 	// An export can retain this source while publishing outside the lock. Do not
 	// wait for its completion here: publication needs this lock to finalize.
-	if o.exports.ActiveDone(sb.ID) != nil {
-		return fmt.Errorf("orch: checkpoint cleanup %s: export still owns source", sb.ID)
+	ctx, release, err := o.trySourceOperation(ctx, sb)
+	if err != nil {
+		return err
 	}
+	defer release()
 	// Legacy/recovered rows may have no checkpoint directory. There are then no
 	// candidates to remove; an I/O or identity failure is not equivalent.
 	if _, err := os.Lstat(dir); os.IsNotExist(err) {
@@ -52,6 +54,7 @@ func (o *Orchestrator) cleanupCheckpoint(ctx context.Context, sb *types.Sandbox)
 	args = append(args, "--from", e)
 	args = append(args, "--ref-location-parent", o.cfg.Checkpoint.Remote.RefLocationParent)
 	cmd := exec.CommandContext(ctx, o.executables.OrchestratorCtl(), args...)
+	inheritSourceOperation(ctx, cmd)
 	cmd.Env = append(os.Environ(), "MANIFEST_KEY="+sb.ManifestKey)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr

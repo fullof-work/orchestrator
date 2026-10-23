@@ -44,14 +44,23 @@ assert_export_argv() { # $1=index, remaining args=expected argv
     local index="$1"
     shift
     python3 - "$EXPORT_ARGV_LOG" "$index" "$@" <<'PY'
-import json, sys
+import json, sys, uuid
 path, index, expected = sys.argv[1], int(sys.argv[2]), sys.argv[3:]
 with open(path, encoding="utf-8") as source:
     calls = [json.loads(line) for line in source if line.strip()]
 if index >= len(calls):
     raise SystemExit(f"missing export call {index}; captured {len(calls)}")
-if calls[index] != expected:
-    raise SystemExit(f"export call {index}={calls[index]!r}, want {expected!r}")
+call = calls[index].copy()
+if call.count("--checkpoint") != 1:
+    raise SystemExit(f"export call has no unique named Checkpoint: {call!r}")
+at = call.index("--checkpoint")
+raw = call[at + 1]
+identity = uuid.UUID(raw)
+if identity.version != 7 or identity.variant != uuid.RFC_4122 or str(identity) != raw:
+    raise SystemExit(f"invalid Checkpoint UUID v7: {raw!r}")
+del call[at:at + 2]
+if call != expected:
+    raise SystemExit(f"export call {index}={calls[index]!r}, want {expected!r} plus a Checkpoint ID")
 PY
 }
 
@@ -64,6 +73,8 @@ with open(path, encoding="utf-8") as source:
 if index >= len(calls):
     raise SystemExit(f"missing run call {index}; captured {len(calls)}")
 call = calls[index]
+if call.count("--enable-checkpoint") != 1:
+    raise SystemExit(f"run did not enable Checkpoint exactly once: {call!r}")
 
 def option(name):
     for i, arg in enumerate(call):
@@ -119,14 +130,23 @@ assert_snapshot_argv() { # $1=index, remaining args=expected argv
     local index="$1"
     shift
     python3 - "$SNAPSHOT_ARGV_LOG" "$index" "$@" <<'PY'
-import json, sys
+import json, sys, uuid
 path, index, expected = sys.argv[1], int(sys.argv[2]), sys.argv[3:]
 with open(path, encoding="utf-8") as source:
     calls = [json.loads(line) for line in source if line.strip()]
 if index >= len(calls):
     raise SystemExit(f"missing snapshot call {index}; captured {len(calls)}")
-if calls[index] != expected:
-    raise SystemExit(f"snapshot call {index}={calls[index]!r}, want {expected!r}")
+call = calls[index].copy()
+if call.count("--checkpoint") != 1:
+    raise SystemExit(f"snapshot call has no unique named Checkpoint: {call!r}")
+at = call.index("--checkpoint")
+raw = call[at + 1]
+identity = uuid.UUID(raw)
+if identity.version != 7 or identity.variant != uuid.RFC_4122 or str(identity) != raw:
+    raise SystemExit(f"invalid Checkpoint UUID v7: {raw!r}")
+del call[at:at + 2]
+if call != expected:
+    raise SystemExit(f"snapshot call {index}={calls[index]!r}, want {expected!r} plus a Checkpoint ID")
 PY
 }
 
@@ -136,7 +156,7 @@ import json, sys
 with open(sys.argv[1], encoding="utf-8") as source:
     calls = [json.loads(line) for line in source if line.strip()]
 call = calls[int(sys.argv[2])]
-bad = [arg for arg in call if arg.startswith("--merge-ref=") or arg.startswith("--drop-caches=")]
+bad = [arg for arg in call if arg == "--checkpoint" or arg.startswith("--checkpoint=") or arg.startswith("--merge-ref=") or arg.startswith("--drop-caches=")]
 if bad:
     raise SystemExit(f"builder snapshot unexpectedly received checkpoint policy flags: {bad!r}")
 PY

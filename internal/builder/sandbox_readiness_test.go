@@ -211,6 +211,8 @@ func TestPhaseSandboxSourceArgumentsSeparateMaterializationAndMemoryCapture(t *t
 		replaceBoot bool
 		wantReplace bool
 	}{
+		{name: "image import", phase: "a"},
+		{name: "image build steps", phase: "b"},
 		{name: "image cold run", phase: "c"},
 		{name: "source materialization", phase: "b", from: source},
 		{name: "source memory capture", phase: "c", from: source, replaceBoot: true, wantReplace: true},
@@ -219,8 +221,11 @@ func TestPhaseSandboxSourceArgumentsSeparateMaterializationAndMemoryCapture(t *t
 		t.Run(test.name, func(t *testing.T) {
 			args := phaseSandboxRunArgs(spec, test.phase, "phase-sandbox", "/run/build/sandbox.yaml", nil, test.from, test.replaceBoot)
 			hasReplace, hasRestore, fromValue := false, false, ""
+			checkpointFlags := 0
 			for i, arg := range args {
 				switch arg {
+				case "--enable-checkpoint":
+					checkpointFlags++
 				case "--replace-boot":
 					hasReplace = true
 				case "--restore":
@@ -231,7 +236,7 @@ func TestPhaseSandboxSourceArgumentsSeparateMaterializationAndMemoryCapture(t *t
 					}
 				}
 			}
-			if hasRestore || hasReplace != test.wantReplace || fromValue != test.from {
+			if checkpointFlags != 0 || hasRestore || hasReplace != test.wantReplace || fromValue != test.from {
 				t.Fatalf("phase args = %#v; from=%q replace=%t restore=%t", args, fromValue, hasReplace, hasRestore)
 			}
 		})

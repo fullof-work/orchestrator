@@ -54,20 +54,27 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 	})
 
 	var (
-		source  *types.Sandbox
-		tmpl    types.TemplateID
-		attempt *exportAttempt
+		source        *types.Sandbox
+		tmpl          types.TemplateID
+		attempt       *exportAttempt
+		releaseSource func()
 	)
 	defer func() {
 		stopLifecycle()
 		cancelUpload(nil)
+		if releaseSource != nil {
+			releaseSource()
+		}
 		o.exports.Finish(attempt)
+		if attempt != nil {
+			o.requestDiskCheckpointRelease(sid)
+		}
 		finishOperation()
 	}()
 	for {
-		unlock, err := o.lockLifecycleMutation(opCtx, sid)
+		guardCtx, unlock, err := o.lockLifecycleMutation(opCtx, sid)
 		if err != nil {
-			return types.ExportResult{}, context.Cause(opCtx)
+			return types.ExportResult{}, err
 		}
 		sb, err := o.st.Get(opCtx, sid)
 		if err != nil {
@@ -78,7 +85,7 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 			unlock()
 			return types.ExportResult{}, api.ErrNotFound
 		}
-		if sb.State != types.StatePaused || !sb.ResumeSource.Valid() {
+		if sb.State != types.StatePaused || !sb.ResumeSource.Valid() || sb.ExecutionResult != nil {
 			unlock()
 			return types.ExportResult{}, fmt.Errorf("export-sandbox: pause %s first (e2b sandbox pause %s): %w", sid, sid, api.ErrBadRequest)
 		}
@@ -91,14 +98,41 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 			unlock()
 			return types.ExportResult{}, fmt.Errorf("export-sandbox: sandbox profile %q does not match template profile %q", sb.Profile, tmpl.Profile)
 		}
+		if !types.IsPortableRef(sb.ResumeSource.Ref) {
+			if _, err := o.ownedLocalArtifactDir(sb, sb.ResumeSource); err != nil {
+				unlock()
+				return types.ExportResult{}, err
+			}
+			if g := sourceGrant(guardCtx); g == nil || g.file == nil {
+				unlock()
+				return types.ExportResult{}, fmt.Errorf("export-sandbox: local source BaseDir is missing")
+			}
+		}
 
+		// Retire paused runner/artifact ownership before publication owns the
+		// source. Resume can then proceed without waiting for this upload.
+		beforeRunID, beforePort, beforeRunDir := sb.RunID, sb.VswitchPort, sb.RunDir
+		cleanupErr := o.cleanupPausedOwnership(guardCtx, sb)
+		o.recordPausedCleanupProgress(sb, beforeRunID, beforePort, beforeRunDir)
+		if cleanupErr != nil {
+			o.startPausedCleanupRetry(sid)
+			unlock()
+			return types.ExportResult{}, fmt.Errorf("export-sandbox: paused source cleanup: %w", cleanupErr)
+		}
 		source = cloneSandbox(sb)
+		opCtx, releaseSource, err = retainSourceOperation(guardCtx)
+		if err != nil {
+			unlock()
+			return types.ExportResult{}, err
+		}
 		var started bool
 		attempt, started = o.exports.Begin(sid, source.ResumeSource, toTemplate, cancelUpload)
 		unlock()
 		if started {
 			break
 		}
+		releaseSource()
+		releaseSource = nil
 	}
 
 	// Phase one only publishes and prepares the immutable result. It never
@@ -218,7 +252,7 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 	if err != nil {
 		return types.ExportResult{}, err
 	}
-	if current == nil || current.State != types.StatePaused || current.ResumeSource != attempt.source ||
+	if current == nil || current.State != types.StatePaused || current.ExecutionResult != nil || current.ResumeSource != attempt.source ||
 		current.CreatedUnix != source.CreatedUnix || current.TemplateID != source.TemplateID ||
 		current.StableID() != source.StableID() {
 		return types.ExportResult{}, exportPreemptedError(sid)
@@ -230,11 +264,9 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 	o.log.Info("export won source finalization", "sid", sid, "export_kind", exportKind, "keep_source", keepSource)
 
 	if keepSource {
-		// Retain the source unchanged: keep-source produces an export result
-		// (template id or KMT token) but does not modify the source sandbox's
-		// ResumeSource, row, cache, or route, and does not remove its
-		// checkpoint. The source resumes from exactly where it would have
-		// resumed without the export (#336).
+		// Admission has already completed any pending paused cleanup. This
+		// finalization retains its ResumeSource and required artifacts, so the
+		// source still resumes from the same paused state after publication.
 		return response, nil
 	}
 	if err := o.validateSandboxCleanupPaths(current); err != nil {

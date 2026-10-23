@@ -1051,10 +1051,12 @@ func (s *Store) CommitRunningPaused(ctx context.Context, id, runID string, sourc
 	if !source.Valid() {
 		return false, fmt.Errorf("store: commit running paused sandbox %s: invalid resume source", id)
 	}
+	// Result receipt does not wait for the lifecycle lock held by capture. An
+	// accepted terminal result must win even when capture started earlier.
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE sandboxes
 		   SET state=?, resume_source_kind=?, resume_source_ref=?, resume_sandbox_ref=?, launch_mode='', running_since_ns=0, pause_reason=CASE WHEN resource_obligation=1 THEN 'resource-pressure' ELSE 'explicit' END, pressure_version=pressure_version+1
-		 WHERE id=? AND state=? AND run_id=?`,
+		 WHERE id=? AND state=? AND run_id=? AND sandbox_result_run_id=''`,
 		string(types.StatePaused), string(source.Kind), source.Ref, source.SandboxRef, id, string(types.StateRunning), runID)
 	if err != nil {
 		return false, fmt.Errorf("store: commit running paused sandbox %s: %w", id, err)

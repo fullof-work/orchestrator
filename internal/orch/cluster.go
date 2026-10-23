@@ -1053,7 +1053,7 @@ func clusterConnectResult(sb *types.Sandbox) (*routesync.ConnectResult, error) {
 // owner before ACK. Physical cleanup remains asynchronous in the common
 // finalizer started by acceptSandboxDeleteLocked.
 func (o *Orchestrator) acceptClusterDelete(ctx context.Context, cmd *routesync.Command) error {
-	unlock, err := o.lockLifecycleMutation(ctx, cmd.SID)
+	ctx, unlock, err := o.lockLifecycleMutation(ctx, cmd.SID)
 	if err != nil {
 		return err
 	}
@@ -1091,7 +1091,7 @@ func (o *Orchestrator) acceptClusterDelete(ctx context.Context, cmd *routesync.C
 		return fmt.Errorf("%w: extension removed delete candidate", api.ErrBadRequest)
 	}
 
-	unlock, err = o.lockLifecycleMutation(ctx, cmd.SID)
+	ctx, unlock, err = o.lockLifecycleMutation(ctx, cmd.SID)
 	if err != nil {
 		return err
 	}

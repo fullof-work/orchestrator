@@ -89,6 +89,7 @@ func TestSandboxLaunchSpecColdBootHasNoRestoreArg(t *testing.T) {
 func assertSandboxPathArgs(t *testing.T, cfg *config.Config, sb *types.Sandbox, spec *configsock.LaunchSpec) {
 	t.Helper()
 	if spec.Workdir != sb.RunDir ||
+		!hasArg(spec.Args, "--enable-checkpoint") ||
 		!hasArgPair(spec.Args, "--path-id", sb.ID) ||
 		!hasArgPair(spec.Args, "--run-root", nodepath.SandboxRunRoot(cfg.Paths.RunRoot)) ||
 		!hasArgPair(spec.Args, "--base-root", nodepath.SandboxBaseRoot(cfg.Paths.BaseRoot)) {

@@ -7,6 +7,9 @@ RUN_ARGV_LOG="$WORK/run-argv.jsonl"
 PAUSE_BARRIER_TARGET="$WORK/pause-barrier-target"
 PAUSE_BARRIER_REACHED="$WORK/pause-barrier-reached"
 PAUSE_BARRIER_RELEASE="$WORK/pause-barrier-release"
+PUBLISH_BARRIER_TARGET="$WORK/publish-barrier-target"
+PUBLISH_BARRIER_REACHED="$WORK/publish-barrier-reached"
+PUBLISH_BARRIER_RELEASE="$WORK/publish-barrier-release"
 mkdir -p "$ORCH_BIN_DIR"
 cp "$BIN/node-ctl" "$ORCH_BIN_DIR/node-ctl"
 for b in connector-ctl flatten-ctl manifest-ctl; do
@@ -23,6 +26,18 @@ with open(sys.argv[1], "a", encoding="utf-8") as output:
 PY
 fi
 path_id=""
+if [ "\${1:-}" = "publish" ] && [ -f "$PUBLISH_BARRIER_TARGET" ]; then
+    target="\$(cat "$PUBLISH_BARRIER_TARGET")"
+    for arg in "\$@"; do
+        case "\$arg" in
+            "file://\$target/"*|"\$target/"*)
+                : > "$PUBLISH_BARRIER_REACHED"
+                while [ ! -e "$PUBLISH_BARRIER_RELEASE" ]; do sleep 0.02; done
+                break
+                ;;
+        esac
+    done
+fi
 if [ "\${1:-}" = "snapshot" ] && [ -f "$PAUSE_BARRIER_TARGET" ]; then
     previous=""
     for arg in "\$@"; do

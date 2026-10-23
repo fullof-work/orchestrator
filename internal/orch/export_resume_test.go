@@ -76,6 +76,7 @@ type exportResumeFixture struct {
 
 func newExportResumeFixture(t *testing.T) exportResumeFixture {
 	t.Helper()
+	installExportCheckpointCleanup(t)
 	dir := shortOrchestratorTestDir(t)
 	runtimePath := filepath.Join(dir, "runtime.erofs")
 	if err := os.WriteFile(runtimePath, []byte("runtime"), 0o644); err != nil {
@@ -89,6 +90,22 @@ func newExportResumeFixture(t *testing.T) exportResumeFixture {
 	cfg.Paths.BaseRoot = filepath.Join(dir, "lib")
 	lc := &countingLauncher{}
 	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+	ctx, stop := context.WithCancel(ctx)
+	o.SetLifecycleContext(ctx)
+	t.Cleanup(func() {
+		// A durable running row precedes launch completion and checkpoint
+		// release. Drain both owners before the shared fixture closes SQLite
+		// or removes the directories they may still use.
+		stop()
+		drainCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := o.DrainLaunches(drainCtx); err != nil {
+			t.Errorf("drain export fixture launches: %v", err)
+		}
+		if err := o.DrainPauses(drainCtx); err != nil {
+			t.Errorf("drain export fixture accepted work: %v", err)
+		}
+	})
 
 	manifestKey := strings.Repeat("6", 64)
 	apiSecret, apiKey := defaultTestCredentials(t, manifestKey)
@@ -109,6 +126,9 @@ func newExportResumeFixture(t *testing.T) exportResumeFixture {
 		DeadlineUnix: time.Now().Add(time.Hour).Unix(),
 	}
 	materializeTestSandboxCredentials(t, sb)
+	if err := os.MkdirAll(sb.BaseDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	if err := o.st.Put(ctx, sb); err != nil {
 		t.Fatal(err)
 	}
@@ -147,15 +167,30 @@ func waitExportResult(t *testing.T, done <-chan asyncExportResult) asyncExportRe
 
 func assertLocalResumeWon(t *testing.T, fixture exportResumeFixture) {
 	t.Helper()
-	stored := waitForSandbox(t, fixture.o, fixture.ctx, fixture.sb.ID, func(current *types.Sandbox) bool {
-		return current.State == types.StateRunning
-	}, "running after export-time resume")
+	stored := fixture.waitForRunning(t, "running after export-time resume")
 	if stored.ResumeSource != (types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: fixture.localRef}) {
 		t.Fatalf("resumed source = %+v, want local snapshot %q", stored.ResumeSource, fixture.localRef)
 	}
 	if _, err := os.Stat(fixture.localRef); err != nil {
 		t.Fatalf("resume-winning export removed local snapshot: %v", err)
 	}
+}
+
+func (fixture exportResumeFixture) waitForRunning(t *testing.T, description string) *types.Sandbox {
+	t.Helper()
+	// Wait for the actual launch owner, rather than continuously competing
+	// with its commits through SQLite polling. A failed launch is reported at
+	// its completion boundary instead of appearing as a stale starting row.
+	waitCtx, cancel := context.WithTimeout(fixture.ctx, 3*time.Second)
+	defer cancel()
+	if _, err := fixture.o.launches.Wait(waitCtx, fixture.sb.ID); err != nil {
+		t.Fatalf("launch did not complete for %s: %v (runner error: %v)", description, err, fixture.launcher.taskError())
+	}
+	stored, err := fixture.o.st.Get(fixture.ctx, fixture.sb.ID)
+	if err != nil || stored == nil || stored.State != types.StateRunning {
+		t.Fatalf("sandbox did not become %s: %+v, %v", description, stored, err)
+	}
+	return stored
 }
 
 func TestExportResumeDuringPublish(t *testing.T) {
@@ -376,7 +411,7 @@ func TestTemplateExportDeletesPortableUnkeptSource(t *testing.T) {
 	}
 }
 
-func TestExportDeleteTeardownFailureRetriesAfterAcceptance(t *testing.T) {
+func TestExportPausedTeardownFailureRejectsPublicationAndRetriesCleanup(t *testing.T) {
 	dir := t.TempDir()
 	o := migrationOrchestrator(t, dir, []byte("runtime"))
 	o.cfg.Units.Runner = "sandbox-runner@.service"
@@ -388,7 +423,9 @@ func TestExportDeleteTeardownFailureRetriesAfterAcceptance(t *testing.T) {
 
 	manifestKey := strings.Repeat("8", 64)
 	_, apiKey := defaultTestCredentials(t, manifestKey)
-	sb := migrationSandbox(t, dir, "teardown-retry-source", manifestKey, "manifest://"+strings.Repeat("4", 64))
+	localRef := makeLocalSnapshot(t, dir, "teardown-retry-source")
+	portableRef := "manifest://" + strings.Repeat("4", 64)
+	sb := migrationSandbox(t, dir, "teardown-retry-source", manifestKey, localRef)
 	sb.RunID = "sr-00000000-0000-7000-8000-000000000008"
 	o.runs.restore(sb.RunID, instanceUnit(o.cfg.Units.Runner, sb.RunID))
 	sb.VswitchPort = "teardown-retry-port"
@@ -399,15 +436,33 @@ func TestExportDeleteTeardownFailureRetriesAfterAcceptance(t *testing.T) {
 		t.Fatal(err)
 	}
 	o.cache(sb)
+	publishCalls := 0
+	o.artifactPublisher = func(_ context.Context, _ *types.Sandbox, source types.ResumeSource) (artifact.PublishReport, error) {
+		publishCalls++
+		return testPublicationReport(source.Kind, portableRef), nil
+	}
 
 	result, err := o.exportSandboxTokenForTest(context.Background(), apiKey, sb.ID, true, false)
-	if err != nil {
-		t.Fatalf("export acceptance: %v", err)
+	if !errors.Is(err, stopErr) || result != "" || publishCalls != 0 {
+		t.Fatalf("failed admission published or accepted a result: %q, %v, calls=%d", result, err, publishCalls)
 	}
-	// Cleanup failure belongs to the durable delete worker; no second Export
-	// request is needed to retry it.
+	// The paused worker retries old ownership without publishing or deleting
+	// the source. A subsequent export can then obtain its normal result.
+	prepared := waitForSandbox(t, o, context.Background(), sb.ID, func(current *types.Sandbox) bool {
+		return current.State == types.StatePaused && !pausedCleanupPending(current)
+	}, "paused source cleanup after rejected export")
+	if prepared.ResumeSource != sb.ResumeSource || publishCalls != 0 || o.exports.ActiveDone(sb.ID) != nil {
+		t.Fatal("cleanup retry changed source or admitted a publisher")
+	}
+	if _, err := os.Stat(localRef); err != nil {
+		t.Fatalf("cleanup retry lost retained checkpoint: %v", err)
+	}
+	result, err = o.exportSandboxTokenForTest(context.Background(), apiKey, sb.ID, true, false)
+	if err != nil || publishCalls != 1 {
+		t.Fatalf("export after paused cleanup: %q, %v, calls=%d", result, err, publishCalls)
+	}
 	waitForExportDeletion(t, o, sb.ID)
-	if template, parseErr := types.ParseTemplateID(result); parseErr != nil || template.Ref != sb.ResumeSource.Ref {
+	if template, parseErr := types.ParseTemplateID(result); parseErr != nil || template.Ref != portableRef {
 		t.Fatalf("retry template result = %#v, %v", template, parseErr)
 	}
 	stored, getErr := o.st.Get(context.Background(), sb.ID)

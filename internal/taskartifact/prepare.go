@@ -622,11 +622,11 @@ func summarizeDiskTopology(cfg *rtconfig.PortableSandboxConfig) (types.ArtifactD
 	shape := func(name string, root rtconfig.PortableRootConfig) types.ArtifactDiskShape {
 		if root.Overlay == nil {
 			return types.ArtifactDiskShape{
-				Name: name, Mode: types.ArtifactDiskSingle, HasActiveBase: root.Base != "",
+				Name: name, Mode: types.ArtifactDiskSingle, HasActiveBase: cfg.IsCheckpoint() || root.Base != "",
 			}
 		}
 		return types.ArtifactDiskShape{
-			Name: name, Mode: types.ArtifactDiskOverlay, HasActiveBase: root.Overlay.Base != "",
+			Name: name, Mode: types.ArtifactDiskOverlay, HasActiveBase: cfg.IsCheckpoint() || root.Overlay.Base != "",
 		}
 	}
 	topology := types.ArtifactDiskTopology{Root: shape("", cfg.Boot.Root)}

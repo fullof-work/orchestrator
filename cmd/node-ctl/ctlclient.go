@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 )
@@ -35,6 +36,10 @@ func resolveSocket(flagVal string) string {
 // udsDo performs one HTTP request to the control socket and returns the status code
 // and raw response body. hdr and reqBody are optional (reqBody is JSON-encoded).
 func udsDo(socket, method, path string, hdr map[string]string, reqBody any) (int, []byte, error) {
+	return udsDoWithTimeout(socket, method, path, hdr, reqBody, 30*time.Second)
+}
+
+func udsDoWithTimeout(socket, method, path string, hdr map[string]string, reqBody any, timeout time.Duration) (int, []byte, error) {
 	var rdr io.Reader
 	if reqBody != nil {
 		b, err := json.Marshal(reqBody)
@@ -53,7 +58,7 @@ func udsDo(socket, method, path string, hdr map[string]string, reqBody any) (int
 	for k, v := range hdr {
 		req.Header.Set(k, v)
 	}
-	resp, err := configsock.HTTPClient(socket).Do(req)
+	resp, err := configsock.HTTPClientWithTimeout(socket, timeout).Do(req)
 	if err != nil {
 		return 0, nil, fmt.Errorf("reach orchestrator at %s: %w (is `node-ctl conductor serve` running?)", socket, err)
 	}

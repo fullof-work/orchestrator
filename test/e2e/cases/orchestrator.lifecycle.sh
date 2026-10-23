@@ -249,8 +249,11 @@ assert_resolved_resource_yaml "$EXECUTE_RUN_ROOT/sandboxes/$SID/$SID.yaml" 2560M
     || fail "snapshot restore resource YAML did not preserve capacity and target-node defaults"
 assert_resource_lease "$SID" 2684354560 268435456 2684354560 \
     || fail "snapshot restore lease did not match generated YAML"
-[ -f "$WORK/lib/sandboxes/$SID/$SID.overlay.diff" ] \
-    || fail "Sandbox writable diff is outside BaseDir or lost logical SandboxID filename"
+# Checkpoint mode names the persistent writable disk by DiffID. Require the
+# running unit to reference that exact file, not merely a leftover in BaseDir.
+python3 "$SCRIPT_DIR/disk_checkpoint.py" live-root-disk "$WORK/lib/node-ctl.db" "$SID" "$RUNNER_PREFIX" \
+    "$WORK/lib/sandboxes/$SID" "$EXECUTE_RUN_ROOT/sandboxes/$SID" >"$WORK/live-root-disk.json" \
+    || fail "Sandbox runtime does not use its BaseDir/checkpoint/diffs writable disk"
 if find "$EXECUTE_RUN_ROOT/sandboxes/$SID" -type f \( -name '*.img' -o -name '*.diff' -o -name '*.sandbox' -o -name '*.snapshot' \) -print -quit | grep -q .; then
     find "$EXECUTE_RUN_ROOT/sandboxes/$SID" -type f -print >&2
     fail "Sandbox RunDir contains a large image/diff/checkpoint artifact"

@@ -221,6 +221,28 @@ Register-time builder.target names three outputs: `{kind:"image"}`, `{kind:"sand
 
 Every source first becomes an image or cold Sandbox E, then A/B yields this Build's top-level image. Builds never restore source S memory/VMM state: S only locates E. Final Image/E/S must not reference source S/E, writable/data disks or memory parents. A memory result permits only the S→E relation created by this Build itself.
 
+A/B/C sandboxes use single-layer writable disks (raw, or v1 when encrypted),
+without `--enable-checkpoint`. Builds do not use business pause/resume, so their
+import, build steps and final template preparation avoid the versioned backend's
+index and copy-on-write costs. The stage PathID remains `a`, `b` or `c`,
+independently of the phase SandboxID. The final template snapshot can still
+capture memory: it writes ordinary copied artifacts under
+`<BuildBaseDir>/checkpoint` without `--checkpoint`. The `checkpoint.mode`
+setting selects local/bundle artifact packaging, not the writable disk backend.
+The published template is independent of stage disks and can later start a
+managed business sandbox with Checkpoint enabled. The existing Build finalizer
+cleans owned directories after execution ownership has ended.
+
+Source preparation preserves a Checkpoint E layout through Open, Clone and
+Validate, including when S selects that E. Its fixed disk contents are materialized into independent Build storage before
+use, even though the Build runtime disables Checkpoint; they are not replaced
+by a blank template. Root-only E remains eligible for the existing
+Build inheritance path; source data disks retain their existing unsupported
+boundary. This backend change does not add source-memory restoration or expand
+the accepted Build topology. Startup preparation, first-access cost and ordinary
+template copying remain separate from the named local-Pause benefit described
+in [node capture](node.md#local-disk-checkpoints).
+
 **Conductor, once per Build:** registered/waiting creates no object directories. A durable execution claim precedes BuildRunDir=`<RunRoot>/builds/<BuildID>` and BuildBaseDir=`<BaseRoot>/builds/<BuildID>`, including checkpoint. Parse request-only spec/resource policy, allocate from builder pool, then durably bind exact run ID, starting a unit on demand if no idle one exists. Run-builder retrieves bootstrap. For SBX/SNP fromTemplate, task reads root config under cold/E-selection semantics and submits a summary; image fast path needs no second RPC. Strictly parse inherited network and merge current request; allocate one slot through TAPFD/1 PREPARE when tapfd_socket is configured, otherwise connector-ctl vswitch attach. All phases sequentially reuse that slot/tapfd. Mint envd token, then atomically write port/token and nonsecret runtime_prepare_json in one exact-run SQLite CAS. Runtime preparation schema v5 freezes the accepted root S/E pair together with the digest and source command presence for equivalent recovery; replay compares the pair as well as the digest, including after restart; only an actual Sandbox target resolves Sandbox resources, and only memory=true resolves checkpoint/instance policy. Preparation records the complete root pair and digest, resolved build/template network and independent A/B execution versus target Sandbox resources. For e2b+MMDS where the resolved target is memory Sandbox, publish a synthetic Sandbox route before handing off final BuildSpec: C may start immediately and needs floating-IP self-resolution. This route projects registration MMDS routes and initial build-owner values to the builder guest. Run-builder executes the pipeline and reports `{target, exactly-one-of image_ref|sandbox_ref|snapshot_ref, start_cmd,ready_cmd,error,failure_stage}` through config-socket. While retaining execution claim, conductor first durably stores and fail-closed validates the result against requested/auto target. Terminal derived kind is img/sbx/snp; names/aliases store `<profile>-<kind>-<base64url(portable-ref)>`. Nonterminal Build.Kind stays empty and is never a second target authority. Profile is explicit throughout registration→BuildSpec; checkpoint.mode travels as checkpoint_mode to C. Register/trigger validate request network metadata before enqueueing; strict inherited artifact metadata validation follows task summary and can fail asynchronously during preparation. Resolve network once, supplementing profile/node defaults: the same NetworkSpec derives host AttachReq and guest BuildNet. Transit fields affect host Attach only and remain absent from BuildNet; without transit they stay zero.
 
 Node config first validates publication matrix, especially that checkpoint.remote.manifest=true requires an absolute ref_location_parent. Before scanning any source image, writing large directory files or starting a VM, run-builder loads manifest_config, pins the task customer key and obtains/verifies image Bundle write admission. SBX/SNP two-stage bootstrap performs the same preflight before task-local E/S readers open the root carrier. Failure yields Build error without starting a phase or returning an artifact ref.

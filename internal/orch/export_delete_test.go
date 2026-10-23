@@ -47,6 +47,7 @@ func waitExportCleanupStep(t *testing.T, step <-chan struct{}) {
 
 func newExportDeleteFixture(t *testing.T, kind types.ResumeSourceKind, portable bool) (sandboxFinalizerFixture, context.CancelFunc) {
 	t.Helper()
+	installExportCheckpointCleanup(t)
 	fixture := newSandboxFinalizerFixture(t, "move-source")
 	o, sb := fixture.o, fixture.sb
 	o.cfg.Sandbox.Boot.Runtime = filepath.Join(filepath.Dir(fixture.dbPath), "runtime.erofs")
@@ -87,6 +88,9 @@ func newExportDeleteFixture(t *testing.T, kind types.ResumeSourceKind, portable 
 		defer stop()
 		if err := o.DrainSandboxDeletes(ctx); err != nil {
 			t.Errorf("drain fixture deletion: %v", err)
+		}
+		if err := o.acceptedOps.Drain(ctx); err != nil {
+			t.Errorf("drain fixture paused cleanup: %v", err)
 		}
 	})
 	return fixture, cancel
@@ -136,14 +140,11 @@ func TestExportMoveAcceptsCommonDeletionForEveryArtifactAndResult(t *testing.T) 
 								t.Fatalf("keep-source result = %+v, %v", kept, err)
 							}
 							stored, err := o.st.Get(ctx, sb.ID)
-							if err != nil || !reflect.DeepEqual(stored, sb) || !reflect.DeepEqual(o.lookup(sb.ID), sb) {
+							prepared := preparedExportSource(sb)
+							if err != nil || !reflect.DeepEqual(stored, prepared) || !reflect.DeepEqual(o.lookup(sb.ID), prepared) {
 								t.Fatalf("keep-source changed row/cache: %+v, %v", stored, err)
 							}
-							select {
-							case event := <-events:
-								t.Fatalf("keep-source changed route: %+v", event)
-							default:
-							}
+							assertExportPausedCleanupPublished(t, o, prepared, events, recorder)
 							if _, err := os.Stat(filepath.Join(sb.BaseDir, "checkpoint", sb.ID+".stale")); err != nil {
 								t.Fatal(err)
 							}
@@ -180,6 +181,9 @@ func TestExportMoveAcceptsCommonDeletionForEveryArtifactAndResult(t *testing.T) 
 						if o.lookup(sb.ID) != nil {
 							t.Fatal("accepted move remained cached")
 						}
+						if !keepFirst {
+							assertExportPausedCleanupPublished(t, o, preparedExportSource(sb), events, recorder)
+						}
 						select {
 						case event := <-events:
 							if event.Kind != routesync.TypeDelete || event.SID != sb.ID {
@@ -197,7 +201,7 @@ func TestExportMoveAcceptsCommonDeletionForEveryArtifactAndResult(t *testing.T) 
 							t.Fatal(err)
 						}
 						waitExportCleanupStep(t, entered)
-						deleting := assertDeletingOwnershipState(t, fixture, false)
+						deleting := assertExportDeletingOwnership(t, fixture)
 						if deleting.ResumeSource != sb.ResumeSource {
 							t.Fatal("delete acceptance rewrote the source pair")
 						}
@@ -243,7 +247,7 @@ func TestExportMoveAcceptsCommonDeletionForEveryArtifactAndResult(t *testing.T) 
 }
 
 func TestExportMoveCleanupFailureKeepsDeletingAndRetries(t *testing.T) {
-	for _, phase := range []string{"RunDir", "BaseDir", "hard-delete"} {
+	for _, phase := range []string{"BaseDir", "hard-delete"} {
 		t.Run(phase, func(t *testing.T) {
 			fixture, _ := newExportDeleteFixture(t, types.ResumeSourceSnapshot, true)
 			o, sb := fixture.o, fixture.sb
@@ -268,11 +272,7 @@ func TestExportMoveCleanupFailureKeepsDeletingAndRetries(t *testing.T) {
 				}
 				return os.RemoveAll(path)
 			}
-			if phase == "RunDir" {
-				o.removeSandboxRunDir = remove
-			} else {
-				o.removeSandboxBaseDir = remove
-			}
+			o.removeSandboxBaseDir = remove
 			if phase == "hard-delete" {
 				installStoreTrigger(t, fixture.dbPath, `CREATE TRIGGER fail_move_delete BEFORE DELETE ON sandboxes BEGIN SELECT RAISE(ABORT, 'forced hard delete failure'); END`)
 			}
@@ -281,10 +281,11 @@ func TestExportMoveCleanupFailureKeepsDeletingAndRetries(t *testing.T) {
 				t.Fatalf("accepted result = %+v, %v", result, err)
 			}
 			waitExportCleanupStep(t, entered)
-			deleting := assertDeletingOwnershipState(t, fixture, false)
+			deleting := assertExportDeletingOwnership(t, fixture)
 			if deleting.ResumeSource != sb.ResumeSource || o.lookup(sb.ID) != nil {
 				t.Fatal("cleanup failure restored or rewrote the source")
 			}
+			assertExportPausedCleanupPublished(t, o, preparedExportSource(sb), nil, recorder)
 			if kinds := recorder.sandboxKinds(); len(kinds) != 0 {
 				t.Fatalf("failed cleanup emitted observer event: %v", kinds)
 			}
@@ -310,6 +311,58 @@ func TestExportMoveCleanupFailureKeepsDeletingAndRetries(t *testing.T) {
 	}
 }
 
+func TestExportRunDirCleanupFailureRejectsPublicationAndRetries(t *testing.T) {
+	fixture, _ := newExportDeleteFixture(t, types.ResumeSourceSnapshot, false)
+	o, sb := fixture.o, fixture.sb
+	fault := errors.New("injected paused RunDir failure")
+	var calls atomic.Int32
+	entered, release := make(chan struct{}), make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(release) })
+	defer unblock()
+	o.removeSandboxRunDir = func(path string) error {
+		if calls.Add(1) == 1 {
+			return fault
+		}
+		close(entered)
+		<-release
+		return os.RemoveAll(path)
+	}
+	publishCalls := 0
+	o.artifactPublisher = func(_ context.Context, prepared *types.Sandbox, source types.ResumeSource) (artifact.PublishReport, error) {
+		publishCalls++
+		if pausedCleanupPending(prepared) {
+			t.Error("publisher received uncleared paused runtime ownership")
+		}
+		return testPublicationReport(source.Kind, "manifest://"+strings.Repeat("d", 64)), nil
+	}
+	result, err := o.ExportSandbox(context.Background(), fixture.apiKey, sb.ID, false, false)
+	if !errors.Is(err, fault) || result.Result != "" || publishCalls != 0 {
+		t.Fatalf("failed cleanup reached publication: %+v, %v, calls=%d", result, err, publishCalls)
+	}
+	waitExportCleanupStep(t, entered)
+	current, err := o.st.Get(context.Background(), sb.ID)
+	if err != nil || current == nil || current.State != types.StatePaused || current.RunDir != sb.RunDir || current.RunID != "" || current.VswitchPort != "" || current.ResumeSource != sb.ResumeSource || current.BaseDir != sb.BaseDir {
+		t.Fatalf("failed cleanup lost paused retry owner: %+v, %v", current, err)
+	}
+	if o.exports.ActiveDone(sb.ID) != nil {
+		t.Fatal("failed cleanup registered an export")
+	}
+	if _, err := os.Stat(filepath.Join(sb.BaseDir, "checkpoint", sb.ID+".snapshot")); err != nil {
+		t.Fatalf("failed cleanup lost retained checkpoint: %v", err)
+	}
+	unblock()
+	waitForSandbox(t, o, context.Background(), sb.ID, func(current *types.Sandbox) bool {
+		return current.State == types.StatePaused && !pausedCleanupPending(current)
+	}, "paused RunDir cleanup retry")
+	if result, err := o.ExportSandbox(context.Background(), fixture.apiKey, sb.ID, false, false); err != nil || result.Validate() != nil || publishCalls != 1 {
+		t.Fatalf("export after cleanup retry: %+v, %v, calls=%d", result, err, publishCalls)
+	}
+	waitForExportDeletion(t, o, sb.ID)
+	if calls.Load() != 2 {
+		t.Fatalf("RunDir cleanup ran %d times, want initial failure and live retry", calls.Load())
+	}
+}
+
 func TestExportMoveReconcilesAcceptedDeletionAfterRestart(t *testing.T) {
 	fixture, stop := newExportDeleteFixture(t, types.ResumeSourceSnapshot, true)
 	attempted := make(chan struct{}, 1)
@@ -331,7 +384,7 @@ func TestExportMoveReconcilesAcceptedDeletionAfterRestart(t *testing.T) {
 	if err := fixture.o.DrainSandboxDeletes(ctx); err != nil {
 		t.Fatal(err)
 	}
-	assertDeletingOwnershipState(t, fixture, false)
+	assertExportDeletingOwnership(t, fixture)
 	// Reopen the same isolated database, without the old process's worker map.
 	restarted := testOrchCfgAt(t, fixture.o.cfg, fixture.dbPath)
 	restarted.lc = &sandboxFinalizerLauncher{unit: fixture.lc.unit, state: "inactive"}
@@ -377,6 +430,7 @@ func TestExportMoveCancellationAfterAcceptanceKeepsResult(t *testing.T) {
 	unlock := sync.OnceFunc(o.deleteMu.Unlock)
 	defer unlock()
 	done := startExport(o, ctx, fixture.apiKey, sb.ID, false, false)
+	assertExportPausedCleanupPublished(t, o, preparedExportSource(sb), events, nil)
 	select {
 	case event := <-events:
 		if event.Kind != routesync.TypeDelete || event.SID != sb.ID {
@@ -392,7 +446,7 @@ func TestExportMoveCancellationAfterAcceptanceKeepsResult(t *testing.T) {
 		t.Fatalf("post-acceptance cancellation lost result: %v", out.err)
 	}
 	waitExportCleanupStep(t, entered)
-	assertDeletingOwnershipState(t, fixture, false)
+	assertExportDeletingOwnership(t, fixture)
 	unblock()
 	waitForExportDeletion(t, o, sb.ID)
 }
@@ -499,7 +553,7 @@ func TestExportMoveRejectsUnownedCleanupPathsBeforeAcceptance(t *testing.T) {
 	}
 }
 
-func TestExportMoveDeleteAcceptanceFailureHasNoCleanupEffects(t *testing.T) {
+func TestExportMoveDeleteAcceptanceFailurePreservesPreparedSource(t *testing.T) {
 	for _, kind := range []types.ResumeSourceKind{types.ResumeSourceSnapshot, types.ResumeSourceSandbox} {
 		for _, portable := range []bool{false, true} {
 			for _, template := range []bool{false, true} {
@@ -519,12 +573,14 @@ func TestExportMoveDeleteAcceptanceFailureHasNoCleanupEffects(t *testing.T) {
 						t.Fatalf("rejected acceptance = %+v, %v", result, err)
 					}
 					current, err := o.st.Get(context.Background(), sb.ID)
-					if err != nil || !reflect.DeepEqual(current, sb) || !reflect.DeepEqual(o.lookup(sb.ID), sb) {
+					prepared := preparedExportSource(sb)
+					if err != nil || !reflect.DeepEqual(current, prepared) || !reflect.DeepEqual(o.lookup(sb.ID), prepared) {
 						t.Fatalf("failed acceptance changed source/cache: %+v, %v", current, err)
 					}
-					if _, stops := fixture.lc.stopSnapshot(); stops != 0 || fixture.vs.calls != 0 {
-						t.Fatal("failed acceptance stopped runner or detached network")
+					if _, stops := fixture.lc.stopSnapshot(); stops != 1 || fixture.vs.calls != 1 {
+						t.Fatal("export admission did not finish paused runner/network cleanup exactly once")
 					}
+					assertExportPausedCleanupPublished(t, o, prepared, events, recorder)
 					if kinds := recorder.sandboxKinds(); len(kinds) != 0 {
 						t.Fatalf("failed acceptance observed deletion: %v", kinds)
 					}
@@ -533,7 +589,10 @@ func TestExportMoveDeleteAcceptanceFailureHasNoCleanupEffects(t *testing.T) {
 						t.Fatalf("failed acceptance withdrew route: %+v", event)
 					default:
 					}
-					for _, path := range []string{filepath.Join(sb.RunDir, "owned"), filepath.Join(sb.BaseDir, "checkpoint", sb.ID+".stale")} {
+					if _, err := os.Stat(sb.RunDir); !errors.Is(err, os.ErrNotExist) {
+						t.Fatalf("export admission retained the old RunDir: %v", err)
+					}
+					for _, path := range []string{filepath.Join(sb.BaseDir, "checkpoint", sb.ID+".stale")} {
 						if _, err := os.Stat(path); err != nil {
 							t.Fatalf("failed acceptance removed %s: %v", path, err)
 						}
@@ -638,7 +697,7 @@ func TestExportMoveSameIDConflictUntilCleanupCompletes(t *testing.T) {
 				}
 			}
 			if admission != "import" {
-				waitForSandbox(t, o, ctx, sb.ID, func(current *types.Sandbox) bool { return current.State == types.StateRunning }, "same-ID successor running")
+				fixture.waitForRunning(t, "same-ID successor running")
 			}
 		})
 	}

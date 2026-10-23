@@ -23,6 +23,11 @@ func (o *Orchestrator) acceptSandboxDeleteLocked(ctx context.Context, sb *types.
 	if sb == nil {
 		return false, nil
 	}
+	ctx, release, err := o.trySourceOperation(ctx, sb)
+	if err != nil {
+		return false, err
+	}
+	defer release()
 	changed, err := o.st.BeginSandboxDelete(ctx, sb)
 	if err != nil {
 		return false, err
@@ -222,9 +227,16 @@ func (o *Orchestrator) startSandboxResultCleanup(sid, runID string) {
 	o.startSandboxRunEndCheck(runID)
 }
 
-func (o *Orchestrator) cleanupResultRunningOwnership(ctx context.Context, sb *types.Sandbox) error {
+// cleanupSandboxTerminalOwnership releases the same resources for a retained
+// execution result and an explicit hard delete. The caller holds both the SID
+// lifecycle lock and source-operation grant through the final durable commit.
+// Starting rollback and paused old-run cleanup retain their separate semantics.
+func (o *Orchestrator) cleanupSandboxTerminalOwnership(ctx context.Context, sb *types.Sandbox) error {
 	if err := o.validateSandboxCleanupPaths(sb); err != nil {
 		return err
+	}
+	if sb.State != types.StateRunning && sb.State != types.StateDeleting {
+		return fmt.Errorf("orch: terminal cleanup requires running or deleting sandbox %s", sb.ID)
 	}
 	if sb.RunID != "" {
 		if err := o.fenceSandboxRunner(ctx, sb.RunID); err != nil {
@@ -232,7 +244,13 @@ func (o *Orchestrator) cleanupResultRunningOwnership(ctx context.Context, sb *ty
 		}
 	}
 	if sb.VswitchPort != "" {
-		if err := o.clearRunningSandboxNetwork(ctx, sb); err != nil {
+		var err error
+		if sb.State == types.StateDeleting {
+			err = o.clearDeletingSandboxNetwork(ctx, sb)
+		} else {
+			err = o.clearRunningSandboxNetwork(ctx, sb)
+		}
+		if err != nil {
 			return err
 		}
 	}
@@ -287,7 +305,7 @@ func (o *Orchestrator) finalizeSandboxResultOnce(ctx context.Context, sid, runID
 	unlock := o.lifecycle.Lock(sid)
 	defer unlock()
 
-	cleanupCtx, cancel := cleanupContext()
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
 	sb, err := o.st.Get(cleanupCtx, sid)
 	if err != nil {
@@ -298,28 +316,7 @@ func (o *Orchestrator) finalizeSandboxResultOnce(ctx context.Context, sid, runID
 	}
 	switch sb.State {
 	case types.StateRunning:
-		if err := o.cleanupResultRunningOwnership(cleanupCtx, sb); err != nil {
-			return err
-		}
-		changed, err := o.st.CommitSandboxDead(cleanupCtx, sb)
-		if err != nil {
-			return err
-		}
-		if !changed {
-			return fmt.Errorf("orch: sandbox %s changed before result dead commit", sid)
-		}
-		o.runs.forget(runID)
-		o.releaseDetachedPortFence(sb.VswitchPort)
-		o.uncache(sid)
-		o.publishDelete(sid)
-		updated, err := o.st.Get(cleanupCtx, sid)
-		if err != nil {
-			return err
-		}
-		if updated != nil {
-			o.observeSandboxUpsert(updated)
-		}
-		return nil
+		return o.finalizeRunningSandboxDeadLocked(cleanupCtx, sb)
 	case types.StateStarting:
 		if attempt, ok := o.launches.Lookup(sid); ok && attempt.RunID() == runID {
 			o.launches.CancelExact(attempt)
@@ -338,6 +335,91 @@ func (o *Orchestrator) finalizeSandboxResultOnce(ctx context.Context, sid, runID
 	default:
 		return nil
 	}
+}
+
+// finalizeMissingRunningSandboxOnce is startup's lost-unit path. A missing
+// runner does not invent an execution result; any result accepted concurrently
+// remains attached to the dead row. The observed incarnation is immutable so a
+// delayed retry cannot act on a same-SID successor, including legacy rows with
+// no RunID. Network fields may change as this same cleanup makes progress.
+func (o *Orchestrator) finalizeMissingRunningSandboxOnce(ctx context.Context, observed *types.Sandbox) error {
+	unlock := o.lifecycle.Lock(observed.ID)
+	adopted := false
+	defer func() {
+		unlock()
+		if adopted {
+			o.requestDiskCheckpointRelease(observed.ID)
+		}
+	}()
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	sb, err := o.st.Get(cleanupCtx, observed.ID)
+	if err != nil {
+		return err
+	}
+	if sb == nil || sb.State != types.StateRunning || sb.RunID != observed.RunID ||
+		sb.CreatedUnix != observed.CreatedUnix || sb.APISecret != observed.APISecret ||
+		sb.TemplateID != observed.TemplateID || sb.BaseDir != observed.BaseDir ||
+		sb.RunDir != observed.RunDir || sb.ResumeSource != observed.ResumeSource {
+		return nil
+	}
+	if sb.ExecutionResult == nil && sb.RunID != "" {
+		if o.runSessionActive(runKindSandbox, sb.RunID) {
+			o.cache(sb)
+			o.observeSandboxUpsert(sb)
+			adopted = true
+			return nil
+		}
+		unit, err := o.resolveRunUnit(cleanupCtx, runKindSandbox, sb.RunID)
+		if err != nil {
+			return err
+		}
+		if unit != "" {
+			active, err := o.sandboxUnitActive(cleanupCtx, unit)
+			if err != nil {
+				return err
+			}
+			if active {
+				o.cache(sb)
+				o.observeSandboxUpsert(sb)
+				adopted = true
+				return nil
+			}
+		}
+	}
+	return o.finalizeRunningSandboxDeadLocked(cleanupCtx, sb)
+}
+
+// Caller holds the SID lifecycle lock. Keep the source grant through the dead
+// commit so physical source removal and its durable owner retire together.
+func (o *Orchestrator) finalizeRunningSandboxDeadLocked(ctx context.Context, sb *types.Sandbox) error {
+	ctx, release, err := o.trySourceOperation(ctx, sb)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if err := o.cleanupSandboxTerminalOwnership(ctx, sb); err != nil {
+		return err
+	}
+	changed, err := o.st.CommitSandboxDead(ctx, sb)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return fmt.Errorf("orch: sandbox %s changed before dead commit", sb.ID)
+	}
+	o.runs.forget(sb.RunID)
+	o.releaseDetachedPortFence(sb.VswitchPort)
+	o.uncache(sb.ID)
+	o.publishDelete(sb.ID)
+	updated, err := o.st.Get(ctx, sb.ID)
+	if err != nil {
+		return err
+	}
+	if updated != nil {
+		o.observeSandboxUpsert(updated)
+	}
+	return nil
 }
 
 func waitSandboxCleanupRetry(ctx context.Context, delay time.Duration) bool {
@@ -449,35 +531,15 @@ func (o *Orchestrator) finalizeSandboxDeleteOnce(ctx context.Context, sid string
 		return err
 	}
 
-	cleanupCtx, cancel := cleanupContext()
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
-	if sb.RunID != "" {
-		if err := o.fenceSandboxRunner(cleanupCtx, sb.RunID); err != nil {
-			return err
-		}
+	cleanupCtx, release, err := o.trySourceOperation(cleanupCtx, sb)
+	if err != nil {
+		return err
 	}
-	if sb.VswitchPort != "" {
-		if err := o.clearDeletingSandboxNetwork(cleanupCtx, sb); err != nil {
-			return err
-		}
-	}
-	removeRunDir := o.removeSandboxRunDir
-	if removeRunDir == nil {
-		removeRunDir = os.RemoveAll
-	}
-	if sb.RunDir != "" {
-		if err := removeRunDir(sb.RunDir); err != nil {
-			return fmt.Errorf("remove sandbox RunDir %s: %w", sb.RunDir, err)
-		}
-	}
-	removeBaseDir := o.removeSandboxBaseDir
-	if removeBaseDir == nil {
-		removeBaseDir = os.RemoveAll
-	}
-	if sb.BaseDir != "" {
-		if err := removeBaseDir(sb.BaseDir); err != nil {
-			return fmt.Errorf("remove sandbox BaseDir %s: %w", sb.BaseDir, err)
-		}
+	defer release()
+	if err := o.cleanupSandboxTerminalOwnership(cleanupCtx, sb); err != nil {
+		return err
 	}
 
 	deleted, err := o.st.DeleteFinalizedSandbox(cleanupCtx, sb)
