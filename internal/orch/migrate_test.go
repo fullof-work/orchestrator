@@ -1141,6 +1141,25 @@ func migrationOrchestrator(t *testing.T, dir string, runtime []byte) *Orchestrat
 	cfg.Paths.RunRoot = filepath.Join(dir, "run")
 	cfg.Paths.BaseRoot = filepath.Join(dir, "lib")
 	o := testOrchCfgAt(t, cfg, filepath.Join(dir, "node.db"))
+	lifecycle, stop := context.WithCancel(context.Background())
+	o.SetLifecycleContext(lifecycle)
+	t.Cleanup(func() {
+		// Publication can schedule checkpoint release after source deletion.
+		// Drain every fixture owner before SQLite and TempDir cleanup; waiting
+		// for the deleted row alone does not fence that background work.
+		stop()
+		drainCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := o.DrainLaunches(drainCtx); err != nil {
+			t.Errorf("drain migration fixture launches: %v", err)
+		}
+		if err := o.DrainPauses(drainCtx); err != nil {
+			t.Errorf("drain migration fixture accepted work: %v", err)
+		}
+		if err := o.DrainSandboxDeletes(drainCtx); err != nil {
+			t.Errorf("drain migration fixture deletes: %v", err)
+		}
+	})
 
 	return o
 }
