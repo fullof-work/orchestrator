@@ -2,6 +2,7 @@ package orch
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"time"
@@ -112,6 +113,11 @@ func (o *Orchestrator) releaseDiskCheckpointsOnce(ctx context.Context, sid strin
 	socket := filepath.Join(sb.RunDir, "ctl.sock")
 	if !selected.listed {
 		refs, err := ctl.ListDiffCheckpoints(ctx, socket)
+		if errors.Is(err, ctl.ErrCheckpointUnsupported) {
+			// Explicitly unsupported runtimes need no online version cleanup.
+			// Finish this check; independent triggers still recheck capability.
+			return nil
+		}
 		if err != nil {
 			return fmt.Errorf("list disk checkpoints: %w", err)
 		}

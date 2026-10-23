@@ -2102,7 +2102,9 @@ starting、恢复失败回退 paused、尚未恢复的 `keepSource` 都保留版
 
 检查使用 sandboxer 完整的 List 结果，删除其中精确的 `{DiffID, ID}` 引用。
 部分或结果不确定的 Delete 重试保持同一集合，不把旧选择交给另一个运行实例。
-错误会记录并通过有界调用和退避重试，不撤销已成功的启动或发布。
+若 List 明确返回 `checkpoint_unsupported`，本次检查正常结束，不发出 Delete 或重试。
+这不会按 SID 缓存能力；后续或并发的独立触发仍会重新检查。其他 List 错误、不完整列表和
+全部 Delete 错误仍会记录并通过有界调用和退避重试，不撤销已成功的启动或发布。
 这一步不执行 `checkpoint-cleanup`、不删除 DIFF 目录，也不删除内存依赖。
 Delete 使旧版本可回收，实际空间由 sandboxer 后续 GC 归还，而非同步回收。
 因此 running row 仍保留 `ResumeSource` 字段，并不保证下一次捕获失败后还能退回该旧暂停点。
