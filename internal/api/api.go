@@ -217,10 +217,10 @@ var ErrSandboxStarting = errors.New("sandbox starting")
 // ErrNotFound is returned by Core methods when the sandbox id is unknown.
 var ErrNotFound = errors.New("sandbox not found")
 
-// ErrProxyUnavailable means Create could not establish its route-applied
-// barrier. It is a temporary admission failure, not an accepted sandbox.
 var ErrResourceUnavailable = errors.New("node resources temporarily unavailable")
 
+// ErrProxyUnavailable means Create or standalone Connect could not establish its
+// route-applied barrier. A failed Connect may have accepted an asynchronous resume.
 var ErrProxyUnavailable = errors.New("proxy temporarily unavailable")
 
 // ErrExtensionUnavailable is the fixed internal classification for a Hook
@@ -1290,6 +1290,8 @@ func (a *API) failMigrate(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, conductorextension.ErrRejected):
 		writeErr(w, http.StatusForbidden, conductorextension.ErrRejected.Error())
+	case errors.Is(err, ErrProxyUnavailable):
+		writeErr(w, http.StatusServiceUnavailable, ErrProxyUnavailable.Error())
 	case errors.Is(err, ErrResourceUnavailable):
 		writeErr(w, http.StatusServiceUnavailable, ErrResourceUnavailable.Error())
 	case errors.Is(err, ErrExtensionUnavailable):
