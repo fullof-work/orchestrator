@@ -2,6 +2,7 @@
 # Prepared process/configuration and assertion primitives; cases own test flows.
 SCRIPT_DIR="${E2E_LIB:?E2E_LIB must point to prepared helpers}/orchestrator"
 . "$SCRIPT_DIR/vmm_cgroup.sh"
+. "$SCRIPT_DIR/diff_fixture.sh"
 . "$SCRIPT_DIR/proxy.sh"
 . "$SCRIPT_DIR/execute_state.sh"
 . "$SCRIPT_DIR/native_usage.sh"
@@ -229,12 +230,10 @@ MK="$("$BIN/e2b-key-ctl" gen-key)"; API_SECRET="$("$BIN/e2b-key-ctl" derive-api-
 MKFS_EXT4="$(command -v mkfs.ext4 || echo /sbin/mkfs.ext4)"
 [ -x "$MKFS_EXT4" ] || skip "mkfs.ext4 not found (overlay template)"
 OVL="$WORK/overlay-1G.ext4"
-truncate -s 1G "$OVL"
-"$MKFS_EXT4" -F -q -b 4096 -O ^has_journal "$OVL" >"$WORK/mkfs.log" 2>&1 || { cat "$WORK/mkfs.log"; fail "mkfs.ext4 overlay template"; }
+create_ext4_fixture "$OVL" 1G >"$WORK/mkfs.log" 2>&1 || { cat "$WORK/mkfs.log"; fail "overlay DIFF fixture"; }
 echo "==> overlay diff_template: $OVL ($(du -h "$OVL" | cut -f1) on disk)"
 BLD="$WORK/builder-2G.ext4"   # build sandbox writable disk (pull cache + export scratch)
-truncate -s 2G "$BLD"
-"$MKFS_EXT4" -F -q -b 4096 -O ^has_journal "$BLD" >"$WORK/mkfs-bld.log" 2>&1 || { cat "$WORK/mkfs-bld.log"; fail "mkfs.ext4 builder template"; }
+create_ext4_fixture "$BLD" 2G >"$WORK/mkfs-bld.log" 2>&1 || { cat "$WORK/mkfs-bld.log"; fail "builder DIFF fixture"; }
 
 CHECKPOINT_ROOT="$WORK/lib/sandboxes"
 cp "$SCRIPT_DIR/envd_exec.py" "$SCRIPT_DIR/envd_start.py" "$WORK/"

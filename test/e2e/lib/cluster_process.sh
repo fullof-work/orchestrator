@@ -58,14 +58,13 @@ EOF
 }
 
 make_ext4_templates() {
+    . "${E2E_LIB:?}/orchestrator/diff_fixture.sh"
     MKFS_EXT4="$(command -v mkfs.ext4 || echo /sbin/mkfs.ext4)"
     [ -x "$MKFS_EXT4" ] || fail "mkfs.ext4 not found"
     OVL="$WORK/overlay-1G.ext4"
-    truncate -s 1G "$OVL"
-    "$MKFS_EXT4" -F -q -b 4096 -O ^has_journal "$OVL" >"$WORK/mkfs-overlay.log" 2>&1 || { cat "$WORK/mkfs-overlay.log"; fail "mkfs overlay"; }
+    create_ext4_fixture "$OVL" 1G >"$WORK/mkfs-overlay.log" 2>&1 || { cat "$WORK/mkfs-overlay.log"; fail "overlay DIFF fixture"; }
     BLD="$WORK/builder-2G.ext4"
-    truncate -s 2G "$BLD"
-    "$MKFS_EXT4" -F -q -b 4096 -O ^has_journal "$BLD" >"$WORK/mkfs-builder.log" 2>&1 || { cat "$WORK/mkfs-builder.log"; fail "mkfs builder"; }
+    create_ext4_fixture "$BLD" 2G >"$WORK/mkfs-builder.log" 2>&1 || { cat "$WORK/mkfs-builder.log"; fail "builder DIFF fixture"; }
 }
 
 build_template_with_standalone_node() {

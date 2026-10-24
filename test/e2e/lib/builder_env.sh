@@ -4,6 +4,7 @@ SCRIPT_DIR="${E2E_LIB:?E2E_LIB must point to prepared helpers}/orchestrator"
 . "$SCRIPT_DIR/proxy.sh"
 . "$SCRIPT_DIR/build_fixture_units.sh"
 . "$SCRIPT_DIR/vmm_cgroup.sh"
+. "$SCRIPT_DIR/diff_fixture.sh"
 : "${BIN:?BIN must point to prepared products}"
 DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
 export PATH="$BIN:$PATH"
@@ -114,11 +115,10 @@ crypto:
   chunk: aes
   manifest: aes
 EOF
-MKFS_EXT4="$(command -v mkfs.ext4 || echo /sbin/mkfs.ext4)"
 OVL="$WORK/overlay-1G.ext4"             # cold-boot overlay upper (template VMs)
-truncate -s 1G "$OVL" && "$MKFS_EXT4" -F -q -b 4096 -O ^has_journal "$OVL"
+create_ext4_fixture "$OVL" 1G
 BLDDIFF="$WORK/builder-2G.ext4"         # build VM writable disk (pull cache + steps delta + export scratch)
-truncate -s 2G "$BLDDIFF" && "$MKFS_EXT4" -F -q -b 4096 -O ^has_journal "$BLDDIFF"
+create_ext4_fixture "$BLDDIFF" 2G
 
 MK="$("$BIN/e2b-key-ctl" gen-key)"
 API_SECRET="$("$BIN/e2b-key-ctl" derive-api-secret "$MK")"

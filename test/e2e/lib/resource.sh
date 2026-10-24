@@ -12,6 +12,7 @@ resource_init() {
     : "${WORK:?WORK must be provided by the E2E runner}"
     : "${E2E_LIB:?E2E_LIB must point to prepared helpers}"
     . "$E2E_LIB/orchestrator/tarstream.sh"
+    . "$E2E_LIB/orchestrator/diff_fixture.sh"
     export PATH="$BIN:$PATH"
     for b in sandbox-ctl node-ctl sandbox-init sandbox-runtime.bundle flatten-ctl cloud-hypervisor vmlinux; do
         [ -e "$BIN/$b" ] || resource_fail "missing prepared product $BIN/$b"
@@ -49,8 +50,7 @@ resource_setup_sandbox() {
     RESOURCE_TAPS["$sid"]="$tap"
     ip tuntap add "$tap" mode tap
     ip link set "$tap" up
-    truncate -s 1G "$WORK/${sid}.diff"
-    mkfs.ext4 -q -F -O ^has_journal "$WORK/${sid}.diff"
+    create_ext4_fixture "$WORK/${sid}.diff" 1G
 }
 
 resource_write_sandbox() {
