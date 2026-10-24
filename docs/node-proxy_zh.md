@@ -743,19 +743,22 @@ column 只存在于独立 arena,不进入会因 backshift 移动的 route record
   column并以新 epoch重启同 index。等待期间 stale-high 只会保守拒绝;其他 worker 继续
   accept 同一 listener fd,route/Sandbox state和Create barrier均不改变。崩溃 worker 上的已有
   连接由 kernel 关闭。
-- **master 崩溃**:plugin 租约断开,新 Create 无法通过 barrier,DataEndpoint 也不可用;
+- **master 崩溃**:plugin 租约断开,Create 和 standalone Connect 无法通过路由 barrier,DataEndpoint 也不可用;
   systemd 重启 master 后重新注册,重建共享表并启动 worker.已运行沙箱本身不受影响.
 - **routesync 断开**:master 指数退避重连;固定数据面共享表沿用原有保留/Bookmark
   收敛语义,但 MMDS routes/value/service authority 立即清空并返回 503,完整同步 Bookmark
-  前不服务旧 secret 或执行旧 service route。断连同时使尚未返回的 Create barrier 失败;
-  已 ACK并完成 201 commit 后的断连按正常运行期 availability failure 处理。
+  前不服务旧 secret 或执行旧 service route。断连同时使尚未返回的 Create 和 standalone Connect barrier 失败;
+  已 ACK并完成 201/200 响应后的断连按正常运行期 availability failure 处理。
+- **standalone Connect**:成功响应等待先行路由更新已应用并获 ACK,使首个请求能在 starting
+  上 parking,而不会选中旧 running 实例。它不等待 VM ready。barrier 失败返回 503,调用方
+  取消会结束等待;两者都不取消已受理的 resume。cluster CmdConnect 保持独立的受理及归属协议。
 - **park / wake**:Lookup 不发送 Wake;通过有效鉴权策略的 Activate 才能对 paused sid 发 Wake 并等待
   共享表更新。starting 只 park、不 Wake,变为 paused/Delete 时立即结束;resume ownership 和
   当前 launch 的状态推进仍由 conductor 执行。
 - **stats stream**:任一 worker stream EOF、超时或协议错误都会停止该 worker;确认退出前
   traffic GET 返回 503,确认后删除其贡献并等待 replacement ready。Prometheus counter 在
   master 生命周期内保持单调,worker epoch 更换不会回退。
-- **失败码**:Create 无可用 proxy route stream,barrier 超时/断连或 route apply
+- **失败码**:Create/standalone Connect 无可用 proxy route stream,barrier 超时/断连或 route apply
   失败 = 503;非法 target = 400;exec 的非 CONNECT method = 405;未知/已删除 sid = 404;
   鉴权失败 = 401;已识别但 profile 不支持的 service = 501;
   后端/proxy 未注册或不可达 = 502;已授权的 exec 恢复失败 = 503;ordinary admission 达限 =

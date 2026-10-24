@@ -107,7 +107,7 @@ type Orchestrator struct {
 	subs   map[int]chan routesync.Event // route-change subscribers (routesync clients)
 	subSeq int
 	// routeBarriers is wired before any API or node-link listener starts. It is
-	// consulted for every fresh Create admission.
+	// consulted for every fresh Create admission and standalone Connect response.
 	routeBarriers routesync.RouteBarrierCoordinator
 
 	routeLogMu sync.Mutex
@@ -265,7 +265,7 @@ func (o *Orchestrator) StartRunPools(ctx context.Context) error {
 }
 
 // SetProxyRouteBarrierCoordinator wires the independent Proxy registration lease
-// registry into Create admission. Wiring is immutable after serve starts.
+// registry into Create and standalone Connect. Wiring is immutable after serve starts.
 func (o *Orchestrator) SetProxyRouteBarrierCoordinator(c routesync.RouteBarrierCoordinator) {
 	o.routeBarriers = c
 }
@@ -1623,6 +1623,9 @@ func (o *Orchestrator) Connect(ctx context.Context, id, apiKey, migrationToken s
 	if err != nil {
 		return nil, err
 	}
+	if err := o.waitConnectRouteBarrier(ctx, id); err != nil {
+		return nil, err
+	}
 	return cloneSandbox(sb), nil
 }
 
@@ -1657,6 +1660,9 @@ func (o *Orchestrator) ConnectWithMMDS(ctx context.Context, id, apiKey, migratio
 		return nil
 	})
 	if err != nil {
+		return nil, err
+	}
+	if err := o.waitConnectRouteBarrier(ctx, id); err != nil {
 		return nil, err
 	}
 	return cloneSandbox(sb), nil

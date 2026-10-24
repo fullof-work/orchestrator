@@ -647,9 +647,17 @@ envd,不生成也不返回 Envd/Traffic token;两种 profile 都返回独立的
 Create 响应保持既有 body(不新增 `state` 字段),且与 cache 和后台 worker 使用不同的对象
 副本。GET 可观察 `starting` 或内部 cleanup-pending `deleting`;默认 List 仍只列 running/paused,
 显式 `state=starting|deleting|dead`
-用于诊断。Connect 已是 running 时直接返回;已是 starting 时只应用显式 timeout 的窄更新,
+用于诊断。Connect 已是 running 时保持幂等;已是 starting 时只应用显式 timeout 的窄更新,
 不重复启动。paused Connect 在返回前完成 durable resume acceptance,因此成功响应可以对应
-starting,但不会仍对应旧 paused 状态。paused/starting 上的显式 deadline intent 在同一
+starting,但不会仍对应旧 paused 状态。
+
+每次 standalone Connect 成功返回前,包括 running、starting 和迁入目标,都会等待当前
+Proxy registration 应用先行路由更新并确认有序 barrier。它不等待 runtime 或 envd ready;
+首个数据请求可以在 starting 上 parking。等待沿用既有 park timeout,并受调用方取消及
+节点关闭约束。route barrier 失败返回 503,但不会撤销已经提交的 timeout 更新或 resume
+acceptance;已受理的 launch 独立继续。此响应屏障不改变 cluster CmdConnect 的受理及归属协议。
+
+paused/starting 上的显式 deadline intent 在同一
 conductor 进程内的恢复失败回 paused 后继续保留,只在某次 exact-run 成功提交 running 后
 消费。V1 没有持久 intent 字段,所以 Reconcile 可从仍为 starting 的中断 resume 推断并在
 本次进程内保守恢复 intent,避免紧随其后的普通 Wake/Connect 被 node default 覆盖。如果该行
