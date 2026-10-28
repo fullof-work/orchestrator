@@ -4,6 +4,38 @@
 set -euo pipefail
 . "${E2E_LIB:?}/orchestrator/execute_env.sh"
 
+launch_recovery_cleanup() {
+    local status=$? cleanup_status=0
+    set +e
+    if [ "$status" -ne 0 ]; then
+        python3 - "$WORK" <<'RECOVERY_DIAGNOSTICS'
+import pathlib, re, sys
+work = pathlib.Path(sys.argv[1])
+# Bounded owned error logs only, never configuration or key files.
+for name in ('orch.log', 'read-proxy.log', 'store-serve.log'):
+    try:
+        with (work / name).open('rb') as source:
+            source.seek(0, 2)
+            size = source.tell()
+            offset = max(0, size - 8192)
+            source.seek(offset)
+            tail = source.read(8192).decode(errors='replace')
+        if offset:
+            tail = tail.partition('\n')[2]
+        tail = re.sub(r'(?i)[0-9a-f]{64}', '<redacted>', tail)
+        tail = tail.replace('##[', '<workflow-marker>')
+        print(f'launch-recovery diagnostic {name} bytes={size}', file=sys.stderr)
+        print('\n'.join(tail.splitlines()[-24:]), file=sys.stderr)
+    except OSError:
+        print(f'launch-recovery diagnostic {name}: unavailable', file=sys.stderr)
+RECOVERY_DIAGNOSTICS
+    fi
+    cleanup || cleanup_status=$?
+    [ "$status" -ne 0 ] || status=$cleanup_status
+    exit "$status"
+}
+trap launch_recovery_cleanup EXIT
+
 docker save "$E2E_IMAGE" | "$BIN/flatten-ctl" export --output "$WORK/recovery.image" --no-progress
 ROOT=$(MANIFEST_KEY="$MK" "$BIN/manifest-ctl" store --manifest-config "$WORK/manifest.yaml" --no-progress "$WORK/recovery.image")
 [ "${#ROOT}" = 64 ] || fail "invalid image root"
@@ -16,7 +48,7 @@ wait_port 127.0.0.1 "$READ_PROXY_PORT" read-proxy
 python3 - "$WORK/manifest.yaml" "$STORE_PORT" "$READ_PROXY_PORT" <<'PY'
 import pathlib,sys
 p=pathlib.Path(sys.argv[1])
-p.write_text(p.read_text().replace("127.0.0.1:"+sys.argv[2], "127.0.0.1:"+sys.argv[3]).replace("timeout: 30s","timeout: 1s"))
+p.write_text(p.read_text().replace("127.0.0.1:"+sys.argv[2], "127.0.0.1:"+sys.argv[3]))
 PY
 write_orchestrator_config unset static
 start_orchestrator "$WORK/orch.log"
