@@ -73,6 +73,22 @@ launch_fault sbx "$E_REF" "${E_REF#manifest://}" sandbox
 delete_current
 launch_fault snp "$S_REF" "${E_REF#manifest://}" snapshot
 delete_current
+fault_mode block "$ROOT" cancel
+BODY=$(python3 - "$ROOT" <<'PY_CANCEL'
+import base64,json,sys
+ref=base64.urlsafe_b64encode(("manifest://"+sys.argv[1]).encode()).decode().rstrip("=")
+print(json.dumps({"templateID":"bare-img-"+ref,"timeout":180}))
+PY_CANCEL
+)
+REQ_RESOURCE_HEADER='{"capacity":{"cpu":1,"memory":"512MiB"}}'
+code=$(req POST /sandboxes "$AK" "$BODY")
+unset REQ_RESOURCE_HEADER
+[ "$code" = 201 ] || fail "waiting Delete Create=$code"
+SID=$(json_field "$WORK/resp.body" sandboxID)
+python3 "$SCRIPT_DIR/launch_recovery.py" watch "$WORK" "$SID" "$RUNNER_PREFIX" "$CASE_OUT" "$EXECUTE_RUN_ROOT" cancel
+delete_current
+python3 "$SCRIPT_DIR/launch_recovery.py" deleted "$WORK" "$SID" "$RUNNER_PREFIX" "$CASE_OUT" "$EXECUTE_RUN_ROOT" cancel
+fault_mode healthy "$ROOT" cancel
 SID=$SOURCE_SID
 delete_current
 echo "PASS orchestrator.launch-recovery.sh: original cold/E/S accepted attempts recovered"

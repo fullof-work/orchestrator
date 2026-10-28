@@ -63,7 +63,7 @@ if action == "watch":
                     runtimes.append(item)
             # Image opens inside the original sandbox-ctl. E/S resolve in
             # resident taskrun before any sandbox-ctl or VM may be spawned.
-            expected = int(phase == "image")
+            expected = int(phase in ("image", "cancel"))
             assert len(runtimes) == expected and calls() == expected, (runtimes, calls())
             identity = dict(sid=sid, run_id=row[1], unit=unit, parent=parent,
                             runtime=runtimes[0] if runtimes else None,
@@ -71,7 +71,8 @@ if action == "watch":
             if first is None:
                 first = identity
             assert identity == first, (first, identity)
-            if evidence["count"] >= 4 and evidence["last_ns"] - evidence["first_ns"] > 61_000_000_000:
+            if (phase == "cancel" and evidence["count"] >= 2) or (
+                    evidence["count"] >= 4 and evidence["last_ns"] - evidence["first_ns"] > 61_000_000_000):
                 (out / (phase + "-waiting.json")).write_text(json.dumps(first))
                 (out / (phase + "-faults.json")).write_text(json.dumps(evidence))
                 break
@@ -90,5 +91,20 @@ elif action == "compare":
         assert tuple(row[2:]) == (old["port"], old["floatingip"]), row
     assert row[2] and row[3] and calls() == 1, (row, calls())
     (out / (phase + "-running.json")).write_text(json.dumps(new))
+elif action == "deleted":
+    old = json.loads((out / (phase + "-waiting.json")).read_text())
+    assert network() is None, "Delete retained the durable sandbox"
+    for original in (old["parent"], old["runtime"]):
+        if original is None:
+            continue
+        try:
+            current = process(original["pid"])
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        assert not same_process(original, current), (original, current)
+    props = subprocess.check_output(["systemctl", "show", old["unit"], "--property=ActiveState"], text=True)
+    assert props.strip() in ("ActiveState=inactive", "ActiveState=failed"), props
+    for path in (pathlib.Path(run_root) / "sandboxes" / sid, work / "lib/sandboxes" / sid):
+        assert not path.exists(), path
 else:
-    raise SystemExit("expected watch or compare")
+    raise SystemExit("expected watch, compare or deleted")
