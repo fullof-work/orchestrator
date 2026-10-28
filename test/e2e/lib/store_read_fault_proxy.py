@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test-owned plaintext HTTP/2 proxy: close exact selected Manifest Get streams."""
+"""Test-owned plaintext HTTP/2 proxy: close exact selected Manifest Get connections."""
 import json
 import pathlib
 import signal

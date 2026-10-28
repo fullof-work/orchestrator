@@ -37,9 +37,11 @@ unset REQ_RESOURCE_HEADER
 SID=$(json_field "$WORK/resp.body" sandboxID)
 # Poll only observed selected Get failures. Every sample simultaneously checks
 # exact durable/run/process/network ownership; wall time alone cannot pass.
-python3 - "$WORK" "$SID" "$RUNNER_PREFIX" "$CASE_OUT" <<'PY'
+python3 - "$WORK" "$SID" "$RUNNER_PREFIX" "$CASE_OUT" "$SCRIPT_DIR" <<'PY'
 import json,pathlib,sqlite3,subprocess,sys,time
-work,sid,prefix,out=sys.argv[1:]; work=pathlib.Path(work);out=pathlib.Path(out)
+work,sid,prefix,out,lib=sys.argv[1:]; work=pathlib.Path(work);out=pathlib.Path(out)
+sys.path.insert(0,lib)
+from runner_lifecycle import process
 first=None
 limit=time.monotonic()+100
 while time.monotonic()<limit:
@@ -55,7 +57,17 @@ while time.monotonic()<limit:
         assert props["ActiveState"]=="active",props
         pid=int(props["MainPID"])
         stat=pathlib.Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()
-        identity={"sid":sid,"run_id":row[1],"unit":unit,"pid":pid,"start":int(stat[19]),"port":row[2],"floatingip":row[3]}
+        children=set()
+        for task in pathlib.Path(f"/proc/{pid}/task").iterdir():
+            try: children.update((task/"children").read_text().split())
+            except FileNotFoundError: pass
+        runtimes=[]
+        for child in children:
+            try: item=process(int(child))
+            except (FileNotFoundError,ProcessLookupError): continue
+            if item["executable"]=="sandbox-ctl": runtimes.append(item)
+        assert len(runtimes)==1,runtimes
+        identity={"runtime":runtimes[0],"sid":sid,"run_id":row[1],"unit":unit,"pid":pid,"start":int(stat[19]),"port":row[2],"floatingip":row[3]}
         if first is None:first=identity
         assert identity==first,(first,identity)
         if evidence["count"]>=4 and evidence["last_ns"]-evidence["first_ns"]>61_000_000_000:
@@ -82,6 +94,13 @@ assert parent["pid"]==old["pid"] and parent["start_ticks"]==old["start"], (old,p
 with sqlite3.connect(work/"lib/node-ctl.db") as db:
     row=db.execute("select vswitch_port,floatingip from sandboxes where id=?",(old["sid"],)).fetchone()
 assert tuple(row)==(old["port"],old["floatingip"]),row
+assert old["runtime"]==new["processes"]["runtime"],(old["runtime"],new["processes"]["runtime"])
+runs=[json.loads(line) for line in (work/"run-argv.jsonl").read_text().splitlines()]
+def value(args,name):
+    for i,arg in enumerate(args):
+        if arg==name:return args[i+1]
+        if arg.startswith(name+"="):return arg.split("=",1)[1]
+assert sum(value(args,"--sandbox-id")==old["sid"] for args in runs)==1,runs
 PY
 code=$(req DELETE "/sandboxes/$SID" "$AK")
 [ "$code" = 204 ] || fail "Kill after recovery=$code"
