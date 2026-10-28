@@ -53,7 +53,9 @@ PY
 delete_current() {
     code=$(req DELETE "/sandboxes/$SID" "$AK")
     [ "$code" = 204 ] || fail "Kill after recovery=$code"
-    wait_sandbox_state "$SID" missing 120 || fail "recovered sandbox did not clean up"
+    # The repository unit owns a 20-second Stop/kill budget. Use the existing
+    # lifecycle completion bound; 12 seconds would abort its ordered cleanup.
+    wait_sandbox_state "$SID" missing 1200 || fail "recovered sandbox did not clean up"
 }
 
 launch_fault img "manifest://$ROOT" "$ROOT" image
