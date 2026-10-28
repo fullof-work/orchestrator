@@ -19,7 +19,7 @@ func TestSamePrepareRecoversRealManifestRPCs(t *testing.T) {
 		for _, existing := range []bool{false, true} {
 			name := string(mode) + "/first-open"
 			if existing {
-				name = string(mode) + "/existing-connection"
+				name = string(mode) + "/after-successful-get"
 			}
 			t.Run(name, func(t *testing.T) {
 				var armed atomic.Bool
@@ -34,7 +34,7 @@ func TestSamePrepareRecoversRealManifestRPCs(t *testing.T) {
 						if n >= start && n < start+3 {
 							failures.Add(1)
 							// An actual gRPC stream sends a partial object before
-							// its transport fails; consumer recovery owns replay.
+							// an Unavailable stream status; consumer recovery owns replay.
 							if err := stream.SendMsg(&storepb.GetResponse{Data: []byte("partial")}); err != nil {
 								return err
 							}
