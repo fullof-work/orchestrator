@@ -994,6 +994,10 @@ func writeTaskManifestBundleSource(t testing.TB, directory string, refs []string
 }
 
 func writeTaskManifestStoreArtifacts(t testing.TB, cfgBody string, options ...grpc.ServerOption) (string, string, string) {
+	return writeTaskManifestStoreArtifactsWithListener(t, cfgBody, nil, options...)
+}
+
+func writeTaskManifestStoreArtifactsWithListener(t testing.TB, cfgBody string, wrap func(net.Listener) net.Listener, options ...grpc.ServerOption) (string, string, string) {
 	t.Helper()
 	backend, err := storefs.New(storefs.Config{Root: t.TempDir()})
 	if err != nil {
@@ -1009,6 +1013,9 @@ func writeTaskManifestStoreArtifacts(t testing.TB, cfgBody string, options ...gr
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if wrap != nil {
+		listener = wrap(listener)
 	}
 	grpcServer := grpc.NewServer(options...)
 	storepb.RegisterStoreServer(grpcServer, server)
