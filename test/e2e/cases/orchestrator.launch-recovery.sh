@@ -73,8 +73,6 @@ S_REF=$(json_field "$WORK/published.json" snapshotRef)
 # S opens successfully, then its referenced E hits this same shared entry.
 launch_fault sbx "$E_REF" "${E_REF#manifest://}" sandbox
 delete_current
-launch_fault snp "$S_REF" "${E_REF#manifest://}" snapshot
-delete_current
 fault_mode block "$ROOT" cancel
 BODY=$(python3 - "$ROOT" <<'PY_CANCEL'
 import base64,json,sys
@@ -91,6 +89,9 @@ python3 "$SCRIPT_DIR/launch_recovery.py" watch "$WORK" "$SID" "$RUNNER_PREFIX" "
 delete_current
 python3 "$SCRIPT_DIR/launch_recovery.py" deleted "$WORK" "$SID" "$RUNNER_PREFIX" "$CASE_OUT" "$EXECUTE_RUN_ROOT" cancel
 fault_mode healthy "$ROOT" cancel
+# Verify cancellation before the restored-VM teardown so each failure is distinct.
+launch_fault snp "$S_REF" "${E_REF#manifest://}" snapshot
+delete_current
 SID=$SOURCE_SID
 delete_current
 echo "PASS orchestrator.launch-recovery.sh: original cold/E/S accepted attempts recovered"
