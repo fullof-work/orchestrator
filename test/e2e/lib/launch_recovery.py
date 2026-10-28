@@ -101,7 +101,10 @@ elif action == "deleted":
             current = process(original["pid"])
         except (FileNotFoundError, ProcessLookupError):
             continue
-        assert not same_process(original, current), (original, current)
+        assert current["start_ticks"] != original["start_ticks"], (original, current)
+    # Reparenting or moving cgroups does not make a surviving original PID safe.
+    cgroup = pathlib.Path("/sys/fs/cgroup") / old["parent"]["cgroup"].lstrip("/")
+    assert not cgroup.exists(), cgroup
     props = subprocess.check_output(["systemctl", "show", old["unit"], "--property=ActiveState"], text=True)
     assert props.strip() in ("ActiveState=inactive", "ActiveState=failed"), props
     for path in (pathlib.Path(run_root) / "sandboxes" / sid, work / "lib/sandboxes" / sid):
