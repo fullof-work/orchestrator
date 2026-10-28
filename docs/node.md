@@ -477,6 +477,14 @@ detaches/removes resources. Positive app_start or explicit PingFatal policy opts
 into bounded termination; default PingFatalThreshold stays zero. See the
 [conductor example](../deploy/conductor.example.yaml).
 
+The prepared [launch recovery case](../test/e2e/cases/orchestrator.launch-recovery.sh)
+observes actual Manifest Get failures for more than 60 seconds on image, E and S
+startup paths. It compares SID, RunID, exact runner/process identities and network
+ownership, checks one runtime spawn, and deletes a still-blocked accepted attempt.
+E/S preparation precedes VM creation; the Sandboxer recovery case separately
+proves VM survival across post-ACK and ordinary-read failures. Record the actual
+selected SDK and Guest Bundle, not just a successful local relative replace build.
+
 ## 4. e2b API contract
 
 Base URL is `https://api.<domain>`. Authentication accepts **X-API-KEY** for SDKs or **Authorization: Bearer** for CLI builds, parsing both identically. APISecret signs keys through e2b-key-ctl gen-apikey; conductor verifies their MAC to identify tenants without a static api_keys table (§7).

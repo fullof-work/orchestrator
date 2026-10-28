@@ -624,6 +624,13 @@ owner 取消、真实 runner/VM 退出、永久读取错误、readiness EOF/格�
 执行。正数 app_start 或显式 PingFatal 选择有界终止；默认 PingFatalThreshold
 仍为零。可选结构见 [conductor 示例](../deploy/conductor.example.yaml)。
 
+已准备的 [启动恢复用例](../test/e2e/cases/orchestrator.launch-recovery.sh) 在 image、
+E、S 路径观测超过 60 秒的实际 Manifest Get 故障，核对 SID、RunID、精确 runner/
+进程身份与网络归属、唯一 runtime spawn，并删除仍在等待依赖的已接纳 attempt。
+E/S prepare 先于 VM 创建；Sandboxer 恢复用例另行证明 post-ACK 及普通读取故障
+期间原 VM 存活。须记录实际选定 SDK 和 Guest Bundle，不能只用本地相对 replace
+构建成功证明正式 CI 的输入。
+
 ## 4. e2b API 契约
 
 基址 `https://api.<domain>`;鉴权 **`X-API-KEY`**(SDK)或 **`Authorization: Bearer`**
