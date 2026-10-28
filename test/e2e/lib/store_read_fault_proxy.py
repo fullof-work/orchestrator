@@ -13,7 +13,7 @@ stop = threading.Event()
 lock = threading.Lock()
 connections = set()
 workers = []
-receipt = {"count": 0, "first_ns": 0, "last_ns": 0}
+receipt = {"epoch": "", "count": 0, "first_ns": 0, "last_ns": 0}
 
 
 def exact(conn, size):
@@ -36,6 +36,8 @@ def fault(payload):
         return False
     with lock:
         now = time.monotonic_ns()
+        if receipt["epoch"] != config["epoch"]:
+            receipt.update(epoch=config["epoch"], count=0, first_ns=0, last_ns=0)
         receipt.update(count=receipt["count"] + 1, last_ns=now)
         if not receipt["first_ns"]:
             receipt["first_ns"] = now
