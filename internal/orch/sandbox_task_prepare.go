@@ -86,11 +86,9 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 		if !changed {
 			return errLaunchOwnershipLost
 		}
-		launchTimeout := o.sandboxReadyTimeout
-		if launchTimeout <= 0 {
-			launchTimeout = 60 * time.Second
+		if o.sandboxReadyTimeout > 0 {
+			attempt.SetDeadline(time.Now().Add(o.sandboxReadyTimeout))
 		}
-		attempt.SetDeadline(time.Now().Add(launchTimeout))
 		sb.RunID = runID
 		attempt.SetRunID(runID)
 		bound := o.mutateCached(sb.ID, func(cached *types.Sandbox) { cached.RunID = runID })
@@ -124,11 +122,11 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 	}
 	o.logLaunchPhase(attempt, sb, "runner_handoff_duration", time.Since(commitFinished))
 
-	deadline := attempt.Deadline()
-	if deadline.IsZero() {
-		return launchFailed("artifact_prepare", errors.New("orch: artifact launch deadline was not initialized"))
+	launchCtx, cancelLaunch := context.WithCancel(ctx)
+	if deadline := attempt.Deadline(); !deadline.IsZero() {
+		cancelLaunch()
+		launchCtx, cancelLaunch = context.WithDeadline(ctx, deadline)
 	}
-	launchCtx, cancelLaunch := context.WithDeadline(ctx, deadline)
 	defer cancelLaunch()
 	finalPublished := false
 	defer func() {

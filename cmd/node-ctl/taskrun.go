@@ -97,11 +97,17 @@ func launchTaskWith(ctx context.Context, stopContext func(), socket, sandboxID, 
 	taskCtx := ctx
 	cancelDeadline := func() {}
 	if bootstrap.Prepare != nil {
-		deadline := time.Unix(0, bootstrap.Prepare.AbsoluteDeadlineUnixNano)
-		if bootstrap.Prepare.AbsoluteDeadlineUnixNano <= 0 || !deadline.After(time.Now()) {
-			return fmt.Errorf("sandbox task bootstrap launch deadline has expired")
+		rawDeadline := bootstrap.Prepare.AbsoluteDeadlineUnixNano
+		if rawDeadline < 0 {
+			return fmt.Errorf("sandbox task bootstrap launch deadline must not be negative")
 		}
-		taskCtx, cancelDeadline = context.WithDeadline(ctx, deadline)
+		if rawDeadline > 0 {
+			deadline := time.Unix(0, rawDeadline)
+			if !deadline.After(time.Now()) {
+				return fmt.Errorf("sandbox task bootstrap launch deadline has expired")
+			}
+			taskCtx, cancelDeadline = context.WithDeadline(ctx, deadline)
+		}
 	}
 	defer cancelDeadline()
 

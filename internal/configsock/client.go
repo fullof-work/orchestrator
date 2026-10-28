@@ -315,7 +315,7 @@ func PostBuildPhaseContext(ctx context.Context, socket, runID, buildID, phase, s
 // FetchSandboxTaskSpec fetches one exact-run bootstrap after the caller has
 // locked and written the assigned sandbox task pidfile.
 func FetchSandboxTaskSpec(ctx context.Context, socket, sandboxID, runID string) (*SandboxTaskSpec, error) {
-	body, _ := json.Marshal(SandboxTaskRequest{SandboxID: sandboxID, RunID: runID, Version: ArtifactPrepareSchemaVersion})
+	body, _ := json.Marshal(SandboxTaskRequest{SandboxID: sandboxID, RunID: runID, Version: SandboxBootstrapVersion})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://localhost"+PathTaskSandboxBootstrap, bytes.NewReader(body))
 	if err != nil {
 		return nil, err

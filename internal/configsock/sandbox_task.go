@@ -12,6 +12,11 @@ import (
 // runners cannot complete this protocol.
 const ArtifactPrepareSchemaVersion = 5
 
+// SandboxBootstrapVersion gates only sandbox bootstrap semantics: version 6
+// accepts an omitted/zero prepare deadline as following the task owner.
+// ArtifactPrepareSummary and Builder retain their independent versions.
+const SandboxBootstrapVersion = 6
+
 // SandboxTaskRequest identifies one exact assigned sandbox-runner incarnation.
 type SandboxTaskRequest struct {
 	SandboxID string `json:"sandbox_id"`

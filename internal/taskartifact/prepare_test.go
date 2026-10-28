@@ -993,7 +993,7 @@ func writeTaskManifestBundleSource(t testing.TB, directory string, refs []string
 	return filepath.Join(directory, manifest.HexKey(rootKey)+".bundle"), manifest.HexKey(rootKey), manifest.HexKey(sandboxKey), configPath
 }
 
-func writeTaskManifestStoreArtifacts(t testing.TB, cfgBody string) (string, string, string) {
+func writeTaskManifestStoreArtifacts(t testing.TB, cfgBody string, options ...grpc.ServerOption) (string, string, string) {
 	t.Helper()
 	backend, err := storefs.New(storefs.Config{Root: t.TempDir()})
 	if err != nil {
@@ -1010,7 +1010,7 @@ func writeTaskManifestStoreArtifacts(t testing.TB, cfgBody string) (string, stri
 	if err != nil {
 		t.Fatal(err)
 	}
-	grpcServer := grpc.NewServer()
+	grpcServer := grpc.NewServer(options...)
 	storepb.RegisterStoreServer(grpcServer, server)
 	go func() { _ = grpcServer.Serve(listener) }()
 	t.Cleanup(func() {

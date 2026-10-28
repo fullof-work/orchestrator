@@ -22,7 +22,7 @@ func TestSandboxAppStartPolicyRoundTripAndValidation(t *testing.T) {
 	if err := json.Unmarshal(raw, &round); err != nil || round.Sandbox.Timeouts.Runtime().AppStart != "3s" {
 		t.Fatal(err, round.Sandbox.Timeouts)
 	}
-	for _, input := range []string{"0", "-1s", "bad"} {
+	for _, input := range []string{"-1s", "bad"} {
 		if _, err := DecodeConductor(strings.NewReader("sandbox: {timeouts: {app_start: " + input + "}}")); err == nil {
 			t.Fatal("accepted", input)
 		}
@@ -30,8 +30,35 @@ func TestSandboxAppStartPolicyRoundTripAndValidation(t *testing.T) {
 	if _, err := DecodeConductor(strings.NewReader("sandbox: {timeouts: {app_strat: 3s}}")); err == nil {
 		t.Fatal("unknown field accepted")
 	}
-	c.Sandbox.Timeouts.AppStart = "0"
+	c.Sandbox.Timeouts.AppStart = "-1s"
 	if err := c.validateDeclarative(); err == nil || !strings.Contains(err.Error(), "sandbox.timeouts.app_start") {
 		t.Fatal("programmatic override bypassed validation", err)
+	}
+}
+
+func TestSandboxAppStartZeroRoundTrip(t *testing.T) {
+	for _, input := range []string{"", "0", "0s", "3s"} {
+		body := "sandbox: {}"
+		if input != "" {
+			body = "sandbox: {timeouts: {app_start: " + input + "}}"
+		}
+		c, err := DecodeConductor(strings.NewReader(body))
+		if err != nil {
+			t.Fatal(input, err)
+		}
+		if c.Clone().Sandbox.Timeouts.AppStart != input {
+			t.Fatal("clone changed policy")
+		}
+		raw, err := json.Marshal(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var round Conductor
+		if err := json.Unmarshal(raw, &round); err != nil {
+			t.Fatal(input, err)
+		}
+		if round.Sandbox.Timeouts.Runtime().AppStart != input {
+			t.Fatal("policy roundtrip changed value")
+		}
 	}
 }
