@@ -535,6 +535,12 @@ func TestSandboxTaskBootstrapUsesExactRunAndDoesNoArtifactIO(t *testing.T) {
 	if task.Prepare.RootRef != rootRef || task.Env["MANIFEST_KEY"] != manifestKey || task.Prepare.AbsoluteDeadlineUnixNano != deadline.UnixNano() {
 		t.Fatalf("task bootstrap content = %+v", task)
 	}
+
+	attempt.SetDeadline(time.Time{})
+	task, found, err = o.SandboxTaskSpecFor(context.Background(), sb.ID, sb.RunID)
+	if err != nil || !found || task.Prepare.AbsoluteDeadlineUnixNano != 0 {
+		t.Fatalf("default bootstrap must follow attempt owner: %+v/%v", task, err)
+	}
 }
 
 func TestSandboxTaskBootstrapNormalizesRawLocalRoot(t *testing.T) {

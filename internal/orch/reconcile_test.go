@@ -34,6 +34,7 @@ type reconcileLauncher struct {
 	stopped []string
 	reset   []string
 
+	stopKeepsActive    bool
 	stopErr            error
 	inactiveAfterLists int
 	listCalls          int
@@ -47,6 +48,9 @@ func (l *reconcileLauncher) Stop(_ context.Context, unit string) error {
 	l.stopped = append(l.stopped, unit)
 	if l.stopErr != nil {
 		return l.stopErr
+	}
+	if l.stopKeepsActive {
+		return nil
 	}
 	for i := range l.units {
 		if l.units[i].Name == unit {
@@ -1635,4 +1639,39 @@ func containsString(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func TestReconcileOrphanRequiresObservedInactiveAfterSuccessfulStop(t *testing.T) {
+	box, err := secretbox.NewFromColonHex(strings.Repeat("0", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "node.db"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	runID := "sr-00000000-0000-7000-8000-000000000099"
+	unit := "sandbox-runner@" + runID + ".service"
+	lc := &reconcileLauncher{stopKeepsActive: true, units: []launcher.Unit{{Name: unit, ActiveState: "active"}}}
+	cfg := &config.Config{
+		Paths: config.PathsConfig{RunRoot: t.TempDir(), BaseRoot: t.TempDir()},
+		Units: config.UnitsConfig{Runner: "sandbox-runner@.service", Builder: "sandbox-builder@.service"},
+	}
+	o := New(cfg, st, lc, &reconcileVS{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	o.runs.restore(runID, unit)
+	err = o.ReconcileSandboxes(context.Background())
+	if err == nil || !strings.Contains(err.Error(), runID) || !strings.Contains(err.Error(), "remained active") {
+		t.Fatalf("active orphan not diagnosed: %v", err)
+	}
+	if o.runs.unit(runID) != unit {
+		t.Fatal("failed cleanup lost exact unit identity")
+	}
+	lc.setUnitState(unit, "inactive")
+	if err := o.ReconcileSandboxes(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if o.runs.unit(runID) != "" {
+		t.Fatal("confirmed inactive orphan retained")
+	}
 }

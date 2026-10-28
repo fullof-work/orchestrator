@@ -27,6 +27,7 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/restore"
+	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
 )
 
@@ -548,11 +549,8 @@ func openArtifactStreamWithFetcher(
 		if manifestFetcher == nil {
 			return nil, errors.New("manifest configuration is required")
 		}
-		key, err := manifest.ParseKeyRef(ref.Path)
-		if err != nil {
-			return nil, err
-		}
-		return manifestFetcher.OpenManifest(ctx, key)
+		stream, _, err := sandbox.OpenManifestStream(ctx, ref.Path, manifestFetcher)
+		return stream, err
 	case manifest.RefSchemeFile:
 		path, err := locations.ResolveFile(ref, relativeDir)
 		if err != nil {

@@ -605,7 +605,7 @@ func (s *Server) handleSandboxBootstrap(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var req SandboxTaskRequest
-	if status := decodeTaskRequest(w, r, taskBootstrapRequestMaxBytes, &req); status != 0 || req.SandboxID == "" || req.RunID == "" || req.Version != ArtifactPrepareSchemaVersion {
+	if status := decodeTaskRequest(w, r, taskBootstrapRequestMaxBytes, &req); status != 0 || req.SandboxID == "" || req.RunID == "" || req.Version != SandboxBootstrapVersion {
 		if status == 0 {
 			status = http.StatusBadRequest
 		}

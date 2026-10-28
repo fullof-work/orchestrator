@@ -181,3 +181,25 @@ func TestInstallUnitsRemovesGeneratedParentResourcePolicy(t *testing.T) {
 		}
 	}
 }
+
+func TestInstallUnitsReplacesOldRunnerExecutable(t *testing.T) {
+	install := true
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sandbox-runner@.service")
+	if err := os.WriteFile(path, []byte("[Service]\nExecStart=/old/node-ctl run-sandbox --run-id=%i\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	lc := &reconcileLauncher{}
+	o := &Orchestrator{cfg: &config.Config{
+		Paths: config.PathsConfig{RunRoot: t.TempDir(), ConfigSocket: filepath.Join(t.TempDir(), "ctl.sock")},
+		Units: config.UnitsConfig{Install: &install, Dir: dir, Runner: "sandbox-runner@.service", Builder: "sandbox-builder@.service"},
+	}, lc: lc, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	o.SetExecutables(configresolve.ExecutablesForNodeCtl("/candidate/node-ctl"))
+	if err := o.InstallUnits(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil || strings.Contains(string(b), "/old/") || !strings.Contains(string(b), "ExecStart=/candidate/node-ctl run-sandbox ") || lc.reloads != 1 {
+		t.Fatalf("installed runner=%s reloads=%d err=%v", b, lc.reloads, err)
+	}
+}

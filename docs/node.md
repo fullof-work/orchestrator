@@ -434,21 +434,56 @@ See the parsed [conductor deployment example](../deploy/conductor.example.yaml).
 
 ### 3.4 Application startup policy
 
-Node-local `sandbox.timeouts.app_start` configures the SDK post-ACK application
-startup deadline. Omission uses the SDK default of `2s`; an explicit duration
-must be positive. The current node policy reaches image cold start,
-`run --from`, `run --restore` and every Builder phase. It is not inherited from
-portable E/S artifacts and does not alter per-message socket deadlines,
-Sandbox TTL, or Builder total/step/readiness deadlines.
+Node-local `sandbox.timeouts.app_start` is an optional SDK post-ACK overall
+deadline. Omission, empty and `0` add no deadline; positive durations opt into a
+bound, and negative/invalid values are errors. Existing clone, bootstrap,
+workorder and Builder rendering carry this host policy; portable E/S artifacts
+never do. Socket deadlines, API/Proxy waits, assignment budgets, running TTL and
+Builder total/step/readiness deadlines retain their existing responsibilities.
 
-Set `sandbox.timeouts.app_start` to a positive duration such as `3s` only when
-the workload needs a different startup budget; see the nested configuration in
-the [conductor deployment example](../deploy/conductor.example.yaml).
-This does not add launch retries or change when a Build is considered ready.
+Ordinary accepted launches follow the attempt owner through prepare, readiness
+and /init, without the former implicit 60-second limit. Sandbox bootstrap version
+6 permits zero/omitted `absolute_deadline_unix_nano`; positive means an explicit
+absolute cutoff and negative is invalid. Shared prepare summary stays version 5;
+Builder version 7 and its positive work deadline/reporting reserve are unchanged.
 
-Upgrade conductor and `run-builder` together: Build task schema version 7 carries
-this node policy. A worker with an older schema is rejected at bootstrap and
-prepare completion, so it cannot silently fall back to the SDK default.
+Manifest opens reuse Sandboxer's `OpenManifestStream`/readretry with the original
+scoped fetcher, Bundle identity and caller context. Builder benefits within its
+own work deadline; file carriers keep their existing recovery boundary.
+Store/Cache Get/GetShard remain single attempts. Recovery never replays
+Prepare/Create/Resume or allocates another runner/network.
+
+Upgrade conductor and idle node-ctl runners together. Reconcile stops each old
+orphan's exact unit and confirms inactive before pool refill; failure reports the
+RunID/unit and prevents startup. A new pool only accepts RunIDs it created.
+Generated units retain the resolved node-ctl executable; self-managed unit
+operators must install the compatible binary at their ExecStart path. Running
+VMs are not replaced. Conductor restart continuation of all starting attempts
+is outside this contract.
+
+New initial Launch requires Guest `initial_launch_state_v1` before apply.
+Rebuild runtime Bundle with matching sandbox-init, including prewarmed Guests
+intended for a new Launch. Host upgrade cannot replace init inside an existing
+snapshot. Ordinary restore retains restore semantics and does not consume an old
+token as a new startup fact. Initial notification and verified Pong confirm the
+same token; PID presence or reachability alone cannot confirm success.
+
+An unavailable dependency can retain a `starting` runner, network and directories
+indefinitely. Inspect existing state, launch phases, accepted duration and exact
+RunID; running TTL does not reap starting. Kill/Delete, owner cancellation, real
+runner/VM exit, permanent read errors, readiness EOF/malformed wire and /init
+non-204 remain terminal. Cleanup stops the exact runner, confirms inactive, then
+detaches/removes resources. Positive app_start or explicit PingFatal policy opts
+into bounded termination; default PingFatalThreshold stays zero. See the
+[conductor example](../deploy/conductor.example.yaml).
+
+The prepared [launch recovery case](../test/e2e/cases/orchestrator.launch-recovery.sh)
+observes actual Manifest Get failures for more than 60 seconds on image, E and S
+startup paths. It compares SID, RunID, exact runner/process identities and network
+ownership, checks one runtime spawn, and deletes a still-blocked accepted attempt.
+E/S preparation precedes VM creation; the Sandboxer recovery case separately
+proves VM survival across post-ACK and ordinary-read failures. Record the actual
+selected SDK and Guest Bundle, not just a successful local relative replace build.
 
 ## 4. e2b API contract
 
@@ -1064,7 +1099,7 @@ Runner assignment budget begins at pool Assign and covers queuing, on-demand Sta
 
 
 - **Kill:** under the SID fence, exact-CAS full ownership into deleting, cancel active launch, withdraw cache and publish route Delete. Asynchronous finalization stops the unit and all CH descendants, resets failed state, releases TAPFD or detaches vswitch, removes directories and hard-deletes row. Route withdrawal does not await cleanup. The old launch claim remains until its attempt finishes local cleanup, preventing late CAS resurrection or an early same-SID successor. Guest restart policy cannot block host unit termination.
-- **Readiness:** before assigning a runner, conductor binds `<RunDir>/ready.sock` with directory 0700/socket 0600. Runner immediately connects. Conductor waits for artifact completion, readiness EOF, cancellation and absolute deadline together, so a task exiting during root reads fails immediately. The one-shot stream must be `control_ready\nready\nEOF`. Bare is ready then; e2b next sends mandatory POST /init as the first envd request, without /health as a startup gate. Health is for external checks after initialization. Artifact-launch absolute budget begins at successful Assign and covers root read, completion RPC, host resource/network preparation, final-spec wait, child Start, runtime wire and /init; final spec does not reset it. Cold fast path retains its post-handoff runtime budget. /init starts immediately, retries only connection/transport errors at 1ms/2ms/4ms/capped-5ms backoff, with at most 50ms per request. Only 204 succeeds; other statuses expose the status code without potentially sensitive response body. Protocol errors, early EOF, cancellation or total timeout fail launch: fresh starting becomes dead; resume returns paused. After durable acceptance but before runner assignment, failure uses the empty-RunID fence. Only /init success commits starting→running with the exact RunID and publishes running route.
+- **Readiness:** before assigning a runner, conductor binds `<RunDir>/ready.sock` with directory 0700/socket 0600. Runner immediately connects. Conductor waits for artifact completion, readiness EOF, cancellation and absolute deadline together, so a task exiting during root reads fails immediately. The one-shot stream must be `control_ready\nready\nEOF`. Bare is ready then; e2b next sends mandatory POST /init as the first envd request, without /health as a startup gate. Health is for external checks after initialization. Artifact and cold launches follow the accepted attempt owner through preparation, child Start, readiness and /init. An explicitly supplied positive absolute deadline spans these phases without reset; ordinary launches add no overall deadline. /init starts immediately, retries only connection/transport errors at 1ms/2ms/4ms/capped-5ms backoff, under the shared launch context, without a separate 50ms request limit. Only 204 succeeds; other statuses expose the status code without potentially sensitive response body. Protocol errors, early EOF, cancellation or total timeout fail launch: fresh starting becomes dead; resume returns paused. After durable acceptance but before runner assignment, failure uses the empty-RunID fence. Only /init success commits starting→running with the exact RunID and publishes running route.
 - **Liveness authority:** ListUnitsByPatterns over distinct configured runner templates obtains the authoritative active RunID set for reconciliation with stored sandboxes.run_id (§14).
 - Host Restart=no and guest envd restart=always under sandbox-init are separate layers.
 

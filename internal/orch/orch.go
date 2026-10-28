@@ -216,7 +216,7 @@ func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient,
 func NewResolved(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient, files *filestore.Store, log *slog.Logger) *Orchestrator {
 	o := &Orchestrator{
 		cfg: cfg, st: st, lc: lc, vs: vs, log: log,
-		sandboxReadyTimeout:  60 * time.Second,
+		sandboxReadyTimeout:  0,
 		reg:                  map[string]*types.Sandbox{},
 		lifecycleCtx:         context.Background(),
 		deadlineIntents:      map[string]struct{}{},
@@ -673,14 +673,14 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 		commitFinished = assignStarted
 	}
 	o.logLaunchPhase(attempt, sb, "runner_handoff_duration", time.Since(commitFinished))
-	launchTimeout := o.sandboxReadyTimeout
-	if launchTimeout <= 0 {
-		launchTimeout = 60 * time.Second
+	// Readiness and mandatory /init follow the accepted attempt owner. A
+	// positive explicitly supplied budget bounds both phases; ordinary launches
+	// have no extra overall deadline. Assignment and running TTL are separate.
+	launchCtx, cancelLaunch := context.WithCancel(ctx)
+	if o.sandboxReadyTimeout > 0 {
+		cancelLaunch()
+		launchCtx, cancelLaunch = context.WithTimeout(ctx, o.sandboxReadyTimeout)
 	}
-	// Runtime readiness and, for E2B, mandatory envd initialization consume one
-	// launch budget beginning after assignment. /init is the first envd request:
-	// health is meaningful only after initialization and is not a launch gate.
-	launchCtx, cancelLaunch := context.WithTimeout(ctx, launchTimeout)
 	defer cancelLaunch()
 	runtimeStarted := time.Now()
 	err = waitRuntimeReadiness(launchCtx, readyListener)
@@ -2356,9 +2356,9 @@ func (o *Orchestrator) SandboxTaskSpecFor(ctx context.Context, sandboxID, runID 
 		response.Final = o.sandboxFinalLaunchSpec(sb, tmpl, cfgSpec, locations)
 		return response, true, nil
 	}
-	deadline := attempt.Deadline()
-	if deadline.IsZero() {
-		return nil, false, errors.New("orch: sandbox task launch deadline is not initialized")
+	var deadlineUnixNano int64
+	if deadline := attempt.Deadline(); !deadline.IsZero() {
+		deadlineUnixNano = deadline.UnixNano()
 	}
 	manifestConfig := o.cfg.ManifestConfig
 	if manifestConfig != "" && !filepath.IsAbs(manifestConfig) {
@@ -2382,7 +2382,7 @@ func (o *Orchestrator) SandboxTaskSpecFor(ctx context.Context, sandboxID, runID 
 		RefLocationParent:        o.cfg.Checkpoint.Remote.RefLocationParent,
 		RelativeDir:              checkpointDir,
 		MaxRefs:                  maxRequiredArtifactRefs,
-		AbsoluteDeadlineUnixNano: deadline.UnixNano(),
+		AbsoluteDeadlineUnixNano: deadlineUnixNano,
 	}
 	return response, true, nil
 }
@@ -2777,8 +2777,9 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 			continue
 		}
 		o.log.Info("reconcile: orphan runner", "run_id", runID, "unit", u.Name)
-		_ = o.lc.Stop(ctx, u.Name)
-		_ = o.lc.ResetFailed(ctx, u.Name)
+		if err := o.fenceSandboxRunner(ctx, runID); err != nil {
+			return fmt.Errorf("reconcile: fence orphan runner %s (%s): %w", runID, u.Name, err)
+		}
 		o.runs.forget(runID)
 	}
 	return nil

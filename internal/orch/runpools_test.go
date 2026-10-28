@@ -298,3 +298,34 @@ func TestRunPoolsCancellationLateCallbackAndCommitFailure(t *testing.T) {
 		})
 	}
 }
+
+func TestRestoredIdleRunIDCannotReceiveNewAssignment(t *testing.T) {
+	runs := &runIndex{}
+	oldID := "sr-00000000-0000-7000-8000-000000000001"
+	oldUnit := "sandbox-runner@" + oldID + ".service"
+	runs.restore(oldID, oldUnit)
+	lc := callbackLauncher(t, runs)
+	pools, ctx, _ := startPoolSet(t, runKindSandbox, []config.RunPoolConfig{{Unit: "sandbox-runner@.service", Size: 1}}, lc, runs)
+	if unit, owner, waiting := runs.ownerPool(oldID); unit != oldUnit || owner != nil || waiting {
+		t.Fatalf("restored unit acquired new pool eligibility: %q %p %v", unit, owner, waiting)
+	}
+	if task, ok, err := runs.wait(ctx, oldID); err == nil || ok || task != "" {
+		t.Fatalf("old idle callback accepted: task=%q ok=%v err=%v", task, ok, err)
+	}
+	for _, pool := range pools.pools {
+		if task, ok, err := pool.WaitAssignment(ctx, oldID); err == nil || ok || task != "" {
+			t.Fatalf("direct old callback accepted: task=%q ok=%v err=%v", task, ok, err)
+		}
+	}
+	var commits int
+	id, err := pools.Assign(ctx, "new-sandbox", func(id string) error {
+		commits++
+		if id == oldID {
+			return errors.New("old runner selected")
+		}
+		return nil
+	})
+	if err != nil || id == oldID || commits != 1 {
+		t.Fatalf("assignment id=%q commits=%d err=%v", id, commits, err)
+	}
+}

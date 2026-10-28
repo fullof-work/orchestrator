@@ -23,8 +23,8 @@ func (t SandboxTimeoutsConfig) validate() error {
 		return nil
 	}
 	d, err := time.ParseDuration(t.AppStart)
-	if err != nil || d <= 0 {
-		return fmt.Errorf("config: sandbox.timeouts.app_start must be a positive duration")
+	if err != nil || d < 0 {
+		return fmt.Errorf("config: sandbox.timeouts.app_start must be a non-negative duration")
 	}
 	return nil
 }

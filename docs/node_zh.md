@@ -589,19 +589,47 @@ telemetry 不会启用 usage, 停止 telemetry 不会停止原生计量. `flush_
 
 ### 3.4 应用启动策略
 
-节点配置 `sandbox.timeouts.app_start` 控制 SDK ACK 后的应用启动期限。
-省略时使用 SDK 默认值 `2s`，显式时长必须为正数。当前节点策略传递到 image
-cold start、`run --from`、`run --restore` 及每个 Builder 阶段，不从 portable
-E/S 制品继承，也不改变单条消息的 socket 期限、Sandbox TTL 或 Builder 的
-总期限、步骤期限、readiness 期限。
+节点配置 `sandbox.timeouts.app_start` 是 SDK ACK 后可选的整体期限。
+省略、空值或 `0` 不增加期限；正时长显式选择有界等待，负数/非法值为配置错误。
+既有 clone、bootstrap、workorder 和 Builder rendering 传递此宿主策略，portable
+E/S 制品不携带它。Socket 期限、API/Proxy 等待、assignment 预算、running TTL 及
+Builder 总期限/步骤/readiness 保持各自职责。
 
-仅在工作负载需要不同启动预算时将 `sandbox.timeouts.app_start` 显式设置为
-`3s` 等正时长；嵌套结构参见 [conductor 部署示例](../deploy/conductor.example.yaml)。
-此配置不增加启动重试，也不改变 Build 就绪的判定。
+普通已接纳启动从 prepare、readiness 到 /init 跟随 attempt owner，不再隐式附加
+60 秒总期限。Sandbox bootstrap 版本 6 允许 `absolute_deadline_unix_nano` 为零或
+省略；正数是显式绝对截止，负数非法。共用 prepare summary 保持版本 5；
+Builder 版本 7、正数 work deadline 及结果上报预留不变。
 
-请同时升级 conductor 和 `run-builder`：Build 任务 schema 版本 7 传递此节点
-策略。旧 schema 的 worker 会在 bootstrap 及 prepare completion 时被拒绝，
-避免静默回退到 SDK 默认值。
+Manifest 打开复用 Sandboxer 的 `OpenManifestStream`/readretry，保留原 scoped
+fetcher、Bundle 身份和调用方 context。Builder 在自身 work deadline 内受益；
+file carrier 保持既有恢复边界。Store/Cache Get/GetShard 仍为 single attempt；
+恢复不重放 Prepare/Create/Resume，不重复分配 runner/网络。
+
+请同时升级 conductor 与待分配 node-ctl runner。Reconcile 停止旧 orphan 的精确
+unit 并确认 inactive 后才补充 pool；失败带 RunID/unit 报错并阻止启动。新 pool
+只接纳本次创建的 RunID。生成 unit 保留已解析的 node-ctl executable；自管 unit
+操作者须在 ExecStart 路径安装兼容二进制。已有运行 VM 不被替换；Conductor
+自身重启后接续所有 starting 不属于本合同。
+
+新初始 Launch 在 apply 前要求 Guest `initial_launch_state_v1`。须使用匹配的
+sandbox-init 重建 runtime Bundle；用于新 Launch 的预热 Guest 同样需要升级。
+Host 升级无法替换旧 snapshot 中的 init。普通 restore 保留恢复语义，不消费旧
+token 作为新启动事实。初始通知和已校验 Pong 确认同一 token；PID 存在或 Ping
+可达本身不能证明成功。
+
+依赖长期不可用会持续占用 `starting` runner、网络和目录。通过现有状态、launch
+phase、接纳后持续时间和精确 RunID 诊断；running TTL 不清理 starting。Kill/Delete、
+owner 取消、真实 runner/VM 退出、永久读取错误、readiness EOF/格式错误及 /init
+非 204 仍终止启动。Cleanup 按精确 runner 停止、确认 inactive、detach/删除资源
+执行。正数 app_start 或显式 PingFatal 选择有界终止；默认 PingFatalThreshold
+仍为零。可选结构见 [conductor 示例](../deploy/conductor.example.yaml)。
+
+已准备的 [启动恢复用例](../test/e2e/cases/orchestrator.launch-recovery.sh) 在 image、
+E、S 路径观测超过 60 秒的实际 Manifest Get 故障，核对 SID、RunID、精确 runner/
+进程身份与网络归属、唯一 runtime spawn，并删除仍在等待依赖的已接纳 attempt。
+E/S prepare 先于 VM 创建；Sandboxer 恢复用例另行证明 post-ACK 及普通读取故障
+期间原 VM 存活。须记录实际选定 SDK 和 Guest Bundle，不能只用本地相对 replace
+构建成功证明正式 CI 的输入。
 
 ## 4. e2b API 契约
 
@@ -1372,11 +1400,12 @@ pool loop 唯一回复,每个请求恰有一次结果。
   attempt cancel与绝对 deadline,因此task在根读取期间退出会立即失败。随后从node-ctl的
   one-shot连接严格读取
   `control_ready\nready\nEOF`;bare 到此启动成功。e2b 随后把 `POST /init` 作为首个 envd
-  请求,不以 `/health` 作为启动门槛;health 仅在初始化完成后用于外部存活检查。restore
-  launch的单一绝对 budget从 Assign成功时开始,覆盖 task根读取、completion RPC、host
-  resource/network准备、final wait、子进程 Start、runtime wire与mandatory `/init`,最终 spec
-  生成后不重置。cold path仍在runner handoff后使用现有runtime budget。首个 `/init`立即发出;仅连接/传输
-  错误按 1ms,2ms,4ms,5ms 上限退避重试,每次请求最多 50ms.只有 204 表示成功;
+  请求,不以 `/health` 作为启动门槛;health 仅在初始化完成后用于外部存活检查。cold 与 restore
+  launch 共用已接纳 attempt 的 owner context，覆盖 task 根读取、completion RPC、host
+  resource/network 准备、final wait、子进程 Start、runtime wire 与 mandatory `/init`；
+  普通启动不加 60 秒整体期限。显式正数 bootstrap deadline 贯穿上述阶段，最终 spec
+  生成后不重置。首个 `/init`立即发出;仅连接/传输
+  错误按 1ms,2ms,4ms,5ms 上限退避重试,共享 launch context，不另加每次请求 50ms 期限。只有 204 表示成功;
   非 204 只返回状态码,不记录可能回显 access token/用户 env 的响应体;协议错误、提前
   EOF、取消或总预算超时都返回
   launch 失败:create 将已持久化的 starting 行按 run-id fence 标 dead,resume 则回退

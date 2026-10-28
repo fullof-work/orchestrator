@@ -370,7 +370,7 @@ func TestSandboxBootstrapAuthenticatesBeforeSecretProvider(t *testing.T) {
 func TestSandboxBootstrapRejectsPreV3SchemasBeforeProviders(t *testing.T) {
 	pf := filepath.Join(t.TempDir(), "task.pid")
 	mustWrite(t, pf, strconv.Itoa(os.Getpid()))
-	for _, version := range []int{1, 2} {
+	for version := 0; version < SandboxBootstrapVersion; version++ {
 		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
 			var authCalls, secretCalls atomic.Int32
 			_, client := startTestServer(t, Deps{Provider: stubProvider{

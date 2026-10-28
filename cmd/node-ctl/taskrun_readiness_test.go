@@ -913,3 +913,62 @@ func closeTestHTTPServer(t *testing.T, server *http.Server, done <-chan error) {
 }
 
 func intPtr(v int) *int { return &v }
+
+func TestSandboxPrepareOptionalDeadlineAndOwner(t *testing.T) {
+	for _, raw := range []int64{0, time.Now().Add(time.Minute).UnixNano(), -1, 1} {
+		t.Run(strconv.FormatInt(raw, 10), func(t *testing.T) {
+			owner, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			entered := make(chan context.Context, 1)
+			done := make(chan error, 1)
+			go func() {
+				done <- launchTaskWith(owner, func() {}, "", "sid", "run", nil, nil, taskLaunchOps{
+					fetchBootstrap: func(context.Context, string, string, string) (*configsock.SandboxTaskSpec, error) {
+						return &configsock.SandboxTaskSpec{SandboxID: "sid", RunID: "run", Env: map[string]string{"MANIFEST_KEY": ""},
+							Prepare: &configsock.ArtifactPrepareSpec{RunID: "run", AbsoluteDeadlineUnixNano: raw}}, nil
+					},
+					setenv: func(string, string) error { return nil },
+					prepareArtifact: func(ctx context.Context, _ configsock.ArtifactPrepareSpec) (*taskartifact.Result, error) {
+						entered <- ctx
+						<-ctx.Done()
+						return nil, ctx.Err()
+					},
+				})
+			}()
+			if raw < 0 || raw == 1 {
+				select {
+				case err := <-done:
+					if err == nil {
+						t.Fatal("invalid deadline accepted")
+					}
+				case <-time.After(time.Second):
+					t.Fatal("invalid deadline reached preparation")
+				}
+				select {
+				case <-entered:
+					t.Fatal("invalid bootstrap performed reads")
+				default:
+				}
+				return
+			}
+			select {
+			case ctx := <-entered:
+				d, hasDeadline := ctx.Deadline()
+				if hasDeadline != (raw > 0) || (raw > 0 && d.UnixNano() != raw) {
+					t.Fatalf("deadline=%v present=%v input=%d", d, hasDeadline, raw)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("valid bootstrap did not reach preparation")
+			}
+			cancel()
+			select {
+			case err := <-done:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatal(err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("owner cancellation lost")
+			}
+		})
+	}
+}
