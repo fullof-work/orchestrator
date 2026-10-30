@@ -32,7 +32,8 @@ class DiskCheckpoint(unittest.TestCase):
             db.execute("insert into sandboxes values(?, ?, ?, ?, ?, ?)",
                        ("sandbox", "paused", str(self.root), "sandbox", self.reference, ""))
 
-    def artifact_payload(self, checkpoint=None, extra=()):
+    def artifact_payload(self, checkpoint=None, extra=(), *, sparse=False, prefix=0, pax_size=True, reverse=False,
+                         extents=None, stored_adjustment=0, carrier_extra=()):
         if checkpoint is None:
             checkpoint = {"version": 1, "checkpoint_id": IDENTITY,
                           "root": {"diff_id": "root"}, "disks": [{"name": "data", "diff_id": "data"}]}
@@ -42,11 +43,85 @@ class DiskCheckpoint(unittest.TestCase):
             archive.writestr("checkpoint.json", json.dumps(checkpoint))
             for name in extra:
                 archive.writestr(name, b"unexpected")
+        body = payload.getvalue()
         with tarfile.open(self.artifact, "w") as carrier:
             member = tarfile.TarInfo("sandbox")
-            member.size = len(payload.getvalue())
-            carrier.addfile(member, io.BytesIO(payload.getvalue()))
+            if sparse:
+                # Match accelerator/pkg/tarstream/write.go: a sorted PAX header
+                # with both physical path/size and GNU sparse logical metadata.
+                # Keep a real digest-marker body after the payload so an offset
+                # error cannot accidentally succeed by finding the zero trailer.
+                logical_size = prefix + len(body)
+                data = body
+                if extents is None:
+                    extents = [(prefix, len(body)), (logical_size, 0)]
+                elif extents == "many":
+                    extents = [(index * 8192, 4096) for index in range(80)]
+                    extents += [(prefix, len(body)), (logical_size, 0)]
+                    data = b"\0" * (80 * 4096) + body
+                sparse_map = (str(len(extents)) + "\n" + "".join(
+                    f"{offset}\n{size}\n" for offset, size in extents)).encode()
+                sparse_map += b"\0" * (-len(sparse_map) % 512)
+                packed = sparse_map + data
+                member.name = "GNUSparseFile.0/sandbox"
+                headers = {"GNU.sparse.major": "1", "GNU.sparse.minor": "0",
+                           "GNU.sparse.name": "sandbox", "GNU.sparse.realsize": str(logical_size),
+                           "KUASAR.payload.size": str(prefix), "KUASAR.presence": "1",
+                           "path": member.name}
+                if pax_size:
+                    headers["size"] = str(len(packed) + stored_adjustment)
+                member.pax_headers = dict(sorted(headers.items(), reverse=reverse))
+                member.size = len(packed)
+                carrier.addfile(member, io.BytesIO(packed))
+                marker = tarfile.TarInfo(".kuasar.digest." + "d" * 64)
+                marker.size = 40
+                carrier.addfile(marker, io.BytesIO(b"\0" * 8 + b"d" * 32))
+            else:
+                member.size = len(body)
+                carrier.addfile(member, io.BytesIO(body))
+            for name in carrier_extra:
+                carrier.addfile(tarfile.TarInfo(name))
         return checkpoint
+
+    def test_reads_sparse_carrier_with_physical_pax_size_and_digest_tail(self):
+        for prefix in (0, 16384, 8 << 30):
+            for pax_size in (False, True):
+                for reverse in (False, True):
+                    with self.subTest(prefix=prefix, pax_size=pax_size, reverse=reverse):
+                        expected = self.artifact_payload(sparse=True, prefix=prefix,
+                                                         pax_size=pax_size, reverse=reverse)
+                        actual = disk_checkpoint.local_metadata(self.database, "sandbox")
+                        self.assertEqual(actual, {**expected, "artifact": str(self.artifact)})
+                        with tarfile.open(self.artifact, tarinfo=disk_checkpoint._CheckpointTarInfo) as carrier:
+                            members = carrier.getmembers()
+                            self.assertEqual([m.name for m in members],
+                                             ["sandbox", ".kuasar.digest." + "d" * 64])
+                            self.assertEqual(carrier.extractfile(members[-1]).read(),
+                                             b"\0" * 8 + b"d" * 32)
+
+    def test_sparse_reader_agrees_with_gnu_tar_for_multiblock_map(self):
+        expected = self.artifact_payload(sparse=True, prefix=1 << 20, extents="many")
+        self.assertEqual(disk_checkpoint.local_metadata(self.database, "sandbox"),
+                         {**expected, "artifact": str(self.artifact)})
+        listing = subprocess.check_output(["tar", "-tf", str(self.artifact)], text=True)
+        self.assertEqual(listing.splitlines(), ["sandbox", ".kuasar.digest." + "d" * 64])
+        extracted = subprocess.check_output(["tar", "-xOf", str(self.artifact), "sandbox"])
+        with tarfile.open(self.artifact, tarinfo=disk_checkpoint._CheckpointTarInfo) as carrier:
+            self.assertEqual(carrier.extractfile("sandbox").read(), extracted)
+
+    def test_sparse_reader_rejects_inconsistent_map_size_and_extra_payloads(self):
+        for adjustment in (-1, 1, 512):
+            self.artifact_payload(sparse=True, stored_adjustment=adjustment)
+            with self.subTest(adjustment=adjustment), self.assertRaises(tarfile.ReadError):
+                disk_checkpoint.artifact_content(self.artifact)
+        for extents in ([(0, -1)], [(1, 1), (0, 1)], [(1 << 30, 1)]):
+            self.artifact_payload(sparse=True, extents=extents)
+            with self.subTest(extents=extents), self.assertRaises(tarfile.ReadError):
+                disk_checkpoint.artifact_content(self.artifact)
+        for name in ("unexpected", "sandbox", ""):
+            self.artifact_payload(sparse=True, carrier_extra=[name])
+            with self.subTest(name=name), self.assertRaises(AssertionError):
+                disk_checkpoint.artifact_content(self.artifact)
 
     def test_reads_local_snapshot_companion_and_sandbox_artifact(self):
         expected = self.artifact_payload()
