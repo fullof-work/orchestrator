@@ -59,12 +59,44 @@ def fence_refs(metadata, report_path, held_path, directory, identity):
     return [{"diff_id": diff_id, "id": identity} for diff_id in ids]
 
 
+class _CheckpointTarInfo(tarfile.TarInfo):
+    """Keep GNU sparse logical metadata separate from the PAX stored size.
+
+    tarfile applies generic PAX path/size after GNU.sparse.name/realsize and
+    recomputes the next header from offset_data, which already skips the sparse
+    map. Kuasar's canonical PAX includes both sets of fields. Preserve the
+    physical boundary before that patching and retain the sparse logical view;
+    do not extract/materialize potentially large Sandbox payloads.
+    """
+
+    def _proc_gnusparse_10(self, member, headers, carrier):
+        start = carrier.fileobj.tell()
+        stored = int(headers.get("size", member.size))
+        super()._proc_gnusparse_10(member, headers, carrier)
+        logical = int(headers["GNU.sparse.realsize"])
+        end = packed = 0
+        for offset, size in member.sparse:
+            if offset < end or size < 0 or offset + size > logical:
+                raise tarfile.ReadError("invalid GNU sparse extent")
+            end = offset + size
+            packed += size
+        if carrier.fileobj.tell() - start + packed != stored:
+            raise tarfile.ReadError("GNU sparse stored size does not match map and payload")
+        self._sparse_layout = (headers["GNU.sparse.name"], logical,
+                               start + self._block(stored))
+
+    def _proc_pax(self, carrier):
+        member = super()._proc_pax(carrier)
+        if hasattr(self, "_sparse_layout"):
+            member.name, member.size, carrier.offset = self._sparse_layout
+        return member
+
+
 def artifact_content(path):
-    with tarfile.open(path) as carrier:
+    with tarfile.open(path, tarinfo=_CheckpointTarInfo) as carrier:
         members = [m for m in carrier if m.isfile() and not m.name.startswith(".kuasar.")]
         assert len(members) == 1, members
         member = members[0]
-        member.size = int(member.pax_headers.get("GNU.sparse.realsize", member.size))
         with zipfile.ZipFile(carrier.extractfile(member)) as logical:
             names = logical.namelist()
             assert len(names) == len(set(names)), names
