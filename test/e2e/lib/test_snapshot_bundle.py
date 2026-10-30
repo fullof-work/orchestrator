@@ -27,7 +27,7 @@ class SnapshotBundleGraph(unittest.TestCase):
         if suffix is None:
             suffix = [ref(BASE), ref(LOWER)]
         if members is None:
-            members = ["manifest/" + key for key in (B, H, BASE, LOWER)]
+            members = ["manifest/" + key for key in (B, H)]
         cfg = {"FromRefs": refs, **(extra_cfg or {})}
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -61,17 +61,19 @@ class SnapshotBundleGraph(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_missing_actual_history_cannot_be_masked_by_original_a(self):
-        self.assert_rejected("omits referenced memory manifest", members=[
+        self.assert_rejected("omits referenced memory history manifest", members=[
             "manifest/" + key for key in (B, A, BASE, LOWER)])
 
-    def test_every_inherited_memory_ref_must_be_embedded(self):
-        for missing in (BASE, LOWER):
-            with self.subTest(missing=missing):
-                self.assert_rejected("omits referenced memory manifest", members=[
-                    "manifest/" + key for key in (B, H, BASE, LOWER) if key != missing])
+    def test_portable_suffix_may_remain_remote_or_already_be_embedded(self):
+        # The inherited published template is not a local history carrier.
+        # Absence of bundle/refs must not imply recursive Store materialization.
+        for keys in ((B, H), (B, H, BASE), (B, H, BASE, LOWER)):
+            with self.subTest(keys=keys):
+                result = self.validate(members=["manifest/" + key for key in keys])
+                self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_external_refs_entry_is_rejected_even_when_all_manifests_exist(self):
-        self.assert_rejected("unexpectedly retained external refs", members=[
+        self.assert_rejected("unexpectedly retained external Bundle locations", members=[
             *("manifest/" + key for key in (B, H, BASE, LOWER)), "bundle/refs"])
 
     def test_missing_and_extra_history_are_rejected(self):

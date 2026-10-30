@@ -338,11 +338,13 @@ if "manifest://" + sys.argv[4] in refs:
 with zipfile.ZipFile(sys.argv[3]) as archive:
     names = set(archive.namelist())
 if "bundle/refs" in names:
-    raise SystemExit("bundle B unexpectedly retained external refs")
-for ref in refs:
-    member = "manifest/" + ref.removeprefix("manifest://")
-    if member not in names:
-        raise SystemExit(f"bundle B omits referenced memory manifest {member!r}")
+    raise SystemExit("bundle B unexpectedly retained external Bundle locations")
+# Only the new local history is owned by B. The inherited suffix retains its
+# portable remote provenance; requiring those published template manifests to
+# be copied into B would cross the external boundary we just verified above.
+member = "manifest/" + refs[0].removeprefix("manifest://")
+if member not in names:
+    raise SystemExit(f"bundle B omits referenced memory history manifest {member!r}")
 def strings(value):
     if isinstance(value, str):
         yield value
